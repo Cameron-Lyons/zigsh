@@ -120,11 +120,25 @@ pub const Parser = struct {
                     break;
                 }
             } else if (self.current.tag == .ampersand) {
+                const save_pos = self.lexer.pos;
+                const save_tok = self.current;
                 try self.advance();
                 if (self.isCommandStart()) {
                     const and_or = try self.parseAndOr();
                     try rest.append(self.alloc, .{ .op = .amp, .and_or = and_or });
+                } else if (self.current.tag == .newline or self.current.tag == .eof) {
+                    try self.skipNewlines();
+                    if (self.isCommandStart()) {
+                        const and_or = try self.parseAndOr();
+                        try rest.append(self.alloc, .{ .op = .amp, .and_or = and_or });
+                    } else {
+                        self.lexer.pos = save_pos;
+                        self.current = save_tok;
+                        break;
+                    }
                 } else {
+                    self.lexer.pos = save_pos;
+                    self.current = save_tok;
                     break;
                 }
             } else if (self.current.tag == .newline) {
