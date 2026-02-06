@@ -262,6 +262,17 @@ pub const Lexer = struct {
                 self.pos += 1;
                 self.skipUntilCloseBrace();
             },
+            '@', '*', '#', '?', '-', '$', '!' => self.pos += 1,
+            '0'...'9' => {
+                while (self.pos < self.source.len and self.source[self.pos] >= '0' and self.source[self.pos] <= '9') {
+                    self.pos += 1;
+                }
+            },
+            'a'...'z', 'A'...'Z', '_' => {
+                while (self.pos < self.source.len and (std.ascii.isAlphanumeric(self.source[self.pos]) or self.source[self.pos] == '_')) {
+                    self.pos += 1;
+                }
+            },
             else => {},
         }
     }
