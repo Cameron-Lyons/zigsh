@@ -159,4 +159,115 @@ pub const JobTable = struct {
         }
         return best;
     }
+
+    pub fn previousJob(self: *JobTable) ?*Job {
+        const current = self.currentJob() orelse return null;
+        var best: ?*Job = null;
+        for (&self.jobs.*) |*slot| {
+            if (slot.*) |*job| {
+                if (job.state != .done and job.id != current.id) {
+                    if (best == null or job.id > best.?.id) {
+                        best = job;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    pub fn parseJobSpec(self: *JobTable, spec: []const u8) ?*Job {
+        if (spec.len == 0 or std.mem.eql(u8, spec, "%%") or std.mem.eql(u8, spec, "%+")) {
+            return self.currentJob();
+        }
+        if (std.mem.eql(u8, spec, "%-")) {
+            return self.previousJob();
+        }
+        if (spec[0] == '%') {
+            if (spec.len > 1) {
+                if (std.fmt.parseInt(u32, spec[1..], 10)) |id| {
+                    return self.findById(id);
+                } else |_| {
+                    const prefix = spec[1..];
+                    for (&self.jobs.*) |*slot| {
+                        if (slot.*) |*job| {
+                            if (job.state != .done and job.command.len >= prefix.len and
+                                std.mem.eql(u8, job.command[0..prefix.len], prefix))
+                            {
+                                return job;
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        if (std.fmt.parseInt(u32, spec, 10)) |id| {
+            return self.findById(id);
+        } else |_| {}
+        return null;
+    }
 };
+
+test "parseJobSpec by id" {
+    var jt = JobTable.init(std.testing.allocator);
+    defer jt.deinit();
+
+    const id1 = try jt.addJob(100, 100, "sleep 10");
+    const id2 = try jt.addJob(101, 101, "cat file");
+
+    const j1 = jt.parseJobSpec("%1");
+    try std.testing.expect(j1 != null);
+    try std.testing.expectEqual(id1, j1.?.id);
+
+    const j2 = jt.parseJobSpec("%2");
+    try std.testing.expect(j2 != null);
+    try std.testing.expectEqual(id2, j2.?.id);
+
+    try std.testing.expect(jt.parseJobSpec("%99") == null);
+}
+
+test "currentJob and previousJob" {
+    var jt = JobTable.init(std.testing.allocator);
+    defer jt.deinit();
+
+    try std.testing.expect(jt.currentJob() == null);
+    try std.testing.expect(jt.previousJob() == null);
+
+    _ = try jt.addJob(100, 100, "job1");
+    const id2 = try jt.addJob(101, 101, "job2");
+
+    const cur = jt.currentJob().?;
+    try std.testing.expectEqual(id2, cur.id);
+
+    const prev = jt.previousJob().?;
+    try std.testing.expect(prev.id != cur.id);
+}
+
+test "parseJobSpec empty and %% return current" {
+    var jt = JobTable.init(std.testing.allocator);
+    defer jt.deinit();
+
+    const id = try jt.addJob(100, 100, "sleep 5");
+
+    const j1 = jt.parseJobSpec("");
+    try std.testing.expect(j1 != null);
+    try std.testing.expectEqual(id, j1.?.id);
+
+    const j2 = jt.parseJobSpec("%%");
+    try std.testing.expect(j2 != null);
+    try std.testing.expectEqual(id, j2.?.id);
+}
+
+test "parseJobSpec by prefix" {
+    var jt = JobTable.init(std.testing.allocator);
+    defer jt.deinit();
+
+    _ = try jt.addJob(100, 100, "sleep 10");
+    _ = try jt.addJob(101, 101, "cat file");
+
+    const j = jt.parseJobSpec("%sle");
+    try std.testing.expect(j != null);
+    try std.testing.expectEqualStrings("sleep 10", j.?.command);
+
+    try std.testing.expect(jt.parseJobSpec("%xyz") == null);
+}

@@ -6,10 +6,6 @@ pub const fd_t = i32;
 pub const pid_t = i32;
 pub const mode_t = u32;
 
-pub const O = std.posix.O;
-pub const S = std.posix.S;
-pub const AT = std.posix.AT;
-
 pub fn pipe() ![2]fd_t {
     var fds: [2]fd_t = undefined;
     const rc = c.pipe(&fds);
@@ -131,21 +127,6 @@ pub fn writeAll(fd: fd_t, data: []const u8) void {
     }
 }
 
-pub fn setpgid(pid: pid_t, pgid: pid_t) !void {
-    const rc = c.setpgid(pid, pgid);
-    if (rc < 0) return error.SetPgidFailed;
-}
-
-pub fn tcsetpgrp(fd: fd_t, pgrp: pid_t) !void {
-    _ = c.tcsetpgrp(fd, pgrp);
-}
-
-pub fn tcgetpgrp(fd: fd_t) !pid_t {
-    const rc = c.tcgetpgrp(fd);
-    if (rc < 0) return error.TcgetpgrpFailed;
-    return rc;
-}
-
 pub fn getpid() pid_t {
     return c.getpid();
 }
@@ -165,14 +146,6 @@ pub fn oRdonly() OpenFlags {
     return .{ .ACCMODE = .RDONLY };
 }
 
-pub fn oWronly() OpenFlags {
-    return .{ .ACCMODE = .WRONLY };
-}
-
-pub fn oRdwr() OpenFlags {
-    return .{ .ACCMODE = .RDWR };
-}
-
 pub fn oWronlyCreatTrunc() OpenFlags {
     return .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
 }
@@ -189,6 +162,116 @@ pub const S_IFMT: u16 = 0o170000;
 pub const S_IFDIR: u16 = 0o040000;
 pub const S_IFREG: u16 = 0o100000;
 
+pub fn statusFromWait(status: u32) u8 {
+    if (status & 0x7f == 0) {
+        return @truncate((status >> 8) & 0xff);
+    }
+    return @truncate(128 + (status & 0x7f));
+}
+
+pub fn readToEnd(fd: fd_t, alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8)) !void {
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = read(fd, &buf) catch break;
+        if (n == 0) break;
+        try list.appendSlice(alloc, buf[0..n]);
+    }
+}
+
+const ext = struct {
+    extern "c" fn tcgetpgrp(fd: c_int) pid_t;
+    extern "c" fn tcsetpgrp(fd: c_int, pgrp: pid_t) c_int;
+    extern "c" fn setpgid(pid: pid_t, pgid: pid_t) c_int;
+};
+
+pub fn tcgetpgrp(fd: fd_t) !pid_t {
+    const rc = ext.tcgetpgrp(fd);
+    if (rc < 0) return error.TcgetpgrpFailed;
+    return rc;
+}
+
+pub fn tcsetpgrp(fd: fd_t, pgrp: pid_t) !void {
+    const rc = ext.tcsetpgrp(fd, pgrp);
+    if (rc < 0) return error.TcsetpgrpFailed;
+}
+
+pub fn setpgid(pid: pid_t, pgid: pid_t) !void {
+    const rc = ext.setpgid(pid, pgid);
+    if (rc < 0) return error.SetpgidFailed;
+}
+
+pub fn killpg(pgrp: pid_t, sig: u6) !void {
+    const rc = linux.kill(-pgrp, @enumFromInt(sig));
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) return error.KillFailed;
+}
+
 pub fn exit(status: u8) noreturn {
     std.process.exit(status);
+}
+
+test "statusFromWait normal exit" {
+    try std.testing.expectEqual(@as(u8, 0), statusFromWait(0x0000));
+    try std.testing.expectEqual(@as(u8, 1), statusFromWait(0x0100));
+    try std.testing.expectEqual(@as(u8, 2), statusFromWait(0x0200));
+    try std.testing.expectEqual(@as(u8, 127), statusFromWait(0x7F00));
+    try std.testing.expectEqual(@as(u8, 255), statusFromWait(0xFF00));
+}
+
+test "statusFromWait signal death" {
+    try std.testing.expectEqual(@as(u8, 128 + 9), statusFromWait(9));
+    try std.testing.expectEqual(@as(u8, 128 + 15), statusFromWait(15));
+    try std.testing.expectEqual(@as(u8, 128 + 2), statusFromWait(2));
+}
+
+test "pipe and close" {
+    const fds = try pipe();
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "dup" {
+    const fds = try pipe();
+    defer {
+        close(fds[0]);
+        close(fds[1]);
+    }
+    const new_fd = try dup(fds[0]);
+    close(new_fd);
+}
+
+test "write and read" {
+    const fds = try pipe();
+    defer {
+        close(fds[0]);
+        close(fds[1]);
+    }
+    const msg = "hello";
+    _ = try write(fds[1], msg);
+    close(fds[1]);
+
+    var buf: [64]u8 = undefined;
+    const n = try read(fds[0], &buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "getcwd" {
+    var buf: [4096]u8 = undefined;
+    const cwd = try getcwd(&buf);
+    try std.testing.expect(cwd.len > 0);
+    try std.testing.expect(cwd[0] == '/');
+}
+
+test "getpid" {
+    const pid = getpid();
+    try std.testing.expect(pid > 0);
+}
+
+test "isatty" {
+    const fds = try pipe();
+    defer {
+        close(fds[0]);
+        close(fds[1]);
+    }
+    try std.testing.expect(!isatty(fds[0]));
 }

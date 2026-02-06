@@ -15,6 +15,8 @@ pub const Environment = struct {
     alloc: std.mem.Allocator,
 
     options: ShellOptions,
+    aliases: std.StringHashMap([]const u8),
+    command_hash: std.StringHashMap([]const u8),
 
     loop_depth: u32,
     break_count: u32,
@@ -64,6 +66,8 @@ pub const Environment = struct {
             .ifs = " \t\n",
             .alloc = alloc,
             .options = .{},
+            .aliases = std.StringHashMap([]const u8).init(alloc),
+            .command_hash = std.StringHashMap([]const u8).init(alloc),
             .loop_depth = 0,
             .break_count = 0,
             .continue_count = 0,
@@ -94,6 +98,20 @@ pub const Environment = struct {
         self.functions.deinit();
 
         self.positional_stack.deinit(self.alloc);
+
+        var ait = self.aliases.iterator();
+        while (ait.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.aliases.deinit();
+
+        var hit = self.command_hash.iterator();
+        while (hit.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.command_hash.deinit();
     }
 
     fn importEnviron(self: *Environment) void {
@@ -142,6 +160,9 @@ pub const Environment = struct {
 
         if (std.mem.eql(u8, name, "IFS")) {
             self.ifs = self.vars.get(name).?.value;
+        }
+        if (std.mem.eql(u8, name, "PATH")) {
+            self.clearCommandHash();
         }
     }
 
@@ -198,6 +219,63 @@ pub const Environment = struct {
         if (idx < self.positional_params.len) return self.positional_params[idx];
         return null;
     }
+
+    pub fn setAlias(self: *Environment, name: []const u8, value: []const u8) !void {
+        const owned_value = try self.alloc.dupe(u8, value);
+        if (self.aliases.getPtr(name)) |existing| {
+            self.alloc.free(existing.*);
+            existing.* = owned_value;
+        } else {
+            const owned_name = try self.alloc.dupe(u8, name);
+            try self.aliases.put(owned_name, owned_value);
+        }
+    }
+
+    pub fn removeAlias(self: *Environment, name: []const u8) bool {
+        if (self.aliases.fetchRemove(name)) |kv| {
+            self.alloc.free(kv.key);
+            self.alloc.free(kv.value);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn getAlias(self: *const Environment, name: []const u8) ?[]const u8 {
+        return self.aliases.get(name);
+    }
+
+    pub fn clearAliases(self: *Environment) void {
+        var it = self.aliases.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.aliases.clearAndFree();
+    }
+
+    pub fn cacheCommand(self: *Environment, name: []const u8, path: []const u8) !void {
+        const owned_path = try self.alloc.dupe(u8, path);
+        if (self.command_hash.getPtr(name)) |existing| {
+            self.alloc.free(existing.*);
+            existing.* = owned_path;
+        } else {
+            const owned_name = try self.alloc.dupe(u8, name);
+            try self.command_hash.put(owned_name, owned_path);
+        }
+    }
+
+    pub fn getCachedCommand(self: *const Environment, name: []const u8) ?[]const u8 {
+        return self.command_hash.get(name);
+    }
+
+    pub fn clearCommandHash(self: *Environment) void {
+        var it = self.command_hash.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.command_hash.clearAndFree();
+    }
 };
 
 test "env set and get" {
@@ -218,4 +296,148 @@ test "env unset" {
     try env.set("FOO", "bar", false);
     env.unset("FOO");
     try std.testing.expect(env.get("FOO") == null);
+}
+
+test "env readonly" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.set("RO", "original", false);
+    env.markReadonly("RO");
+    try env.set("RO", "modified", false);
+    try std.testing.expectEqualStrings("original", env.get("RO").?);
+}
+
+test "env readonly prevents unset" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.set("RO", "val", false);
+    env.markReadonly("RO");
+    env.unset("RO");
+    try std.testing.expectEqualStrings("val", env.get("RO").?);
+}
+
+test "env exported" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.set("EX", "val", false);
+    env.markExported("EX");
+    const v = env.vars.get("EX").?;
+    try std.testing.expect(v.exported);
+}
+
+test "env set with export flag" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.set("EX", "val", true);
+    const v = env.vars.get("EX").?;
+    try std.testing.expect(v.exported);
+}
+
+test "env IFS tracking" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings(" \t\n", env.ifs);
+    try env.set("IFS", ":", false);
+    try std.testing.expectEqualStrings(":", env.ifs);
+    env.unset("IFS");
+    try std.testing.expectEqualStrings(" \t\n", env.ifs);
+}
+
+test "env positional params" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    const params: []const []const u8 = &.{ "a", "b", "c" };
+    env.positional_params = params;
+
+    try std.testing.expect(env.getPositional(0) == null);
+    try std.testing.expectEqualStrings("a", env.getPositional(1).?);
+    try std.testing.expectEqualStrings("b", env.getPositional(2).?);
+    try std.testing.expectEqualStrings("c", env.getPositional(3).?);
+    try std.testing.expect(env.getPositional(4) == null);
+}
+
+test "env positional push and pop" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    const original: []const []const u8 = &.{ "a", "b" };
+    env.positional_params = original;
+
+    const new_params: []const []const u8 = &.{ "x", "y", "z" };
+    try env.pushPositionalParams(new_params);
+    try std.testing.expectEqual(@as(usize, 3), env.positional_params.len);
+    try std.testing.expectEqualStrings("x", env.getPositional(1).?);
+
+    env.popPositionalParams();
+    try std.testing.expectEqual(@as(usize, 2), env.positional_params.len);
+    try std.testing.expectEqualStrings("a", env.getPositional(1).?);
+}
+
+test "env get unset var" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try std.testing.expect(env.get("NONEXISTENT_VAR_12345") == null);
+}
+
+test "env overwrite value" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.set("V", "one", false);
+    try env.set("V", "two", false);
+    try env.set("V", "three", false);
+    try std.testing.expectEqualStrings("three", env.get("V").?);
+}
+
+test "alias set get remove" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.setAlias("ll", "ls -l");
+    try std.testing.expectEqualStrings("ls -l", env.getAlias("ll").?);
+
+    try env.setAlias("ll", "ls -la");
+    try std.testing.expectEqualStrings("ls -la", env.getAlias("ll").?);
+
+    try std.testing.expect(env.removeAlias("ll"));
+    try std.testing.expect(env.getAlias("ll") == null);
+    try std.testing.expect(!env.removeAlias("ll"));
+}
+
+test "alias clear all" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.setAlias("a", "b");
+    try env.setAlias("c", "d");
+    env.clearAliases();
+    try std.testing.expect(env.getAlias("a") == null);
+    try std.testing.expect(env.getAlias("c") == null);
+}
+
+test "command hash cache and clear" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.cacheCommand("ls", "/usr/bin/ls");
+    try std.testing.expectEqualStrings("/usr/bin/ls", env.getCachedCommand("ls").?);
+
+    env.clearCommandHash();
+    try std.testing.expect(env.getCachedCommand("ls") == null);
+}
+
+test "PATH change clears command hash" {
+    var env = Environment.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.cacheCommand("ls", "/usr/bin/ls");
+    try env.set("PATH", "/new/path", false);
+    try std.testing.expect(env.getCachedCommand("ls") == null);
 }

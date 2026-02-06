@@ -9,11 +9,14 @@ const builtins = @import("builtins.zig");
 const redirect = @import("redirect.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
+const glob = @import("glob.zig");
+const signals = @import("signals.zig");
 
 pub const Executor = struct {
     env: *Environment,
     jobs: *JobTable,
     alloc: std.mem.Allocator,
+    in_err_trap: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, env: *Environment, jobs: *JobTable) Executor {
         return .{ .env = env, .jobs = jobs, .alloc = alloc };
@@ -41,14 +44,11 @@ pub const Executor = struct {
             return 1;
         };
         if (pid == 0) {
-            const status = self.executeList(list);
-            posix.exit(status);
+            posix.setpgid(0, 0) catch {};
+            posix.exit(self.executeList(list));
         }
-        self.env.last_bg_pid = pid;
-        const job_id = self.jobs.addJob(pid, pid, "background") catch 0;
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job_id, pid }) catch "";
-        posix.writeAll(2, msg);
+        posix.setpgid(pid, pid) catch {};
+        self.registerBackground(pid);
         return 0;
     }
 
@@ -80,15 +80,21 @@ pub const Executor = struct {
             return 1;
         };
         if (pid == 0) {
+            posix.setpgid(0, 0) catch {};
             _ = self.executeAndOr(and_or);
             posix.exit(0);
         }
+        posix.setpgid(pid, pid) catch {};
+        self.registerBackground(pid);
+        return 0;
+    }
+
+    fn registerBackground(self: *Executor, pid: posix.pid_t) void {
         self.env.last_bg_pid = pid;
         const job_id = self.jobs.addJob(pid, pid, "background") catch 0;
         var buf: [32]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job_id, pid }) catch "";
         posix.writeAll(2, msg);
-        return 0;
     }
 
     fn executeAndOr(self: *Executor, and_or: ast.AndOr) u8 {
@@ -110,6 +116,13 @@ pub const Executor = struct {
             }
         }
         self.env.last_exit_status = status;
+        if (status != 0 and !self.in_err_trap) {
+            if (signals.getErrTrap()) |action| {
+                self.in_err_trap = true;
+                _ = self.executeInline(action);
+                self.in_err_trap = false;
+            }
+        }
         return status;
     }
 
@@ -175,7 +188,7 @@ pub const Executor = struct {
         for (child_pids[0..num_children]) |cpid| {
             const result = posix.waitpid(cpid, 0);
             if (cpid == last_pid) {
-                status = statusFromWait(result.status);
+                status = posix.statusFromWait(result.status);
             }
         }
 
@@ -208,6 +221,17 @@ pub const Executor = struct {
             return 1;
         };
         if (fields.len == 0) return 0;
+
+        if (self.env.getAlias(fields[0])) |alias_val| {
+            var alias_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer alias_buf.deinit(self.alloc);
+            alias_buf.appendSlice(self.alloc, alias_val) catch return 1;
+            for (fields[1..]) |f| {
+                alias_buf.append(self.alloc, ' ') catch return 1;
+                alias_buf.appendSlice(self.alloc, f) catch return 1;
+            }
+            return self.executeInline(alias_buf.items);
+        }
 
         if (self.env.options.xtrace) {
             posix.writeAll(2, "+ ");
@@ -320,7 +344,7 @@ pub const Executor = struct {
             posix.exit(status);
         }
         const result = posix.waitpid(pid, 0);
-        return statusFromWait(result.status);
+        return posix.statusFromWait(result.status);
     }
 
     fn executeIfClause(self: *Executor, ic: ast.IfClause) u8 {
@@ -342,6 +366,22 @@ pub const Executor = struct {
         return 0;
     }
 
+    const LoopAction = enum { none, break_loop, continue_loop };
+
+    fn checkLoopControl(self: *Executor) LoopAction {
+        if (self.env.break_count > 0) {
+            self.env.break_count -= 1;
+            return .break_loop;
+        }
+        if (self.env.continue_count > 0) {
+            self.env.continue_count -= 1;
+            if (self.env.continue_count > 0) return .break_loop;
+            return .continue_loop;
+        }
+        if (self.env.should_return or self.env.should_exit) return .break_loop;
+        return .none;
+    }
+
     fn executeWhileClause(self: *Executor, wc: ast.WhileClause) u8 {
         var status: u8 = 0;
         self.env.loop_depth += 1;
@@ -351,17 +391,11 @@ pub const Executor = struct {
             const cond = self.executeCompoundList(wc.condition);
             if (cond != 0) break;
             status = self.executeCompoundList(wc.body);
-
-            if (self.env.break_count > 0) {
-                self.env.break_count -= 1;
-                break;
+            switch (self.checkLoopControl()) {
+                .break_loop => break,
+                .continue_loop => continue,
+                .none => {},
             }
-            if (self.env.continue_count > 0) {
-                self.env.continue_count -= 1;
-                if (self.env.continue_count > 0) break;
-                continue;
-            }
-            if (self.env.should_return or self.env.should_exit) break;
         }
         return status;
     }
@@ -375,17 +409,11 @@ pub const Executor = struct {
             const cond = self.executeCompoundList(uc.condition);
             if (cond == 0) break;
             status = self.executeCompoundList(uc.body);
-
-            if (self.env.break_count > 0) {
-                self.env.break_count -= 1;
-                break;
+            switch (self.checkLoopControl()) {
+                .break_loop => break,
+                .continue_loop => continue,
+                .none => {},
             }
-            if (self.env.continue_count > 0) {
-                self.env.continue_count -= 1;
-                if (self.env.continue_count > 0) break;
-                continue;
-            }
-            if (self.env.should_return or self.env.should_exit) break;
         }
         return status;
     }
@@ -404,17 +432,11 @@ pub const Executor = struct {
         for (wordlist) |word| {
             self.env.set(fc.name, word, false) catch continue;
             status = self.executeCompoundList(fc.body);
-
-            if (self.env.break_count > 0) {
-                self.env.break_count -= 1;
-                break;
+            switch (self.checkLoopControl()) {
+                .break_loop => break,
+                .continue_loop => continue,
+                .none => {},
             }
-            if (self.env.continue_count > 0) {
-                self.env.continue_count -= 1;
-                if (self.env.continue_count > 0) break;
-                continue;
-            }
-            if (self.env.should_return or self.env.should_exit) break;
         }
         return status;
     }
@@ -426,7 +448,7 @@ pub const Executor = struct {
         for (cc.items) |item| {
             for (item.patterns) |pattern| {
                 const pat_val = expander.expandWord(pattern) catch continue;
-                if (caseMatch(pat_val, word_val)) {
+                if (glob.fnmatch(pat_val, word_val)) {
                     if (item.body) |body| {
                         return self.executeCompoundList(body);
                     }
@@ -488,12 +510,17 @@ pub const Executor = struct {
         }
 
         const result = posix.waitpid(pid, 0);
-        return statusFromWait(result.status);
+        return posix.statusFromWait(result.status);
     }
 
     fn findExecutable(self: *Executor, name: []const u8) ?[*:0]const u8 {
         if (std.mem.indexOfScalar(u8, name, '/') != null) {
             const duped = self.alloc.dupeZ(u8, name) catch return null;
+            return duped.ptr;
+        }
+
+        if (self.env.getCachedCommand(name)) |cached| {
+            const duped = self.alloc.dupeZ(u8, cached) catch return null;
             return duped.ptr;
         }
 
@@ -503,6 +530,7 @@ pub const Executor = struct {
             const full_path = std.fmt.allocPrintSentinel(self.alloc, "{s}/{s}", .{ dir, name }, 0) catch continue;
             const st = posix.stat(full_path.ptr) catch continue;
             if (st.mode & posix.S_IFMT == posix.S_IFREG) {
+                self.env.cacheCommand(name, std.mem.sliceTo(full_path, 0)) catch {};
                 return full_path.ptr;
             }
         }
@@ -556,14 +584,9 @@ pub const Executor = struct {
         };
         defer posix.close(fd);
 
-        var file_buf: [65536]u8 = undefined;
         var content: std.ArrayListUnmanaged(u8) = .empty;
         defer content.deinit(self.alloc);
-        while (true) {
-            const n = posix.read(fd, &file_buf) catch break;
-            if (n == 0) break;
-            content.appendSlice(self.alloc, file_buf[0..n]) catch return 1;
-        }
+        posix.readToEnd(fd, self.alloc, &content) catch return 1;
 
         if (fields.len > 2) {
             self.env.pushPositionalParams(fields[2..]) catch return 1;
@@ -575,12 +598,6 @@ pub const Executor = struct {
 
     fn executeEvalBuiltin(self: *Executor, fields: []const []const u8) u8 {
         if (fields.len < 2) return 0;
-
-        var total_len: usize = 0;
-        for (fields[1..], 0..) |f, i| {
-            total_len += f.len;
-            if (i > 0) total_len += 1;
-        }
 
         var eval_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer eval_buf.deinit(self.alloc);
@@ -673,38 +690,4 @@ fn astToRedirectOp(op: ast.RedirectOp) redirect.RedirectOp {
         .heredoc => .heredoc,
         .heredoc_strip => .heredoc_strip,
     };
-}
-
-fn statusFromWait(status: u32) u8 {
-    if (status & 0x7f == 0) {
-        return @truncate((status >> 8) & 0xff);
-    }
-    const signal = status & 0x7f;
-    return @truncate(128 + signal);
-}
-
-fn caseMatch(pattern: []const u8, text: []const u8) bool {
-    var pi: usize = 0;
-    var ti: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
-
-    while (ti < text.len) {
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-    while (pi < pattern.len and pattern[pi] == '*') : (pi += 1) {}
-    return pi == pattern.len;
 }

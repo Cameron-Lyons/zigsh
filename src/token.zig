@@ -13,7 +13,6 @@ pub const Token = struct {
 pub const Tag = enum {
     word,
     assignment_word,
-    name,
     io_number,
     newline,
     eof,
@@ -66,12 +65,6 @@ pub const Tag = enum {
         };
     }
 
-    pub fn isControlOp(self: Tag) bool {
-        return switch (self) {
-            .ampersand, .and_if, .or_if, .semicolon, .dsemi, .newline, .pipe => true,
-            else => false,
-        };
-    }
 };
 
 pub const reserved_words = std.StaticStringMap(Tag).initComptime(.{

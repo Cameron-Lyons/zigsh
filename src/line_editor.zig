@@ -99,14 +99,9 @@ pub const LineEditor = struct {
             self.file_path = self.alloc.dupe(u8, path) catch return;
             const fd = posix.open(path, posix.oRdonly(), 0) catch return;
             defer posix.close(fd);
-            var file_buf: [65536]u8 = undefined;
             var content: std.ArrayListUnmanaged(u8) = .empty;
             defer content.deinit(self.alloc);
-            while (true) {
-                const n = posix.read(fd, &file_buf) catch break;
-                if (n == 0) break;
-                content.appendSlice(self.alloc, file_buf[0..n]) catch return;
-            }
+            posix.readToEnd(fd, self.alloc, &content) catch return;
             var iter = std.mem.splitScalar(u8, content.items, '\n');
             while (iter.next()) |line| {
                 if (line.len > 0) self.add(line);
