@@ -51,15 +51,6 @@ pub const Lexer = struct {
         return self.readWord();
     }
 
-    pub fn peek(self: *Lexer) !Token {
-        const saved_pos = self.pos;
-        const saved_rwc = self.reserved_word_context;
-        const tok = try self.next();
-        self.pos = saved_pos;
-        self.reserved_word_context = saved_rwc;
-        return tok;
-    }
-
     fn skipBlanks(self: *Lexer) void {
         while (self.pos < self.source.len) {
             switch (self.source[self.pos]) {
@@ -485,4 +476,83 @@ test "lex comments" {
     try std.testing.expectEqualStrings("hello", (try lex.next()).slice(lex.source));
     try std.testing.expectEqual(Tag.newline, (try lex.next()).tag);
     try std.testing.expectEqualStrings("world", (try lex.next()).slice(lex.source));
+}
+
+test "lex backquotes" {
+    var lex = Lexer.init("`echo hi` done");
+    lex.reserved_word_context = false;
+    const t1 = try lex.next();
+    try std.testing.expectEqualStrings("`echo hi`", t1.slice(lex.source));
+    try std.testing.expectEqualStrings("done", (try lex.next()).slice(lex.source));
+}
+
+test "lex dollar expansion" {
+    var lex = Lexer.init("$FOO ${BAR} $(cmd) $((1+2))");
+    lex.reserved_word_context = false;
+    try std.testing.expectEqualStrings("$FOO", (try lex.next()).slice(lex.source));
+    try std.testing.expectEqualStrings("${BAR}", (try lex.next()).slice(lex.source));
+    try std.testing.expectEqualStrings("$(cmd)", (try lex.next()).slice(lex.source));
+    try std.testing.expectEqualStrings("$((1+2))", (try lex.next()).slice(lex.source));
+}
+
+test "lex escape sequences" {
+    var lex = Lexer.init("hello\\ world next");
+    lex.reserved_word_context = false;
+    try std.testing.expectEqualStrings("hello\\ world", (try lex.next()).slice(lex.source));
+    try std.testing.expectEqualStrings("next", (try lex.next()).slice(lex.source));
+}
+
+test "lex dsemi" {
+    var lex = Lexer.init("a ;; b");
+    lex.reserved_word_context = false;
+    try std.testing.expectEqual(Tag.word, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.dsemi, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.word, (try lex.next()).tag);
+}
+
+test "lex heredoc operators" {
+    var lex = Lexer.init("<<EOF <<-STRIP");
+    try std.testing.expectEqual(Tag.dless, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.word, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.dlessdash, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.word, (try lex.next()).tag);
+}
+
+test "lex empty input" {
+    var lex = Lexer.init("");
+    try std.testing.expectEqual(Tag.eof, (try lex.next()).tag);
+}
+
+test "lex only whitespace" {
+    var lex = Lexer.init("   \t  ");
+    try std.testing.expectEqual(Tag.eof, (try lex.next()).tag);
+}
+
+test "lex reserved words not in reserved context" {
+    var lex = Lexer.init("if then");
+    lex.reserved_word_context = false;
+    try std.testing.expectEqual(Tag.word, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.word, (try lex.next()).tag);
+}
+
+test "lex all reserved words" {
+    var lex = Lexer.init("while until for do done case esac in");
+    try std.testing.expectEqual(Tag.kw_while, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_until, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_for, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_do, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_done, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_case, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_esac, (try lex.next()).tag);
+    try std.testing.expectEqual(Tag.kw_in, (try lex.next()).tag);
+}
+
+test "lex unterminated single quote" {
+    var lex = Lexer.init("'hello");
+    try std.testing.expectError(error.UnterminatedSingleQuote, lex.next());
+}
+
+test "lex unterminated double quote" {
+    var lex = Lexer.init("\"hello");
+    try std.testing.expectError(error.UnterminatedDoubleQuote, lex.next());
 }

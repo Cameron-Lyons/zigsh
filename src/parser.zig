@@ -899,3 +899,165 @@ test "parse redirection" {
     try std.testing.expectEqual(ast.RedirectOp.output, simple.redirects[0].op);
     try std.testing.expectEqual(ast.RedirectOp.dup_output, simple.redirects[1].op);
 }
+
+test "parse if clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("if true; then echo yes; fi");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    try std.testing.expectEqual(@as(usize, 1), program.commands.len);
+    const cmd = program.commands[0].list.first.first.commands[0];
+    try std.testing.expectEqual(ast.CompoundCommand.if_clause, std.meta.activeTag(cmd.compound.body));
+}
+
+test "parse if-else clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("if false; then echo no; else echo yes; fi");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    const ic = cmd.compound.body.if_clause;
+    try std.testing.expect(ic.else_body != null);
+}
+
+test "parse while clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("while true; do echo loop; done");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    try std.testing.expectEqual(ast.CompoundCommand.while_clause, std.meta.activeTag(cmd.compound.body));
+}
+
+test "parse for clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("for i in a b c; do echo $i; done");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    const fc = cmd.compound.body.for_clause;
+    try std.testing.expectEqualStrings("i", fc.name);
+    try std.testing.expectEqual(@as(usize, 3), fc.wordlist.?.len);
+}
+
+test "parse case clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("case x in a) echo a;; b) echo b;; esac");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    const cc = cmd.compound.body.case_clause;
+    try std.testing.expectEqual(@as(usize, 2), cc.items.len);
+}
+
+test "parse bang pipeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("! false");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const pipeline = program.commands[0].list.first.first;
+    try std.testing.expect(pipeline.bang);
+}
+
+test "parse background command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("echo a & echo b");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const rest = program.commands[0].list.rest;
+    try std.testing.expect(rest.len == 1);
+    try std.testing.expect(rest[0].op == .amp);
+}
+
+test "parse brace group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("{ echo hello; }");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    try std.testing.expectEqual(ast.CompoundCommand.brace_group, std.meta.activeTag(cmd.compound.body));
+}
+
+test "parse subshell" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("(echo hello)");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    try std.testing.expectEqual(ast.CompoundCommand.subshell, std.meta.activeTag(cmd.compound.body));
+}
+
+test "parse function definition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("myfunc() { echo hello; }");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const cmd = program.commands[0].list.first.first.commands[0];
+    try std.testing.expectEqualStrings("myfunc", cmd.function_def.name);
+}
+
+test "parse multiple commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("echo a; echo b; echo c");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    try std.testing.expectEqual(@as(usize, 1), program.commands.len);
+    const list = program.commands[0].list;
+    try std.testing.expectEqual(@as(usize, 2), list.rest.len);
+}
+
+test "parse empty input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    try std.testing.expectEqual(@as(usize, 0), program.commands.len);
+}
+
+test "parse three-stage pipeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = Lexer.init("ls | grep foo | wc -l");
+    var parser = try Parser.init(alloc, &lex);
+    const program = try parser.parseProgram();
+
+    const pipeline = program.commands[0].list.first.first;
+    try std.testing.expectEqual(@as(usize, 3), pipeline.commands.len);
+}

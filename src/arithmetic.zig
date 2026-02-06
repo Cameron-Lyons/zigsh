@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("types.zig");
 
 pub const ArithError = error{
     InvalidExpression,
@@ -291,7 +292,7 @@ pub const Arithmetic = struct {
             return self.parseDecimalNumber();
         }
 
-        if (isNameStart(self.expr[self.pos])) {
+        if (types.isNameStart(self.expr[self.pos])) {
             return self.parseVariable();
         }
 
@@ -337,7 +338,7 @@ pub const Arithmetic = struct {
 
     fn parseVariable(self: *Arithmetic) ArithError!i64 {
         const start = self.pos;
-        while (self.pos < self.expr.len and isNameCont(self.expr[self.pos])) {
+        while (self.pos < self.expr.len and types.isNameCont(self.expr[self.pos])) {
             self.pos += 1;
         }
         const name = self.expr[start..self.pos];
@@ -354,13 +355,6 @@ pub const Arithmetic = struct {
         return false;
     }
 
-    fn isNameStart(ch: u8) bool {
-        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or ch == '_';
-    }
-
-    fn isNameCont(ch: u8) bool {
-        return isNameStart(ch) or (ch >= '0' and ch <= '9');
-    }
 };
 
 test "basic arithmetic" {
@@ -401,4 +395,108 @@ test "ternary" {
     }.f;
     try std.testing.expectEqual(@as(i64, 10), try Arithmetic.evaluate("1 ? 10 : 20", lookup));
     try std.testing.expectEqual(@as(i64, 20), try Arithmetic.evaluate("0 ? 10 : 20", lookup));
+}
+
+test "variable lookup" {
+    const lookup = struct {
+        fn f(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "x")) return "42";
+            if (std.mem.eql(u8, name, "y")) return "10";
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 42), try Arithmetic.evaluate("x", &lookup));
+    try std.testing.expectEqual(@as(i64, 52), try Arithmetic.evaluate("x + y", &lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("z", &lookup));
+}
+
+test "bitwise ops" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 0xFF), try Arithmetic.evaluate("0xF0 | 0x0F", lookup));
+    try std.testing.expectEqual(@as(i64, 0x00), try Arithmetic.evaluate("0xF0 & 0x0F", lookup));
+    try std.testing.expectEqual(@as(i64, 0xFF), try Arithmetic.evaluate("0xF0 ^ 0x0F", lookup));
+    try std.testing.expectEqual(@as(i64, -1), try Arithmetic.evaluate("~0", lookup));
+}
+
+test "shift ops" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 8), try Arithmetic.evaluate("1 << 3", lookup));
+    try std.testing.expectEqual(@as(i64, 2), try Arithmetic.evaluate("16 >> 3", lookup));
+}
+
+test "unary operators" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 5), try Arithmetic.evaluate("+5", lookup));
+    try std.testing.expectEqual(@as(i64, -3), try Arithmetic.evaluate("-3", lookup));
+    try std.testing.expectEqual(@as(i64, 1), try Arithmetic.evaluate("!0", lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("!1", lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("!42", lookup));
+}
+
+test "hex and octal numbers" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 255), try Arithmetic.evaluate("0xFF", lookup));
+    try std.testing.expectEqual(@as(i64, 255), try Arithmetic.evaluate("0XFF", lookup));
+    try std.testing.expectEqual(@as(i64, 8), try Arithmetic.evaluate("010", lookup));
+    try std.testing.expectEqual(@as(i64, 63), try Arithmetic.evaluate("077", lookup));
+}
+
+test "division by zero" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectError(error.DivisionByZero, Arithmetic.evaluate("1 / 0", lookup));
+    try std.testing.expectError(error.DivisionByZero, Arithmetic.evaluate("1 % 0", lookup));
+}
+
+test "relational operators" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 1), try Arithmetic.evaluate("3 <= 3", lookup));
+    try std.testing.expectEqual(@as(i64, 1), try Arithmetic.evaluate("3 >= 3", lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("4 <= 3", lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("2 >= 3", lookup));
+    try std.testing.expectEqual(@as(i64, 1), try Arithmetic.evaluate("3 > 2", lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("3 > 3", lookup));
+}
+
+test "nested parentheses" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 30), try Arithmetic.evaluate("((2 + 3) * (1 + 2)) * 2", lookup));
+}
+
+test "invalid expression" {
+    const lookup = struct {
+        fn f(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.f;
+    try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("", lookup));
+    try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("1 +", lookup));
+    try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("(1 + 2", lookup));
 }

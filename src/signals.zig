@@ -20,7 +20,11 @@ pub const SIGPIPE: u6 = 13;
 pub const SIGUSR1: u6 = 10;
 pub const SIGUSR2: u6 = 12;
 
-pub var trap_handlers: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
+pub const TRAP_EXIT: usize = 0;
+pub const TRAP_ERR: usize = 33;
+const TRAP_COUNT = 34;
+
+pub var trap_handlers: [TRAP_COUNT]?[]const u8 = [_]?[]const u8{null} ** TRAP_COUNT;
 pub var received_signals: [32]bool = [_]bool{false} ** 32;
 
 fn signalHandler(sig: SIG) callconv(.c) void {
@@ -86,6 +90,22 @@ pub fn setTrap(signum: u6, action: ?[]const u8) void {
             defaultSignal(signum);
         }
     }
+}
+
+pub fn getExitTrap() ?[]const u8 {
+    return trap_handlers[TRAP_EXIT];
+}
+
+pub fn setExitTrap(action: ?[]const u8) void {
+    trap_handlers[TRAP_EXIT] = action;
+}
+
+pub fn getErrTrap() ?[]const u8 {
+    return trap_handlers[TRAP_ERR];
+}
+
+pub fn setErrTrap(action: ?[]const u8) void {
+    trap_handlers[TRAP_ERR] = action;
 }
 
 pub fn checkPendingSignals() ?u6 {

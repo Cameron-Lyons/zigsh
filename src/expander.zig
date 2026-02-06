@@ -5,6 +5,7 @@ const Parser = @import("parser.zig").Parser;
 const Arithmetic = @import("arithmetic.zig").Arithmetic;
 const glob = @import("glob.zig");
 const posix = @import("posix.zig");
+const types = @import("types.zig");
 const Environment = @import("env.zig").Environment;
 
 pub const ExpandError = error{
@@ -36,10 +37,6 @@ pub const Expander = struct {
         return result.toOwnedSlice(self.alloc);
     }
 
-    pub fn expandWordNoSplit(self: *Expander, word: ast.Word) ExpandError![]const u8 {
-        return self.expandWord(word);
-    }
-
     pub fn expandFields(self: *Expander, word: ast.Word) ExpandError![]const []const u8 {
         const expanded = try self.expandWord(word);
         if (expanded.len == 0) {
@@ -52,27 +49,24 @@ pub const Expander = struct {
     pub fn expandWordsToFields(self: *Expander, words: []const ast.Word) ExpandError![]const []const u8 {
         var fields: std.ArrayListUnmanaged([]const u8) = .empty;
         for (words) |word| {
-            if (isQuoted(word)) {
-                const expanded = try self.expandWord(word);
-                try fields.append(self.alloc, expanded);
+            const ew = try self.expandWordWithSplitInfo(word);
+            if (ew.text.len == 0) {
+                if (hasQuotedParts(word)) {
+                    try fields.append(self.alloc, ew.text);
+                }
+                continue;
+            }
+            const split = try self.fieldSplitWithQuoting(ew.text, ew.splittable);
+            if (!self.env.options.noglob) {
+                for (split) |field| {
+                    const globbed = glob.expand(self.alloc, field) catch {
+                        try fields.append(self.alloc, field);
+                        continue;
+                    };
+                    try fields.appendSlice(self.alloc, globbed);
+                }
             } else {
-                const expanded = try self.expandWord(word);
-                if (expanded.len == 0) {
-                    self.alloc.free(expanded);
-                    continue;
-                }
-                const split = try self.fieldSplit(expanded);
-                if (!self.env.options.noglob) {
-                    for (split) |field| {
-                        const globbed = glob.expand(self.alloc, field) catch {
-                            try fields.append(self.alloc, field);
-                            continue;
-                        };
-                        try fields.appendSlice(self.alloc, globbed);
-                    }
-                } else {
-                    try fields.appendSlice(self.alloc, split);
-                }
+                try fields.appendSlice(self.alloc, split);
             }
         }
         return fields.toOwnedSlice(self.alloc);
@@ -175,7 +169,7 @@ pub const Expander = struct {
             .prefix_short => {
                 var i: usize = 0;
                 while (i <= val.len) : (i += 1) {
-                    if (simpleMatch(pat, val[0..i])) {
+                    if (glob.fnmatch(pat, val[0..i])) {
                         return try self.alloc.dupe(u8, val[i..]);
                     }
                 }
@@ -183,7 +177,7 @@ pub const Expander = struct {
             .prefix_long => {
                 var i: usize = val.len;
                 while (true) {
-                    if (simpleMatch(pat, val[0..i])) {
+                    if (glob.fnmatch(pat, val[0..i])) {
                         return try self.alloc.dupe(u8, val[i..]);
                     }
                     if (i == 0) break;
@@ -193,7 +187,7 @@ pub const Expander = struct {
             .suffix_short => {
                 var i: usize = val.len;
                 while (true) {
-                    if (simpleMatch(pat, val[i..])) {
+                    if (glob.fnmatch(pat, val[i..])) {
                         return try self.alloc.dupe(u8, val[0..i]);
                     }
                     if (i == 0) break;
@@ -203,7 +197,7 @@ pub const Expander = struct {
             .suffix_long => {
                 var i: usize = 0;
                 while (i <= val.len) : (i += 1) {
-                    if (simpleMatch(pat, val[i..])) {
+                    if (glob.fnmatch(pat, val[i..])) {
                         return try self.alloc.dupe(u8, val[0..i]);
                     }
                 }
@@ -301,10 +295,10 @@ pub const Expander = struct {
                     if (i < expr.len) i += 1;
                     const val = self.env.get(name) orelse "0";
                     try expanded_expr.appendSlice(self.alloc, val);
-                } else if (isNameStart(expr[i + 1])) {
+                } else if (types.isNameStart(expr[i + 1])) {
                     i += 1;
                     const start = i;
-                    while (i < expr.len and isNameCont(expr[i])) : (i += 1) {}
+                    while (i < expr.len and types.isNameCont(expr[i])) : (i += 1) {}
                     const name = expr[start..i];
                     const val = self.env.get(name) orelse "0";
                     try expanded_expr.appendSlice(self.alloc, val);
@@ -353,12 +347,57 @@ pub const Expander = struct {
         return std.fmt.allocPrint(self.alloc, "{d}", .{result});
     }
 
-    fn isNameStart(ch: u8) bool {
-        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or ch == '_';
+    const SplitInfo = struct {
+        text: []const u8,
+        splittable: []const bool,
+    };
+
+    fn expandWordWithSplitInfo(self: *Expander, word: ast.Word) ExpandError!SplitInfo {
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        var splittable: std.ArrayListUnmanaged(bool) = .empty;
+
+        for (word.parts) |part| {
+            const expanded = try self.expandPart(part);
+            const is_splittable = switch (part) {
+                .parameter, .command_sub, .arith_sub, .backtick_sub => true,
+                .literal, .single_quoted, .double_quoted, .tilde => false,
+            };
+            try text.appendSlice(self.alloc, expanded);
+            for (0..expanded.len) |_| {
+                try splittable.append(self.alloc, is_splittable);
+            }
+        }
+
+        return .{
+            .text = try text.toOwnedSlice(self.alloc),
+            .splittable = try splittable.toOwnedSlice(self.alloc),
+        };
     }
 
-    fn isNameCont(ch: u8) bool {
-        return isNameStart(ch) or (ch >= '0' and ch <= '9');
+    fn fieldSplitWithQuoting(self: *Expander, text: []const u8, splittable: []const bool) ExpandError![]const []const u8 {
+        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        const ifs = self.env.ifs;
+        var i: usize = 0;
+
+        while (i < text.len and splittable[i] and isIfsChar(text[i], ifs)) : (i += 1) {}
+
+        while (i < text.len) {
+            var field: std.ArrayListUnmanaged(u8) = .empty;
+
+            while (i < text.len) {
+                if (splittable[i] and isIfsChar(text[i], ifs)) break;
+                try field.append(self.alloc, text[i]);
+                i += 1;
+            }
+
+            if (field.items.len > 0) {
+                try fields.append(self.alloc, try field.toOwnedSlice(self.alloc));
+            }
+
+            while (i < text.len and splittable[i] and isIfsChar(text[i], ifs)) : (i += 1) {}
+        }
+
+        return fields.toOwnedSlice(self.alloc);
     }
 
     fn fieldSplit(self: *Expander, input: []const u8) ExpandError![]const []const u8 {
@@ -380,47 +419,20 @@ pub const Expander = struct {
         return fields.toOwnedSlice(self.alloc);
     }
 
-    fn isIfsChar(c: u8, ifs: []const u8) bool {
-        return std.mem.indexOfScalar(u8, ifs, c) != null;
+    fn isIfsChar(ch: u8, ifs: []const u8) bool {
+        return std.mem.indexOfScalar(u8, ifs, ch) != null;
     }
 
-    fn isQuoted(word: ast.Word) bool {
-        if (word.parts.len == 1) {
-            return switch (word.parts[0]) {
-                .single_quoted, .double_quoted => true,
-                else => false,
-            };
+    fn hasQuotedParts(word: ast.Word) bool {
+        for (word.parts) |part| {
+            switch (part) {
+                .single_quoted, .double_quoted => return true,
+                else => {},
+            }
         }
         return false;
     }
 };
-
-fn simpleMatch(pattern: []const u8, text: []const u8) bool {
-    var pi: usize = 0;
-    var ti: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
-
-    while (ti < text.len) {
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    while (pi < pattern.len and pattern[pi] == '*') : (pi += 1) {}
-    return pi == pattern.len;
-}
 
 test "expand literal word" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -475,9 +487,254 @@ test "expand default value" {
     try std.testing.expectEqualStrings("default", result);
 }
 
-test "simple pattern matching" {
-    try std.testing.expect(simpleMatch("*.txt", "file.txt"));
-    try std.testing.expect(!simpleMatch("*.txt", "file.log"));
-    try std.testing.expect(simpleMatch("?oo", "foo"));
-    try std.testing.expect(simpleMatch("*", "anything"));
+test "expand single quoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .single_quoted = "hello world" }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "expand special param question mark" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    env_inst.last_exit_status = 42;
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .special = '?' } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("42", result);
+}
+
+test "expand special param hash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    const params: []const []const u8 = &.{ "a", "b", "c" };
+    env_inst.positional_params = params;
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .special = '#' } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("3", result);
+}
+
+test "expand positional param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    const params: []const []const u8 = &.{ "first", "second" };
+    env_inst.positional_params = params;
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .positional = 1 } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("first", result);
+
+    const word2 = ast.Word{ .parts = &.{.{ .parameter = .{ .positional = 2 } }} };
+    const result2 = try exp.expandWord(word2);
+    try std.testing.expectEqualStrings("second", result2);
+
+    const word3 = ast.Word{ .parts = &.{.{ .parameter = .{ .positional = 3 } }} };
+    const result3 = try exp.expandWord(word3);
+    try std.testing.expectEqualStrings("", result3);
+}
+
+test "expand length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("MSG", "hello", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .length = "MSG" } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("5", result);
+}
+
+test "expand length unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .length = "NOPE" } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("0", result);
+}
+
+test "expand alternative value set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("X", "val", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const alt_word = ast.Word{ .parts = &.{.{ .literal = "alt" }} };
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .alternative = .{
+        .name = "X",
+        .colon = false,
+        .word = alt_word,
+    } } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("alt", result);
+}
+
+test "expand alternative value unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const alt_word = ast.Word{ .parts = &.{.{ .literal = "alt" }} };
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .alternative = .{
+        .name = "NOPE",
+        .colon = false,
+        .word = alt_word,
+    } } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "expand assign value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const assign_word = ast.Word{ .parts = &.{.{ .literal = "assigned" }} };
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .assign = .{
+        .name = "NEW",
+        .colon = true,
+        .word = assign_word,
+    } } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("assigned", result);
+    try std.testing.expectEqualStrings("assigned", env_inst.get("NEW").?);
+}
+
+test "expand tilde" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("HOME", "/home/test", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .tilde = "~" }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("/home/test", result);
+}
+
+test "expand double quoted parts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("NAME", "world", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const inner_parts: []const ast.WordPart = &.{
+        .{ .literal = "hello " },
+        .{ .parameter = .{ .simple = "NAME" } },
+    };
+    const word = ast.Word{ .parts = &.{.{ .double_quoted = inner_parts }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "field splitting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("VAR", "one two three", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .simple = "VAR" } }} };
+    const fields = try exp.expandFields(word);
+    try std.testing.expectEqual(@as(usize, 3), fields.len);
+    try std.testing.expectEqualStrings("one", fields[0]);
+    try std.testing.expectEqualStrings("two", fields[1]);
+    try std.testing.expectEqualStrings("three", fields[2]);
+}
+
+test "no field split on literal plus single quoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{
+        .{ .literal = "ll=" },
+        .{ .single_quoted = "ls -l" },
+    } };
+    const fields = try exp.expandWordsToFields(&.{word});
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("ll=ls -l", fields[0]);
+}
+
+test "field split only unquoted expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("FOO", "a b", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const word = ast.Word{ .parts = &.{
+        .{ .parameter = .{ .simple = "FOO" } },
+        .{ .single_quoted = "bar" },
+    } };
+    const fields = try exp.expandWordsToFields(&.{word});
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("a", fields[0]);
+    try std.testing.expectEqualStrings("bbar", fields[1]);
+}
+
+test "expand default when var is set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var env_inst = @import("env.zig").Environment.init(alloc);
+    try env_inst.set("X", "existing", false);
+    var jobs = JobTable.init(alloc);
+    var exp = Expander.init(alloc, &env_inst, &jobs);
+
+    const default_word = ast.Word{ .parts = &.{.{ .literal = "default" }} };
+    const word = ast.Word{ .parts = &.{.{ .parameter = .{ .default = .{
+        .name = "X",
+        .colon = true,
+        .word = default_word,
+    } } }} };
+    const result = try exp.expandWord(word);
+    try std.testing.expectEqualStrings("existing", result);
 }

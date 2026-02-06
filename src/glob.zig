@@ -160,3 +160,52 @@ test "fnmatch basic" {
     try std.testing.expect(fnmatch("[!abc]", "d"));
     try std.testing.expect(!fnmatch("[!abc]", "a"));
 }
+
+test "fnmatch empty" {
+    try std.testing.expect(fnmatch("", ""));
+    try std.testing.expect(!fnmatch("", "a"));
+    try std.testing.expect(!fnmatch("a", ""));
+}
+
+test "fnmatch exact" {
+    try std.testing.expect(fnmatch("abc", "abc"));
+    try std.testing.expect(!fnmatch("abc", "abcd"));
+    try std.testing.expect(!fnmatch("abcd", "abc"));
+}
+
+test "fnmatch multiple wildcards" {
+    try std.testing.expect(fnmatch("*.*", "file.txt"));
+    try std.testing.expect(fnmatch("*.*", "a.b"));
+    try std.testing.expect(!fnmatch("*.*", "noext"));
+    try std.testing.expect(fnmatch("*.*.bak", "file.txt.bak"));
+    try std.testing.expect(fnmatch("a*b*c", "axbxc"));
+    try std.testing.expect(fnmatch("a*b*c", "abc"));
+    try std.testing.expect(!fnmatch("a*b*c", "ac"));
+}
+
+test "fnmatch question mark" {
+    try std.testing.expect(fnmatch("???", "abc"));
+    try std.testing.expect(!fnmatch("???", "ab"));
+    try std.testing.expect(!fnmatch("???", "abcd"));
+    try std.testing.expect(fnmatch("a?c", "abc"));
+    try std.testing.expect(!fnmatch("a?c", "adc_extra"));
+}
+
+test "fnmatch bracket negate caret" {
+    try std.testing.expect(fnmatch("[^abc]", "d"));
+    try std.testing.expect(!fnmatch("[^abc]", "a"));
+}
+
+test "fnmatch star matches empty" {
+    try std.testing.expect(fnmatch("*", ""));
+    try std.testing.expect(fnmatch("a*", "a"));
+    try std.testing.expect(fnmatch("*a", "a"));
+}
+
+test "hasGlobChars" {
+    try std.testing.expect(hasGlobChars("*.txt"));
+    try std.testing.expect(hasGlobChars("file?.c"));
+    try std.testing.expect(hasGlobChars("[abc]"));
+    try std.testing.expect(!hasGlobChars("plain.txt"));
+    try std.testing.expect(!hasGlobChars(""));
+}

@@ -33,7 +33,33 @@ pub const Shell = struct {
         self.history.saveFile();
         self.history.deinit();
         self.jobs.deinit();
+        for (&signals.trap_handlers) |*handler| {
+            if (handler.*) |h| {
+                self.gpa.free(h);
+                handler.* = null;
+            }
+        }
         self.env.deinit();
+    }
+
+    fn executeTrap(self: *Shell, action: []const u8) void {
+        _ = self.executeSource(action);
+    }
+
+    fn checkSignalTraps(self: *Shell) void {
+        while (signals.checkPendingSignals()) |sig| {
+            if (signals.trap_handlers[@intCast(sig)]) |action| {
+                self.executeTrap(action);
+            }
+        }
+    }
+
+    fn executeExitTrap(self: *Shell) void {
+        if (signals.getExitTrap()) |action| {
+            signals.setExitTrap(null);
+            self.executeTrap(action);
+            self.gpa.free(action);
+        }
     }
 
     pub fn executeSource(self: *Shell, source: []const u8) u8 {
@@ -56,24 +82,20 @@ pub const Shell = struct {
 
     pub fn executeFile(self: *Shell, path: []const u8) u8 {
         const fd = posix.open(path, posix.oRdonly(), 0) catch {
-            writeErr("zigsh: ");
-            writeErr(path);
-            writeErr(": No such file or directory\n");
+            posix.writeAll(2, "zigsh: ");
+            posix.writeAll(2, path);
+            posix.writeAll(2, ": No such file or directory\n");
             return 127;
         };
         defer posix.close(fd);
 
-        var buf: [65536]u8 = undefined;
         var content: std.ArrayListUnmanaged(u8) = .empty;
         defer content.deinit(self.gpa);
+        posix.readToEnd(fd, self.gpa, &content) catch return 1;
 
-        while (true) {
-            const n = posix.read(fd, &buf) catch break;
-            if (n == 0) break;
-            content.appendSlice(self.gpa, buf[0..n]) catch return 1;
-        }
-
-        return self.executeSource(content.items);
+        const status = self.executeSource(content.items);
+        self.executeExitTrap();
+        return status;
     }
 
     pub fn runInteractive(self: *Shell) u8 {
@@ -97,6 +119,7 @@ pub const Shell = struct {
         while (!self.env.should_exit) {
             self.jobs.updateJobStatus();
             self.jobs.notifyDoneJobs();
+            self.checkSignalTraps();
 
             const prompt = self.env.get("PS1") orelse "$ ";
             const line = editor.readLine(prompt) orelse break;
@@ -104,6 +127,7 @@ pub const Shell = struct {
 
             _ = self.executeSource(line);
         }
+        self.executeExitTrap();
         return self.env.exit_value;
     }
 
@@ -113,6 +137,7 @@ pub const Shell = struct {
         while (!self.env.should_exit) {
             self.jobs.updateJobStatus();
             self.jobs.notifyDoneJobs();
+            self.checkSignalTraps();
 
             const prompt = self.env.get("PS1") orelse "$ ";
             posix.writeAll(2, prompt);
@@ -123,6 +148,7 @@ pub const Shell = struct {
 
             _ = self.executeSource(line);
         }
+        self.executeExitTrap();
         return self.env.exit_value;
     }
 
@@ -138,12 +164,8 @@ pub const Shell = struct {
     }
 
     fn reportError(_: *Shell, prefix: []const u8, _: anyerror) void {
-        writeErr("zigsh: ");
-        writeErr(prefix);
-        writeErr("\n");
+        posix.writeAll(2, "zigsh: ");
+        posix.writeAll(2, prefix);
+        posix.writeAll(2, "\n");
     }
 };
-
-fn writeErr(msg: []const u8) void {
-    posix.writeAll(2, msg);
-}

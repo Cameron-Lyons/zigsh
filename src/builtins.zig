@@ -1,5 +1,6 @@
 const std = @import("std");
 const Environment = @import("env.zig").Environment;
+const JobTable = @import("jobs.zig").JobTable;
 const signals = @import("signals.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
@@ -33,14 +34,15 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "umask", &builtinUmask },
     .{ "type", &builtinType },
     .{ "getopts", &builtinGetopts },
+    .{ "fg", &builtinFg },
+    .{ "bg", &builtinBg },
+    .{ "alias", &builtinAlias },
+    .{ "unalias", &builtinUnalias },
+    .{ "hash", &builtinHash },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
     return builtins.get(name);
-}
-
-fn writeAll(fd: i32, data: []const u8) void {
-    posix.writeAll(fd, data);
 }
 
 fn builtinColon(_: []const []const u8, _: *Environment) u8 {
@@ -70,19 +72,54 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         args[1]
     else
         env.get("HOME") orelse {
-            writeAll(2, "cd: HOME not set\n");
+            posix.writeAll(2, "cd: HOME not set\n");
             return 1;
         };
 
     var old_buf: [4096]u8 = undefined;
     const old_pwd = posix.getcwd(&old_buf) catch null;
 
-    posix.chdir(target) catch {
-        writeAll(2, "cd: ");
-        writeAll(2, target);
-        writeAll(2, ": No such file or directory\n");
-        return 1;
-    };
+    const is_relative = target.len > 0 and target[0] != '/' and
+        !(target.len >= 1 and target[0] == '.') and
+        !std.mem.eql(u8, target, "-");
+
+    var cdpath_hit = false;
+    if (is_relative) {
+        if (env.get("CDPATH")) |cdpath| {
+            var cditer = std.mem.splitScalar(u8, cdpath, ':');
+            while (cditer.next()) |dir| {
+                var try_buf: [4096]u8 = undefined;
+                const try_path = std.fmt.bufPrint(&try_buf, "{s}/{s}", .{ dir, target }) catch continue;
+                if (posix.chdir(try_path)) {
+                    cdpath_hit = true;
+                    break;
+                } else |_| {}
+            }
+        }
+    }
+
+    if (!cdpath_hit) {
+        if (std.mem.eql(u8, target, "-")) {
+            const oldpwd = env.get("OLDPWD") orelse {
+                posix.writeAll(2, "cd: OLDPWD not set\n");
+                return 1;
+            };
+            posix.chdir(oldpwd) catch {
+                posix.writeAll(2, "cd: ");
+                posix.writeAll(2, oldpwd);
+                posix.writeAll(2, ": No such file or directory\n");
+                return 1;
+            };
+            cdpath_hit = true;
+        } else {
+            posix.chdir(target) catch {
+                posix.writeAll(2, "cd: ");
+                posix.writeAll(2, target);
+                posix.writeAll(2, ": No such file or directory\n");
+                return 1;
+            };
+        }
+    }
 
     if (old_pwd) |pwd| {
         env.set("OLDPWD", pwd, false) catch {};
@@ -92,6 +129,10 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
     const new_pwd = posix.getcwd(&new_buf) catch null;
     if (new_pwd) |pwd| {
         env.set("PWD", pwd, false) catch {};
+        if (cdpath_hit and is_relative) {
+            posix.writeAll(1, pwd);
+            posix.writeAll(1, "\n");
+        }
     }
 
     return 0;
@@ -100,11 +141,11 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
 fn builtinPwd(_: []const []const u8, _: *Environment) u8 {
     var buf: [4096]u8 = undefined;
     const cwd = posix.getcwd(&buf) catch {
-        writeAll(2, "pwd: error getting current directory\n");
+        posix.writeAll(2, "pwd: error getting current directory\n");
         return 1;
     };
-    writeAll(1, cwd);
-    writeAll(1, "\n");
+    posix.writeAll(1, cwd);
+    posix.writeAll(1, "\n");
     return 0;
 }
 
@@ -214,17 +255,17 @@ fn builtinEcho(args: []const []const u8, _: *Environment) u8 {
     }
 
     while (i < args.len) : (i += 1) {
-        if (i > 1 and (if (no_newline) i > 2 else i > 1)) writeAll(1, " ");
-        writeAll(1, args[i]);
+        if (i > 1 and (if (no_newline) i > 2 else i > 1)) posix.writeAll(1, " ");
+        posix.writeAll(1, args[i]);
     }
-    if (!no_newline) writeAll(1, "\n");
+    if (!no_newline) posix.writeAll(1, "\n");
     return 0;
 }
 
 fn builtinTest(args: []const []const u8, _: *Environment) u8 {
     const effective_args = if (args.len > 0 and std.mem.eql(u8, args[0], "[")) blk: {
         if (args.len < 2 or !std.mem.eql(u8, args[args.len - 1], "]")) {
-            writeAll(2, "[: missing ]\n");
+            posix.writeAll(2, "[: missing ]\n");
             return 2;
         }
         break :blk args[1 .. args.len - 1];
@@ -286,42 +327,37 @@ fn builtinJobs(_: []const []const u8, env: *Environment) u8 {
         if (slot.*) |*job| {
             var buf: [16]u8 = undefined;
             const id_str = std.fmt.bufPrint(&buf, "[{d}]", .{job.id}) catch "";
-            writeAll(1, id_str);
+            posix.writeAll(1, id_str);
             const state_str = switch (job.state) {
                 .running => "  Running\t\t",
                 .stopped => "  Stopped\t\t",
                 .done => "  Done\t\t",
             };
-            writeAll(1, state_str);
-            writeAll(1, job.command);
-            writeAll(1, "\n");
+            posix.writeAll(1, state_str);
+            posix.writeAll(1, job.command);
+            posix.writeAll(1, "\n");
         }
     }
     return 0;
 }
 
-fn builtinWait(args: []const []const u8, env: *Environment) u8 {
+fn builtinWait(args: []const []const u8, _: *Environment) u8 {
     if (args.len > 1) {
         const pid = std.fmt.parseInt(posix.pid_t, args[1], 10) catch return 127;
         const result = posix.waitpid(pid, 0);
         if (result.pid <= 0) return 127;
-        const status = if (result.status & 0x7f == 0)
-            @as(u8, @truncate((result.status >> 8) & 0xff))
-        else
-            @as(u8, @truncate(128 + (result.status & 0x7f)));
-        return status;
+        return posix.statusFromWait(result.status);
     }
     while (true) {
         const result = posix.waitpid(-1, 0);
         if (result.pid <= 0) break;
     }
-    _ = env;
     return 0;
 }
 
 fn builtinKill(args: []const []const u8, _: *Environment) u8 {
     if (args.len < 2) {
-        writeAll(2, "kill: usage: kill [-s signal] pid ...\n");
+        posix.writeAll(2, "kill: usage: kill [-s signal] pid ...\n");
         return 2;
     }
 
@@ -336,38 +372,53 @@ fn builtinKill(args: []const []const u8, _: *Environment) u8 {
 
     for (args[start..]) |arg| {
         const pid = std.fmt.parseInt(posix.pid_t, arg, 10) catch {
-            writeAll(2, "kill: invalid pid: ");
-            writeAll(2, arg);
-            writeAll(2, "\n");
+            posix.writeAll(2, "kill: invalid pid: ");
+            posix.writeAll(2, arg);
+            posix.writeAll(2, "\n");
             continue;
         };
         signals.sendSignal(pid, sig) catch {
-            writeAll(2, "kill: failed to send signal\n");
+            posix.writeAll(2, "kill: failed to send signal\n");
         };
     }
     return 0;
 }
 
-fn builtinTrap(args: []const []const u8, _: *Environment) u8 {
+fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 3) {
         if (args.len == 2 and std.mem.eql(u8, args[1], "-l")) {
-            writeAll(1, "HUP INT QUIT TERM USR1 USR2\n");
+            posix.writeAll(1, "EXIT HUP INT QUIT TERM USR1 USR2 ERR\n");
             return 0;
         }
         return 0;
     }
 
-    const action = args[1];
+    const action_src = args[1];
+    const reset = std.mem.eql(u8, action_src, "-") or std.mem.eql(u8, action_src, "");
+    const action = if (!reset) (env.alloc.dupe(u8, action_src) catch return 1) else @as(?[]const u8, null);
+
     for (args[2..]) |sig_name| {
+        if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
+            if (signals.getExitTrap()) |old| env.alloc.free(old);
+            signals.setExitTrap(action);
+            continue;
+        }
+        if (std.mem.eql(u8, sig_name, "ERR")) {
+            if (signals.getErrTrap()) |old| env.alloc.free(old);
+            signals.setErrTrap(action);
+            continue;
+        }
         const sig = sigFromName(sig_name) orelse {
-            writeAll(2, "trap: invalid signal: ");
-            writeAll(2, sig_name);
-            writeAll(2, "\n");
+            posix.writeAll(2, "trap: invalid signal: ");
+            posix.writeAll(2, sig_name);
+            posix.writeAll(2, "\n");
             continue;
         };
-        if (std.mem.eql(u8, action, "-") or std.mem.eql(u8, action, "")) {
+        if (reset) {
+            if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
             signals.setTrap(sig, null);
         } else {
+            if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
             signals.setTrap(sig, action);
         }
     }
@@ -391,7 +442,7 @@ fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
 
 fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
-        writeAll(2, "read: missing variable name\n");
+        posix.writeAll(2, "read: missing variable name\n");
         return 1;
     }
 
@@ -442,11 +493,11 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
         _ = libc.umask(current);
         var buf: [8]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{o:0>4}\n", .{current}) catch return 1;
-        writeAll(1, s);
+        posix.writeAll(1, s);
         return 0;
     }
     const new_mask = std.fmt.parseInt(c_uint, args[1], 8) catch {
-        writeAll(2, "umask: invalid mask\n");
+        posix.writeAll(2, "umask: invalid mask\n");
         return 1;
     };
     _ = libc.umask(new_mask);
@@ -457,20 +508,25 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) return 0;
     var status: u8 = 0;
     for (args[1..]) |name| {
-        if (builtins.get(name) != null) {
-            writeAll(1, name);
-            writeAll(1, " is a shell builtin\n");
+        if (env.getAlias(name)) |val| {
+            posix.writeAll(1, name);
+            posix.writeAll(1, " is aliased to '");
+            posix.writeAll(1, val);
+            posix.writeAll(1, "'\n");
+        } else if (builtins.get(name) != null) {
+            posix.writeAll(1, name);
+            posix.writeAll(1, " is a shell builtin\n");
         } else if (env.functions.get(name) != null) {
-            writeAll(1, name);
-            writeAll(1, " is a shell function\n");
+            posix.writeAll(1, name);
+            posix.writeAll(1, " is a shell function\n");
         } else if (findInPath(name, env)) {
-            writeAll(1, name);
-            writeAll(1, " is ");
-            writeAll(1, name);
-            writeAll(1, "\n");
+            posix.writeAll(1, name);
+            posix.writeAll(1, " is ");
+            posix.writeAll(1, name);
+            posix.writeAll(1, "\n");
         } else {
-            writeAll(2, name);
-            writeAll(2, ": not found\n");
+            posix.writeAll(2, name);
+            posix.writeAll(2, ": not found\n");
             status = 1;
         }
     }
@@ -495,7 +551,7 @@ fn findInPath(name: []const u8, env: *const Environment) bool {
 
 fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 3) {
-        writeAll(2, "getopts: usage: getopts optstring name [arg ...]\n");
+        posix.writeAll(2, "getopts: usage: getopts optstring name [arg ...]\n");
         return 2;
     }
     const optstring = args[1];
@@ -552,9 +608,9 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
                 env.set("OPTARG", params[optind - 1], false) catch {};
             } else {
                 env.set(varname, "?", false) catch {};
-                writeAll(2, "getopts: option requires an argument -- ");
-                writeAll(2, val);
-                writeAll(2, "\n");
+                posix.writeAll(2, "getopts: option requires an argument -- ");
+                posix.writeAll(2, val);
+                posix.writeAll(2, "\n");
                 optind += 1;
                 var ind_buf: [16]u8 = undefined;
                 const ind_str = std.fmt.bufPrint(&ind_buf, "{d}", .{optind}) catch return 1;
@@ -569,6 +625,174 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     const ind_str = std.fmt.bufPrint(&ind_buf, "{d}", .{optind}) catch return 1;
     env.set("OPTIND", ind_str, false) catch {};
     return 0;
+}
+
+fn builtinFg(args: []const []const u8, env: *Environment) u8 {
+    const jt = env.job_table orelse return 1;
+    const spec = if (args.len > 1) args[1] else "";
+    const job = jt.parseJobSpec(spec) orelse {
+        posix.writeAll(2, "fg: no such job\n");
+        return 1;
+    };
+
+    posix.writeAll(2, job.command);
+    posix.writeAll(2, "\n");
+
+    signals.sendSignal(job.pgid, signals.SIGCONT) catch {};
+
+    posix.tcsetpgrp(0, job.pgid) catch {};
+
+    const result = posix.waitpid(job.pid, 2);
+    const shell_pgid = posix.getpid();
+    posix.tcsetpgrp(0, shell_pgid) catch {};
+
+    if (result.pid > 0) {
+        if (result.status & 0xff == 0x7f) {
+            job.state = .stopped;
+            job.notified = false;
+            posix.writeAll(2, "\n[");
+            var buf: [16]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&buf, "{d}", .{job.id}) catch "";
+            posix.writeAll(2, id_str);
+            posix.writeAll(2, "]  Stopped\t\t");
+            posix.writeAll(2, job.command);
+            posix.writeAll(2, "\n");
+            return @truncate(128 + ((result.status >> 8) & 0xff));
+        }
+        const status = posix.statusFromWait(result.status);
+        jt.removeJob(job.id);
+        return status;
+    }
+    return 1;
+}
+
+fn builtinBg(args: []const []const u8, env: *Environment) u8 {
+    const jt = env.job_table orelse return 1;
+    const spec = if (args.len > 1) args[1] else "";
+    const job = jt.parseJobSpec(spec) orelse {
+        posix.writeAll(2, "bg: no such job\n");
+        return 1;
+    };
+
+    if (job.state != .stopped) {
+        posix.writeAll(2, "bg: job is not stopped\n");
+        return 1;
+    }
+
+    signals.sendSignal(job.pgid, signals.SIGCONT) catch {};
+    job.state = .running;
+
+    posix.writeAll(1, "[");
+    var buf: [16]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&buf, "{d}", .{job.id}) catch "";
+    posix.writeAll(1, id_str);
+    posix.writeAll(1, "]  ");
+    posix.writeAll(1, job.command);
+    posix.writeAll(1, " &\n");
+    return 0;
+}
+
+fn builtinAlias(args: []const []const u8, env: *Environment) u8 {
+    if (args.len < 2) {
+        var it = env.aliases.iterator();
+        while (it.next()) |entry| {
+            posix.writeAll(1, "alias ");
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "='");
+            posix.writeAll(1, entry.value_ptr.*);
+            posix.writeAll(1, "'\n");
+        }
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (args[1..]) |arg| {
+        if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
+            const name = arg[0..eq];
+            const value = arg[eq + 1 ..];
+            env.setAlias(name, value) catch {
+                status = 1;
+            };
+        } else {
+            if (env.getAlias(arg)) |val| {
+                posix.writeAll(1, "alias ");
+                posix.writeAll(1, arg);
+                posix.writeAll(1, "='");
+                posix.writeAll(1, val);
+                posix.writeAll(1, "'\n");
+            } else {
+                posix.writeAll(2, "alias: ");
+                posix.writeAll(2, arg);
+                posix.writeAll(2, " not found\n");
+                status = 1;
+            }
+        }
+    }
+    return status;
+}
+
+fn builtinUnalias(args: []const []const u8, env: *Environment) u8 {
+    if (args.len < 2) {
+        posix.writeAll(2, "unalias: usage: unalias [-a] name ...\n");
+        return 2;
+    }
+
+    if (std.mem.eql(u8, args[1], "-a")) {
+        env.clearAliases();
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (args[1..]) |name| {
+        if (!env.removeAlias(name)) {
+            posix.writeAll(2, "unalias: ");
+            posix.writeAll(2, name);
+            posix.writeAll(2, ": not found\n");
+            status = 1;
+        }
+    }
+    return status;
+}
+
+fn builtinHash(args: []const []const u8, env: *Environment) u8 {
+    if (args.len < 2) {
+        var it = env.command_hash.iterator();
+        while (it.next()) |entry| {
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "\t");
+            posix.writeAll(1, entry.value_ptr.*);
+            posix.writeAll(1, "\n");
+        }
+        return 0;
+    }
+
+    if (std.mem.eql(u8, args[1], "-r")) {
+        env.clearCommandHash();
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (args[1..]) |name| {
+        if (findInPath(name, env)) {
+            const path_env = env.get("PATH") orelse "/usr/bin:/bin";
+            var iter = std.mem.splitScalar(u8, path_env, ':');
+            while (iter.next()) |dir| {
+                var full_buf: [4096]u8 = undefined;
+                const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                const full_z = std.posix.toPosixPath(full) catch continue;
+                if (posix.access(&full_z, 1)) {
+                    env.cacheCommand(name, full) catch {};
+                    break;
+                }
+            }
+        } else {
+            posix.writeAll(2, "hash: ");
+            posix.writeAll(2, name);
+            posix.writeAll(2, ": not found\n");
+            status = 1;
+        }
+    }
+    return status;
 }
 
 fn sigFromName(name: []const u8) ?u6 {

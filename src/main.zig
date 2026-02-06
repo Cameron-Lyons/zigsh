@@ -11,13 +11,13 @@ pub const expander = @import("expander.zig");
 pub const builtins = @import("builtins.zig");
 pub const executor = @import("executor.zig");
 pub const shell = @import("shell.zig");
-pub const errors = @import("errors.zig");
 pub const types = @import("types.zig");
 pub const arithmetic = @import("arithmetic.zig");
 pub const glob = @import("glob.zig");
 pub const signals = @import("signals.zig");
 pub const jobs = @import("jobs.zig");
 pub const line_editor = @import("line_editor.zig");
+pub const posix = @import("posix.zig");
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (std.mem.eql(u8, args[i], "-c")) {
                 i += 1;
                 if (i >= args.len) {
-                    writeErr("zigsh: -c: option requires an argument\n");
+                    posix.writeAll(2, "zigsh: -c: option requires an argument\n");
                     return 2;
                 }
                 return sh.executeSource(args[i]);
@@ -58,19 +58,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    if (isatty(0)) {
+    if (posix.isatty(0)) {
         sh.env.set("PS1", "$ ", false) catch {};
     }
 
     return sh.runInteractive();
-}
-
-fn isatty(fd: i32) bool {
-    return std.c.isatty(fd) != 0;
-}
-
-fn writeErr(msg: []const u8) void {
-    _ = std.c.write(2, msg.ptr, msg.len);
 }
 
 test {
@@ -81,4 +73,6 @@ test {
     _ = expander;
     _ = arithmetic;
     _ = glob;
+    _ = types;
+    _ = posix;
 }
