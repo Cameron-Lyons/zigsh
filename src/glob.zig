@@ -121,6 +121,23 @@ fn matchBracket(pattern: []const u8, pi: *usize, ch: u8) bool {
         }
         first = false;
 
+        if (pattern[i] == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
+            const class_start = i + 2;
+            var j = class_start;
+            while (j + 1 < pattern.len) {
+                if (pattern[j] == ':' and pattern[j + 1] == ']') break;
+                j += 1;
+            }
+            if (j + 1 < pattern.len and pattern[j] == ':' and pattern[j + 1] == ']') {
+                const class_name = pattern[class_start..j];
+                if (matchCharClass(class_name, ch)) {
+                    matched = true;
+                }
+                i = j + 2;
+                continue;
+            }
+        }
+
         if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
             if (ch >= pattern[i] and ch <= pattern[i + 2]) {
                 matched = true;
@@ -132,6 +149,35 @@ fn matchBracket(pattern: []const u8, pi: *usize, ch: u8) bool {
             }
             i += 1;
         }
+    }
+    return false;
+}
+
+fn matchCharClass(class_name: []const u8, ch: u8) bool {
+    if (std.mem.eql(u8, class_name, "alpha")) {
+        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z');
+    } else if (std.mem.eql(u8, class_name, "digit")) {
+        return ch >= '0' and ch <= '9';
+    } else if (std.mem.eql(u8, class_name, "alnum")) {
+        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9');
+    } else if (std.mem.eql(u8, class_name, "space")) {
+        return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == 0x0b or ch == 0x0c;
+    } else if (std.mem.eql(u8, class_name, "upper")) {
+        return ch >= 'A' and ch <= 'Z';
+    } else if (std.mem.eql(u8, class_name, "lower")) {
+        return ch >= 'a' and ch <= 'z';
+    } else if (std.mem.eql(u8, class_name, "punct")) {
+        return (ch >= '!' and ch <= '/') or (ch >= ':' and ch <= '@') or (ch >= '[' and ch <= '`') or (ch >= '{' and ch <= '~');
+    } else if (std.mem.eql(u8, class_name, "cntrl")) {
+        return ch < 0x20 or ch == 0x7f;
+    } else if (std.mem.eql(u8, class_name, "graph")) {
+        return ch > 0x20 and ch < 0x7f;
+    } else if (std.mem.eql(u8, class_name, "print")) {
+        return ch >= 0x20 and ch < 0x7f;
+    } else if (std.mem.eql(u8, class_name, "xdigit")) {
+        return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+    } else if (std.mem.eql(u8, class_name, "blank")) {
+        return ch == ' ' or ch == '\t';
     }
     return false;
 }
@@ -208,4 +254,47 @@ test "hasGlobChars" {
     try std.testing.expect(hasGlobChars("[abc]"));
     try std.testing.expect(!hasGlobChars("plain.txt"));
     try std.testing.expect(!hasGlobChars(""));
+}
+
+test "POSIX character classes" {
+    try std.testing.expect(fnmatch("[[:upper:]]", "A"));
+    try std.testing.expect(fnmatch("[[:upper:]]", "Z"));
+    try std.testing.expect(!fnmatch("[[:upper:]]", "a"));
+    try std.testing.expect(!fnmatch("[[:upper:]]", "1"));
+
+    try std.testing.expect(fnmatch("[[:lower:]]", "a"));
+    try std.testing.expect(!fnmatch("[[:lower:]]", "A"));
+
+    try std.testing.expect(fnmatch("[[:digit:]]", "5"));
+    try std.testing.expect(!fnmatch("[[:digit:]]", "x"));
+
+    try std.testing.expect(fnmatch("[[:alpha:]]", "a"));
+    try std.testing.expect(fnmatch("[[:alpha:]]", "Z"));
+    try std.testing.expect(!fnmatch("[[:alpha:]]", "1"));
+
+    try std.testing.expect(fnmatch("[[:alnum:]]", "a"));
+    try std.testing.expect(fnmatch("[[:alnum:]]", "5"));
+    try std.testing.expect(!fnmatch("[[:alnum:]]", "!"));
+
+    try std.testing.expect(fnmatch("[[:space:]]", " "));
+    try std.testing.expect(fnmatch("[[:space:]]", "\t"));
+    try std.testing.expect(!fnmatch("[[:space:]]", "a"));
+
+    try std.testing.expect(fnmatch("[[:xdigit:]]", "a"));
+    try std.testing.expect(fnmatch("[[:xdigit:]]", "F"));
+    try std.testing.expect(fnmatch("[[:xdigit:]]", "9"));
+    try std.testing.expect(!fnmatch("[[:xdigit:]]", "g"));
+
+    try std.testing.expect(fnmatch("[[:blank:]]", " "));
+    try std.testing.expect(fnmatch("[[:blank:]]", "\t"));
+    try std.testing.expect(!fnmatch("[[:blank:]]", "\n"));
+
+    try std.testing.expect(fnmatch("[[:punct:]]", "!"));
+    try std.testing.expect(!fnmatch("[[:punct:]]", "a"));
+
+    try std.testing.expect(fnmatch("[[:upper:][:digit:]]", "A"));
+    try std.testing.expect(fnmatch("[[:upper:][:digit:]]", "5"));
+    try std.testing.expect(!fnmatch("[[:upper:][:digit:]]", "a"));
+
+    try std.testing.expect(!fnmatch("[[:upper:]]", ""));
 }

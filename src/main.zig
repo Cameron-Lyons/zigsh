@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (posix.isatty(0)) {
         sh.env.set("PS1", "$ ", false) catch {};
     }
+    sh.env.set("PS2", "> ", false) catch {};
 
     sh.env.options.interactive = true;
     sh.loadEnvFile();

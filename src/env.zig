@@ -156,7 +156,7 @@ pub const Environment = struct {
 
     pub fn set(self: *Environment, name: []const u8, value: []const u8, exported: bool) !void {
         if (self.vars.get(name)) |existing| {
-            if (existing.readonly) return;
+            if (existing.readonly) return error.ReadonlyVariable;
         }
 
         const owned_value = try self.alloc.dupe(u8, value);
@@ -284,6 +284,13 @@ pub const Environment = struct {
         return self.command_hash.get(name);
     }
 
+    pub fn removeCachedCommand(self: *Environment, name: []const u8) void {
+        if (self.command_hash.fetchRemove(name)) |kv| {
+            self.alloc.free(kv.key);
+            self.alloc.free(kv.value);
+        }
+    }
+
     pub fn clearCommandHash(self: *Environment) void {
         var it = self.command_hash.iterator();
         while (it.next()) |entry| {
@@ -320,7 +327,7 @@ test "env readonly" {
 
     try env.set("RO", "original", false);
     env.markReadonly("RO");
-    try env.set("RO", "modified", false);
+    try std.testing.expectError(error.ReadonlyVariable, env.set("RO", "modified", false));
     try std.testing.expectEqualStrings("original", env.get("RO").?);
 }
 

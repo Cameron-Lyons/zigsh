@@ -505,9 +505,14 @@ pub const Expander = struct {
             fn f(name: []const u8) ?[]const u8 {
                 return env.get(name);
             }
+            fn setter(name: []const u8, val: i64) void {
+                var buf: [32]u8 = undefined;
+                const val_str = std.fmt.bufPrint(&buf, "{d}", .{val}) catch return;
+                env.set(name, val_str, false) catch {};
+            }
         };
         lookup.env = env_ptr;
-        const result = Arithmetic.evaluate(final_expr, &lookup.f) catch return error.ArithmeticError;
+        const result = Arithmetic.evaluateWithSetter(final_expr, &lookup.f, &lookup.setter) catch return error.ArithmeticError;
         return std.fmt.allocPrint(self.alloc, "{d}", .{result});
     }
 
