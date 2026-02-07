@@ -726,6 +726,17 @@ fn printfParseNumericArg(arg: []const u8, had_error: *bool) i64 {
     if (arg.len >= 2 and arg[0] == '"') {
         return @intCast(arg[1]);
     }
+    var s = arg;
+    var negative = false;
+    if (s.len > 0 and s[0] == '-') {
+        negative = true;
+        s = s[1..];
+    } else if (s.len > 0 and s[0] == '+') {
+        s = s[1..];
+    }
+    if (s.len >= 2 and s[0] == '0' and s[1] != 'x' and s[1] != 'X') {
+        if (std.fmt.parseInt(i64, s, 8)) |v| return if (negative) -v else v else |_| {}
+    }
     if (std.fmt.parseInt(i64, arg, 0)) |v| return v else |_| {}
     had_error.* = true;
     posix.writeAll(2, "printf: '");
