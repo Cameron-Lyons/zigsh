@@ -43,6 +43,7 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "printf", &builtinPrintf },
     .{ "fc", &builtinFc },
     .{ "times", &builtinTimes },
+    .{ "ulimit", &builtinUlimit },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
@@ -129,6 +130,12 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
                 posix.writeAll(2, ": No such file or directory\n");
                 return 1;
             };
+            var cd_dash_buf: [4096]u8 = undefined;
+            const cd_dash_pwd = posix.getcwd(&cd_dash_buf) catch null;
+            if (cd_dash_pwd) |p| {
+                posix.writeAll(1, p);
+                posix.writeAll(1, "\n");
+            }
             cdpath_hit = true;
         } else {
             posix.chdir(target) catch {
@@ -174,7 +181,27 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
-fn builtinPwd(_: []const []const u8, _: *Environment) u8 {
+fn builtinPwd(args: []const []const u8, env: *Environment) u8 {
+    var physical = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-L")) {
+            physical = false;
+        } else if (std.mem.eql(u8, args[i], "-P")) {
+            physical = true;
+        } else break;
+    }
+
+    if (!physical) {
+        if (env.get("PWD")) |pwd| {
+            if (pwd.len > 0 and pwd[0] == '/') {
+                posix.writeAll(1, pwd);
+                posix.writeAll(1, "\n");
+                return 0;
+            }
+        }
+    }
+
     var buf: [4096]u8 = undefined;
     const cwd = posix.getcwd(&buf) catch {
         posix.writeAll(2, "pwd: error getting current directory\n");
@@ -213,18 +240,49 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
-    for (args[1..]) |name| {
-        env.unset(name);
+    var unset_func = false;
+    var start: usize = 1;
+    while (start < args.len) {
+        if (std.mem.eql(u8, args[start], "-v")) {
+            unset_func = false;
+            start += 1;
+        } else if (std.mem.eql(u8, args[start], "-f")) {
+            unset_func = true;
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    for (args[start..]) |name| {
+        if (unset_func) {
+            _ = env.unsetFunction(name);
+        } else {
+            env.unset(name);
+        }
     }
     return 0;
 }
 
 fn builtinSet(args: []const []const u8, env: *Environment) u8 {
-    if (args.len < 2) return 0;
+    if (args.len < 2) {
+        var it = env.vars.iterator();
+        while (it.next()) |entry| {
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "=");
+            posix.writeAll(1, entry.value_ptr.value);
+            posix.writeAll(1, "\n");
+        }
+        return 0;
+    }
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            env.positional_params = args[i..];
+            return 0;
+        }
         if (arg.len < 2 or (arg[0] != '-' and arg[0] != '+')) break;
         const enable = arg[0] == '-';
 
@@ -234,6 +292,8 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
                 setOptionByName(&env.options, args[i], enable);
             } else if (enable) {
                 printOptions(&env.options);
+            } else {
+                printOptionsReinput(&env.options);
             }
             continue;
         }
@@ -255,10 +315,6 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
                 else => {},
             }
         }
-    }
-
-    if (i < args.len and std.mem.eql(u8, args[i], "--")) {
-        i += 1;
     }
 
     if (i < args.len) {
@@ -285,6 +341,26 @@ fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable:
 }
 
 fn printOptions(options: *const Environment.ShellOptions) void {
+    const entries = [_]struct { name: []const u8, value: bool }{
+        .{ .name = "allexport", .value = options.allexport },
+        .{ .name = "errexit", .value = options.errexit },
+        .{ .name = "monitor", .value = options.monitor },
+        .{ .name = "noclobber", .value = options.noclobber },
+        .{ .name = "noexec", .value = options.noexec },
+        .{ .name = "noglob", .value = options.noglob },
+        .{ .name = "nounset", .value = options.nounset },
+        .{ .name = "verbose", .value = options.verbose },
+        .{ .name = "xtrace", .value = options.xtrace },
+    };
+    for (entries) |entry| {
+        posix.writeAll(1, "set ");
+        posix.writeAll(1, if (entry.value) "-o " else "+o ");
+        posix.writeAll(1, entry.name);
+        posix.writeAll(1, "\n");
+    }
+}
+
+fn printOptionsReinput(options: *const Environment.ShellOptions) void {
     const entries = [_]struct { name: []const u8, value: bool }{
         .{ .name = "allexport", .value = options.allexport },
         .{ .name = "errexit", .value = options.errexit },
@@ -595,13 +671,38 @@ fn testBinary(left: []const u8, op: []const u8, right: []const u8) u8 {
     return 2;
 }
 
-fn builtinJobs(_: []const []const u8, env: *Environment) u8 {
+fn builtinJobs(args: []const []const u8, env: *Environment) u8 {
     const jt = env.job_table orelse return 1;
+    var show_long = false;
+    var pids_only = false;
+    for (args[1..]) |arg| {
+        if (arg.len > 1 and arg[0] == '-') {
+            for (arg[1..]) |flag_c| {
+                switch (flag_c) {
+                    'l' => show_long = true,
+                    'p' => pids_only = true,
+                    else => {},
+                }
+            }
+        }
+    }
+
     for (&jt.jobs.*) |*slot| {
         if (slot.*) |*job| {
+            if (pids_only) {
+                var pid_buf: [16]u8 = undefined;
+                const pid_str = std.fmt.bufPrint(&pid_buf, "{d}\n", .{job.pid}) catch "";
+                posix.writeAll(1, pid_str);
+                continue;
+            }
             var buf: [16]u8 = undefined;
             const id_str = std.fmt.bufPrint(&buf, "[{d}]", .{job.id}) catch "";
             posix.writeAll(1, id_str);
+            if (show_long) {
+                var pid_buf: [16]u8 = undefined;
+                const pid_str = std.fmt.bufPrint(&pid_buf, " {d}", .{job.pid}) catch "";
+                posix.writeAll(1, pid_str);
+            }
             const state_str = switch (job.state) {
                 .running => "  Running\t\t",
                 .stopped => "  Stopped\t\t",
@@ -615,12 +716,46 @@ fn builtinJobs(_: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
-fn builtinWait(args: []const []const u8, _: *Environment) u8 {
+fn builtinWait(args: []const []const u8, env: *Environment) u8 {
     if (args.len > 1) {
-        const pid = std.fmt.parseInt(posix.pid_t, args[1], 10) catch return 127;
-        const result = posix.waitpid(pid, 0);
-        if (result.pid <= 0) return 127;
-        return posix.statusFromWait(result.status);
+        var status: u8 = 0;
+        for (args[1..]) |arg| {
+            if (arg.len > 0 and arg[0] == '%') {
+                const jt = env.job_table orelse {
+                    posix.writeAll(2, "wait: no job control\n");
+                    status = 127;
+                    continue;
+                };
+                const job = jt.parseJobSpec(arg) orelse {
+                    posix.writeAll(2, "wait: no such job: ");
+                    posix.writeAll(2, arg);
+                    posix.writeAll(2, "\n");
+                    status = 127;
+                    continue;
+                };
+                const result = posix.waitpid(job.pid, 0);
+                if (result.pid <= 0) {
+                    status = 127;
+                } else {
+                    status = posix.statusFromWait(result.status);
+                }
+            } else {
+                const pid = std.fmt.parseInt(posix.pid_t, arg, 10) catch {
+                    posix.writeAll(2, "wait: invalid pid: ");
+                    posix.writeAll(2, arg);
+                    posix.writeAll(2, "\n");
+                    status = 127;
+                    continue;
+                };
+                const result = posix.waitpid(pid, 0);
+                if (result.pid <= 0) {
+                    status = 127;
+                } else {
+                    status = posix.statusFromWait(result.status);
+                }
+            }
+        }
+        return status;
     }
     while (true) {
         const result = posix.waitpid(-1, 0);
@@ -629,21 +764,70 @@ fn builtinWait(args: []const []const u8, _: *Environment) u8 {
     return 0;
 }
 
-fn builtinKill(args: []const []const u8, _: *Environment) u8 {
+fn builtinKill(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
-        posix.writeAll(2, "kill: usage: kill [-s signal] pid ...\n");
+        posix.writeAll(2, "kill: usage: kill [-s signal | -signal] pid ...\n");
         return 2;
     }
 
     var sig: u6 = signals.SIGTERM;
     var start: usize = 1;
 
-    if (args.len > 2 and args[1].len > 1 and args[1][0] == '-') {
-        const sig_str = args[1][1..];
-        sig = std.fmt.parseInt(u6, sig_str, 10) catch signals.SIGTERM;
-        start = 2;
+    if (std.mem.eql(u8, args[1], "-l")) {
+        if (args.len > 2) {
+            for (args[2..]) |arg| {
+                var exit_num = std.fmt.parseInt(u32, arg, 10) catch {
+                    posix.writeAll(2, "kill: invalid signal number: ");
+                    posix.writeAll(2, arg);
+                    posix.writeAll(2, "\n");
+                    return 1;
+                };
+                if (exit_num > 128) exit_num -= 128;
+                if (signals.sigNameFromNum(@intCast(exit_num & 0x3f))) |name| {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "\n");
+                } else {
+                    posix.writeAll(2, "kill: unknown signal: ");
+                    posix.writeAll(2, arg);
+                    posix.writeAll(2, "\n");
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        posix.writeAll(1, "HUP INT QUIT ABRT KILL USR1 USR2 PIPE ALRM TERM CHLD CONT STOP TSTP TTIN TTOU\n");
+        return 0;
     }
 
+    if (std.mem.eql(u8, args[1], "-s")) {
+        if (args.len < 3) {
+            posix.writeAll(2, "kill: -s requires a signal name\n");
+            return 2;
+        }
+        sig = sigFromName(args[2]) orelse {
+            posix.writeAll(2, "kill: invalid signal: ");
+            posix.writeAll(2, args[2]);
+            posix.writeAll(2, "\n");
+            return 1;
+        };
+        start = 3;
+    } else if (args[1].len > 1 and args[1][0] == '-') {
+        const sig_str = args[1][1..];
+        if (std.fmt.parseInt(u6, sig_str, 10)) |n| {
+            sig = n;
+            start = 2;
+        } else |_| {
+            sig = sigFromName(sig_str) orelse {
+                posix.writeAll(2, "kill: invalid signal: ");
+                posix.writeAll(2, sig_str);
+                posix.writeAll(2, "\n");
+                return 1;
+            };
+            start = 2;
+        }
+    }
+
+    _ = env;
     for (args[start..]) |arg| {
         const pid = std.fmt.parseInt(posix.pid_t, arg, 10) catch {
             posix.writeAll(2, "kill: invalid pid: ");
@@ -659,15 +843,21 @@ fn builtinKill(args: []const []const u8, _: *Environment) u8 {
 }
 
 fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
+    if (args.len == 2 and std.mem.eql(u8, args[1], "-l")) {
+        posix.writeAll(1, "EXIT HUP INT QUIT TERM USR1 USR2 ERR\n");
+        return 0;
+    }
+    if (args.len == 1 or (args.len == 2 and std.mem.eql(u8, args[1], "-p"))) {
+        printTraps();
+        return 0;
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "-p")) {
+        for (args[2..]) |sig_name| {
+            printSpecificTrap(sig_name);
+        }
+        return 0;
+    }
     if (args.len < 3) {
-        if (args.len == 2 and std.mem.eql(u8, args[1], "-l")) {
-            posix.writeAll(1, "EXIT HUP INT QUIT TERM USR1 USR2 ERR\n");
-            return 0;
-        }
-        if (args.len == 1 or (args.len == 2 and std.mem.eql(u8, args[1], "-p"))) {
-            printTraps();
-            return 0;
-        }
         return 0;
     }
 
@@ -1326,11 +1516,110 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
         posix.writeAll(1, s);
         return 0;
     }
-    const new_mask = std.fmt.parseInt(c_uint, args[1], 8) catch {
-        posix.writeAll(2, "umask: invalid mask\n");
-        return 1;
-    };
-    _ = libc.umask(new_mask);
+
+    var symbolic_display = false;
+    var arg_start: usize = 1;
+    if (std.mem.eql(u8, args[1], "-S")) {
+        symbolic_display = true;
+        arg_start = 2;
+    }
+
+    if (symbolic_display and arg_start >= args.len) {
+        const current = libc.umask(0);
+        _ = libc.umask(current);
+        const perm: c_uint = ~current & 0o777;
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "u={s}{s}{s},g={s}{s}{s},o={s}{s}{s}\n", .{
+            @as([]const u8, if (perm & 0o400 != 0) "r" else ""),
+            @as([]const u8, if (perm & 0o200 != 0) "w" else ""),
+            @as([]const u8, if (perm & 0o100 != 0) "x" else ""),
+            @as([]const u8, if (perm & 0o040 != 0) "r" else ""),
+            @as([]const u8, if (perm & 0o020 != 0) "w" else ""),
+            @as([]const u8, if (perm & 0o010 != 0) "x" else ""),
+            @as([]const u8, if (perm & 0o004 != 0) "r" else ""),
+            @as([]const u8, if (perm & 0o002 != 0) "w" else ""),
+            @as([]const u8, if (perm & 0o001 != 0) "x" else ""),
+        }) catch return 1;
+        posix.writeAll(1, s);
+        return 0;
+    }
+
+    if (arg_start >= args.len) return 0;
+    const mask_arg = args[arg_start];
+
+    if (std.fmt.parseInt(c_uint, mask_arg, 8)) |new_mask| {
+        _ = libc.umask(new_mask);
+        return 0;
+    } else |_| {}
+
+    const current = libc.umask(0);
+    var perm: c_uint = ~current & 0o777;
+
+    var i: usize = 0;
+    while (i < mask_arg.len) {
+        var who_u = false;
+        var who_g = false;
+        var who_o = false;
+        while (i < mask_arg.len) : (i += 1) {
+            switch (mask_arg[i]) {
+                'u' => who_u = true,
+                'g' => who_g = true,
+                'o' => who_o = true,
+                'a' => {
+                    who_u = true;
+                    who_g = true;
+                    who_o = true;
+                },
+                else => break,
+            }
+        }
+        if (!who_u and !who_g and !who_o) {
+            who_u = true;
+            who_g = true;
+            who_o = true;
+        }
+
+        if (i >= mask_arg.len) break;
+        const op = mask_arg[i];
+        if (op != '=' and op != '+' and op != '-') {
+            posix.writeAll(2, "umask: invalid symbolic mode\n");
+            _ = libc.umask(current);
+            return 1;
+        }
+        i += 1;
+
+        var bits: c_uint = 0;
+        while (i < mask_arg.len and mask_arg[i] != ',') : (i += 1) {
+            switch (mask_arg[i]) {
+                'r' => bits |= 4,
+                'w' => bits |= 2,
+                'x' => bits |= 1,
+                else => break,
+            }
+        }
+
+        var mask_bits: c_uint = 0;
+        if (who_u) mask_bits |= bits << 6;
+        if (who_g) mask_bits |= bits << 3;
+        if (who_o) mask_bits |= bits;
+
+        switch (op) {
+            '=' => {
+                var clear: c_uint = 0;
+                if (who_u) clear |= 0o700;
+                if (who_g) clear |= 0o070;
+                if (who_o) clear |= 0o007;
+                perm = (perm & ~clear) | mask_bits;
+            },
+            '+' => perm |= mask_bits,
+            '-' => perm &= ~mask_bits,
+            else => {},
+        }
+
+        if (i < mask_arg.len and mask_arg[i] == ',') i += 1;
+    }
+
+    _ = libc.umask(~perm & 0o777);
     return 0;
 }
 
@@ -1349,10 +1638,10 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
         } else if (env.functions.get(name) != null) {
             posix.writeAll(1, name);
             posix.writeAll(1, " is a shell function\n");
-        } else if (findInPath(name, env)) {
+        } else if (findInPathStr(name, env)) |path| {
             posix.writeAll(1, name);
             posix.writeAll(1, " is ");
-            posix.writeAll(1, name);
+            posix.writeAll(1, path);
             posix.writeAll(1, "\n");
         } else {
             posix.writeAll(2, name);
@@ -1379,18 +1668,44 @@ fn findInPath(name: []const u8, env: *const Environment) bool {
     return false;
 }
 
+var find_path_result_buf: [4096]u8 = undefined;
+
+fn findInPathStr(name: []const u8, env: *const Environment) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const path_z = std.posix.toPosixPath(name) catch return null;
+        if (posix.access(&path_z, 1)) return name;
+        return null;
+    }
+    const path_env = env.get("PATH") orelse "/usr/bin:/bin";
+    var iter = std.mem.splitScalar(u8, path_env, ':');
+    while (iter.next()) |dir| {
+        const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const full_z = std.posix.toPosixPath(full) catch continue;
+        if (posix.access(&full_z, 1)) return full;
+    }
+    return null;
+}
+
 fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 3) {
         posix.writeAll(2, "getopts: usage: getopts optstring name [arg ...]\n");
         return 2;
     }
-    const optstring = args[1];
+    const raw_optstring = args[1];
     const varname = args[2];
     const params = if (args.len > 3) args[3..] else env.positional_params;
+
+    const silent = raw_optstring.len > 0 and raw_optstring[0] == ':';
+    const optstring = if (silent) raw_optstring[1..] else raw_optstring;
 
     const optind_str = env.get("OPTIND") orelse "1";
     var optind = std.fmt.parseInt(usize, optind_str, 10) catch 1;
     if (optind == 0) optind = 1;
+
+    var optpos_val: usize = 0;
+    if (env.get("OPTPOS")) |pos_str| {
+        optpos_val = std.fmt.parseInt(usize, pos_str, 10) catch 0;
+    }
 
     if (optind > params.len) {
         env.set(varname, "?", false) catch {};
@@ -1398,26 +1713,26 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     }
 
     const current_arg = params[optind - 1];
-    if (current_arg.len < 2 or current_arg[0] != '-' or current_arg[1] == '-') {
-        env.set(varname, "?", false) catch {};
-        return 1;
+
+    if (optpos_val == 0) {
+        if (current_arg.len < 2 or current_arg[0] != '-' or std.mem.eql(u8, current_arg, "--")) {
+            env.set(varname, "?", false) catch {};
+            return 1;
+        }
+        optpos_val = 1;
     }
 
-    const opt_char = current_arg[1];
+    const opt_char = current_arg[optpos_val];
     var found = false;
     var expects_arg = false;
-    for (optstring) |ch| {
+    for (optstring, 0..) |ch, idx| {
+        if (ch == ':') continue;
         if (ch == opt_char) {
             found = true;
-            break;
-        }
-    }
-    if (found) {
-        for (optstring, 0..) |ch, idx| {
-            if (ch == opt_char and idx + 1 < optstring.len and optstring[idx + 1] == ':') {
+            if (idx + 1 < optstring.len and optstring[idx + 1] == ':') {
                 expects_arg = true;
-                break;
             }
+            break;
         }
     }
 
@@ -1426,34 +1741,68 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     const val: []const u8 = val_buf[0..1];
 
     if (!found) {
-        env.set(varname, "?", false) catch {};
-        env.set("OPTARG", val, false) catch {};
+        if (silent) {
+            env.set(varname, "?", false) catch {};
+            env.set("OPTARG", val, false) catch {};
+        } else {
+            env.set(varname, "?", false) catch {};
+            posix.writeAll(2, "getopts: illegal option -- ");
+            posix.writeAll(2, val);
+            posix.writeAll(2, "\n");
+        }
+        optpos_val += 1;
+        if (optpos_val >= current_arg.len) {
+            optind += 1;
+            optpos_val = 0;
+        }
     } else {
         env.set(varname, val, false) catch {};
+        if (!expects_arg) {
+            env.unset("OPTARG");
+        }
         if (expects_arg) {
-            if (current_arg.len > 2) {
-                env.set("OPTARG", current_arg[2..], false) catch {};
+            if (optpos_val + 1 < current_arg.len) {
+                env.set("OPTARG", current_arg[optpos_val + 1 ..], false) catch {};
             } else if (optind < params.len) {
                 optind += 1;
                 env.set("OPTARG", params[optind - 1], false) catch {};
             } else {
-                env.set(varname, "?", false) catch {};
-                posix.writeAll(2, "getopts: option requires an argument -- ");
-                posix.writeAll(2, val);
-                posix.writeAll(2, "\n");
+                if (silent) {
+                    env.set(varname, ":", false) catch {};
+                    env.set("OPTARG", val, false) catch {};
+                } else {
+                    env.set(varname, "?", false) catch {};
+                    posix.writeAll(2, "getopts: option requires an argument -- ");
+                    posix.writeAll(2, val);
+                    posix.writeAll(2, "\n");
+                }
                 optind += 1;
+                optpos_val = 0;
                 var ind_buf: [16]u8 = undefined;
                 const ind_str = std.fmt.bufPrint(&ind_buf, "{d}", .{optind}) catch return 1;
                 env.set("OPTIND", ind_str, false) catch {};
-                return 1;
+                var pos_buf: [16]u8 = undefined;
+                const pos_str = std.fmt.bufPrint(&pos_buf, "{d}", .{optpos_val}) catch return 1;
+                env.set("OPTPOS", pos_str, false) catch {};
+                return if (silent) 0 else 1;
+            }
+            optind += 1;
+            optpos_val = 0;
+        } else {
+            optpos_val += 1;
+            if (optpos_val >= current_arg.len) {
+                optind += 1;
+                optpos_val = 0;
             }
         }
     }
 
-    optind += 1;
     var ind_buf: [16]u8 = undefined;
     const ind_str = std.fmt.bufPrint(&ind_buf, "{d}", .{optind}) catch return 1;
     env.set("OPTIND", ind_str, false) catch {};
+    var pos_buf: [16]u8 = undefined;
+    const pos_str = std.fmt.bufPrint(&pos_buf, "{d}", .{optpos_val}) catch return 1;
+    env.set("OPTPOS", pos_str, false) catch {};
     return 0;
 }
 
@@ -1660,6 +2009,7 @@ fn builtinFc(args: []const []const u8, env: *Environment) u8 {
 
     var list_mode = false;
     var suppress_numbers = false;
+    var reverse = false;
     var arg_start: usize = 1;
 
     while (arg_start < args.len) {
@@ -1673,6 +2023,7 @@ fn builtinFc(args: []const []const u8, env: *Environment) u8 {
             switch (flag_c) {
                 'l' => list_mode = true,
                 'n' => suppress_numbers = true,
+                'r' => reverse = true,
                 's' => {},
                 else => {},
             }
@@ -1681,14 +2032,14 @@ fn builtinFc(args: []const []const u8, env: *Environment) u8 {
     }
 
     if (list_mode) {
-        return fcList(args[arg_start..], history, suppress_numbers);
+        return fcList(args[arg_start..], history, suppress_numbers, reverse);
     }
 
     posix.writeAll(2, "fc: use fc -l to list or fc -s to re-execute\n");
     return 1;
 }
 
-fn fcResolveNum(spec: []const u8, count: usize) usize {
+pub fn fcResolveNum(spec: []const u8, count: usize) usize {
     if (std.fmt.parseInt(i64, spec, 10)) |n| {
         if (n < 0) {
             const abs: usize = @intCast(-n);
@@ -1703,7 +2054,7 @@ fn fcResolveNum(spec: []const u8, count: usize) usize {
     return count;
 }
 
-fn fcList(extra_args: []const []const u8, history: *const LineEditor.History, suppress_numbers: bool) u8 {
+fn fcList(extra_args: []const []const u8, history: *const LineEditor.History, suppress_numbers: bool, reverse: bool) u8 {
     const count = history.count;
     var first: usize = if (count > 16) count - 16 + 1 else 1;
     var last: usize = count;
@@ -1717,18 +2068,38 @@ fn fcList(extra_args: []const []const u8, history: *const LineEditor.History, su
 
     if (first < 1) first = 1;
     if (last > count) last = count;
-    if (first > last) return 0;
+    if (first > last) {
+        const tmp = first;
+        first = last;
+        last = tmp;
+    }
 
-    var i: usize = first;
-    while (i <= last) : (i += 1) {
-        if (history.entries[i - 1]) |entry| {
-            if (!suppress_numbers) {
-                var num_buf: [16]u8 = undefined;
-                const num_str = std.fmt.bufPrint(&num_buf, "{d}\t", .{i}) catch continue;
-                posix.writeAll(1, num_str);
+    if (reverse) {
+        var i: usize = last;
+        while (i >= first) : (i -= 1) {
+            if (history.entries[i - 1]) |entry| {
+                if (!suppress_numbers) {
+                    var num_buf: [16]u8 = undefined;
+                    const num_str = std.fmt.bufPrint(&num_buf, "{d}\t", .{i}) catch continue;
+                    posix.writeAll(1, num_str);
+                }
+                posix.writeAll(1, entry);
+                posix.writeAll(1, "\n");
             }
-            posix.writeAll(1, entry);
-            posix.writeAll(1, "\n");
+            if (i == first) break;
+        }
+    } else {
+        var i: usize = first;
+        while (i <= last) : (i += 1) {
+            if (history.entries[i - 1]) |entry| {
+                if (!suppress_numbers) {
+                    var num_buf: [16]u8 = undefined;
+                    const num_str = std.fmt.bufPrint(&num_buf, "{d}\t", .{i}) catch continue;
+                    posix.writeAll(1, num_str);
+                }
+                posix.writeAll(1, entry);
+                posix.writeAll(1, "\n");
+            }
         }
     }
     return 0;
@@ -1815,6 +2186,34 @@ fn printTraps() void {
     }
 }
 
+fn printSpecificTrap(sig_name: []const u8) void {
+    if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
+        if (signals.getExitTrap()) |action| {
+            posix.writeAll(1, "trap -- '");
+            posix.writeAll(1, action);
+            posix.writeAll(1, "' EXIT\n");
+        }
+        return;
+    }
+    if (std.mem.eql(u8, sig_name, "ERR")) {
+        if (signals.getErrTrap()) |action| {
+            posix.writeAll(1, "trap -- '");
+            posix.writeAll(1, action);
+            posix.writeAll(1, "' ERR\n");
+        }
+        return;
+    }
+    if (sigFromName(sig_name)) |sig| {
+        if (signals.trap_handlers[@intCast(sig)]) |action| {
+            posix.writeAll(1, "trap -- '");
+            posix.writeAll(1, action);
+            posix.writeAll(1, "' ");
+            posix.writeAll(1, sig_name);
+            posix.writeAll(1, "\n");
+        }
+    }
+}
+
 fn builtinTimes(_: []const []const u8, _: *Environment) u8 {
     const self_ru = posix.getrusage(posix.RUSAGE_SELF);
     const children_ru = posix.getrusage(posix.RUSAGE_CHILDREN);
@@ -1848,18 +2247,163 @@ fn builtinTimes(_: []const []const u8, _: *Environment) u8 {
     return 0;
 }
 
+const rlimit_resource = libc.rlimit_resource;
+
+const UlimitResource = struct {
+    flag: u8,
+    resource: rlimit_resource,
+    name: []const u8,
+    divisor: u64,
+};
+
+const ulimit_resources = [_]UlimitResource{
+    .{ .flag = 'c', .resource = .CORE, .name = "core file size (blocks)", .divisor = 512 },
+    .{ .flag = 'd', .resource = .DATA, .name = "data seg size (kbytes)", .divisor = 1024 },
+    .{ .flag = 'f', .resource = .FSIZE, .name = "file size (blocks)", .divisor = 512 },
+    .{ .flag = 'n', .resource = .NOFILE, .name = "open files", .divisor = 1 },
+    .{ .flag = 's', .resource = .STACK, .name = "stack size (kbytes)", .divisor = 1024 },
+    .{ .flag = 't', .resource = .CPU, .name = "cpu time (seconds)", .divisor = 1 },
+    .{ .flag = 'v', .resource = .AS, .name = "virtual memory (kbytes)", .divisor = 1024 },
+};
+
+fn ulimitPrintValue(val: u64, divisor: u64) void {
+    if (val == std.c.RLIM.INFINITY) {
+        posix.writeAll(1, "unlimited\n");
+    } else {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}\n", .{val / divisor}) catch return;
+        posix.writeAll(1, s);
+    }
+}
+
+fn builtinUlimit(args: []const []const u8, _: *Environment) u8 {
+    var use_soft = true;
+    var use_hard = false;
+    var show_all = false;
+    var resource_flag: u8 = 'f';
+    var set_value: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len >= 2 and arg[0] == '-') {
+            for (arg[1..]) |flag_c| {
+                switch (flag_c) {
+                    'a' => show_all = true,
+                    'S' => {
+                        use_soft = true;
+                        use_hard = false;
+                    },
+                    'H' => {
+                        use_soft = false;
+                        use_hard = true;
+                    },
+                    'c', 'd', 'f', 'n', 's', 't', 'v' => resource_flag = flag_c,
+                    else => {
+                        posix.writeAll(2, "ulimit: invalid option: -");
+                        const ch_arr: [1]u8 = .{flag_c};
+                        posix.writeAll(2, &ch_arr);
+                        posix.writeAll(2, "\n");
+                        return 2;
+                    },
+                }
+            }
+        } else {
+            set_value = arg;
+        }
+    }
+
+    if (show_all) {
+        for (ulimit_resources) |res| {
+            posix.writeAll(1, "-");
+            const flag_arr: [1]u8 = .{res.flag};
+            posix.writeAll(1, &flag_arr);
+            posix.writeAll(1, ": ");
+            posix.writeAll(1, res.name);
+            var pad_buf: [40]u8 = undefined;
+            const pad_needed = if (res.name.len < 30) 30 - res.name.len else 0;
+            @memset(pad_buf[0..pad_needed], ' ');
+            posix.writeAll(1, pad_buf[0..pad_needed]);
+            const limits = std.posix.getrlimit(res.resource) catch {
+                posix.writeAll(1, "error\n");
+                continue;
+            };
+            const val = if (use_hard) limits.max else limits.cur;
+            ulimitPrintValue(val, res.divisor);
+        }
+        return 0;
+    }
+
+    var target_res: ?UlimitResource = null;
+    for (ulimit_resources) |res| {
+        if (res.flag == resource_flag) {
+            target_res = res;
+            break;
+        }
+    }
+
+    const res = target_res orelse {
+        posix.writeAll(2, "ulimit: unknown resource\n");
+        return 1;
+    };
+
+    if (set_value) |val_str| {
+        var limits = std.posix.getrlimit(res.resource) catch {
+            posix.writeAll(2, "ulimit: cannot get limit\n");
+            return 1;
+        };
+        var new_val: u64 = undefined;
+        if (std.mem.eql(u8, val_str, "unlimited")) {
+            new_val = std.c.RLIM.INFINITY;
+        } else {
+            const parsed = std.fmt.parseInt(u64, val_str, 10) catch {
+                posix.writeAll(2, "ulimit: invalid limit: ");
+                posix.writeAll(2, val_str);
+                posix.writeAll(2, "\n");
+                return 1;
+            };
+            new_val = parsed * res.divisor;
+        }
+        if (use_hard) {
+            limits.max = new_val;
+        } else {
+            limits.cur = new_val;
+        }
+        std.posix.setrlimit(res.resource, limits) catch {
+            posix.writeAll(2, "ulimit: cannot modify limit\n");
+            return 1;
+        };
+        return 0;
+    }
+
+    const limits = std.posix.getrlimit(res.resource) catch {
+        posix.writeAll(2, "ulimit: cannot get limit\n");
+        return 1;
+    };
+    const val = if (use_hard) limits.max else limits.cur;
+    ulimitPrintValue(val, res.divisor);
+    return 0;
+}
+
 fn sigFromName(name: []const u8) ?u6 {
     if (std.fmt.parseInt(u6, name, 10)) |n| return n else |_| {}
-    if (std.mem.eql(u8, name, "HUP")) return signals.SIGHUP;
-    if (std.mem.eql(u8, name, "INT")) return signals.SIGINT;
-    if (std.mem.eql(u8, name, "QUIT")) return signals.SIGQUIT;
-    if (std.mem.eql(u8, name, "TERM")) return signals.SIGTERM;
-    if (std.mem.eql(u8, name, "TSTP")) return signals.SIGTSTP;
-    if (std.mem.eql(u8, name, "CONT")) return signals.SIGCONT;
-    if (std.mem.eql(u8, name, "CHLD")) return signals.SIGCHLD;
-    if (std.mem.eql(u8, name, "USR1")) return signals.SIGUSR1;
-    if (std.mem.eql(u8, name, "USR2")) return signals.SIGUSR2;
-    if (std.mem.eql(u8, name, "PIPE")) return signals.SIGPIPE;
+    const stripped = if (name.len > 3 and std.mem.eql(u8, name[0..3], "SIG")) name[3..] else name;
+    if (std.mem.eql(u8, stripped, "HUP")) return signals.SIGHUP;
+    if (std.mem.eql(u8, stripped, "INT")) return signals.SIGINT;
+    if (std.mem.eql(u8, stripped, "QUIT")) return signals.SIGQUIT;
+    if (std.mem.eql(u8, stripped, "ABRT")) return signals.SIGABRT;
+    if (std.mem.eql(u8, stripped, "KILL")) return signals.SIGKILL;
+    if (std.mem.eql(u8, stripped, "ALRM")) return signals.SIGALRM;
+    if (std.mem.eql(u8, stripped, "TERM")) return signals.SIGTERM;
+    if (std.mem.eql(u8, stripped, "TSTP")) return signals.SIGTSTP;
+    if (std.mem.eql(u8, stripped, "STOP")) return signals.SIGSTOP;
+    if (std.mem.eql(u8, stripped, "CONT")) return signals.SIGCONT;
+    if (std.mem.eql(u8, stripped, "CHLD")) return signals.SIGCHLD;
+    if (std.mem.eql(u8, stripped, "USR1")) return signals.SIGUSR1;
+    if (std.mem.eql(u8, stripped, "USR2")) return signals.SIGUSR2;
+    if (std.mem.eql(u8, stripped, "PIPE")) return signals.SIGPIPE;
+    if (std.mem.eql(u8, stripped, "TTIN")) return signals.SIGTTIN;
+    if (std.mem.eql(u8, stripped, "TTOU")) return signals.SIGTTOU;
     return null;
 }
 
