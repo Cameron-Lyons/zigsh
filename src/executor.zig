@@ -232,7 +232,18 @@ pub const Executor = struct {
         for (simple.assigns) |assign| {
             const value = expander.expandWord(assign.value) catch "";
             if (simple.words.len == 0) {
-                self.env.set(assign.name, value, false) catch {};
+                self.env.set(assign.name, value, false) catch |err| {
+                    if (err == error.ReadonlyVariable) {
+                        posix.writeAll(2, "zigsh: ");
+                        posix.writeAll(2, assign.name);
+                        posix.writeAll(2, ": readonly variable\n");
+                        if (!self.env.options.interactive) {
+                            self.env.should_exit = true;
+                            self.env.exit_value = 1;
+                        }
+                        return 1;
+                    }
+                };
             }
         }
 
@@ -296,6 +307,10 @@ pub const Executor = struct {
                 }
             }
             status = builtin_fn(fields, self.env);
+            if (status != 0 and isSpecialBuiltin(cmd_name) and !self.env.options.interactive) {
+                self.env.should_exit = true;
+                self.env.exit_value = status;
+            }
         } else if (self.env.functions.get(cmd_name)) |_| {
             status = self.executeFunction(cmd_name, fields);
         } else {
@@ -303,6 +318,9 @@ pub const Executor = struct {
         }
 
         redir_state.restore();
+        if (fields.len > 0) {
+            self.env.set("_", fields[fields.len - 1], false) catch {};
+        }
         self.env.last_exit_status = status;
         return status;
     }
@@ -781,6 +799,17 @@ pub const Executor = struct {
         return self.executeProgram(program);
     }
 };
+
+fn isSpecialBuiltin(name: []const u8) bool {
+    const specials = [_][]const u8{
+        ":", ".", "break", "continue", "eval", "exec", "exit",
+        "export", "readonly", "return", "set", "shift", "trap", "unset",
+    };
+    for (specials) |s| {
+        if (std.mem.eql(u8, name, s)) return true;
+    }
+    return false;
+}
 
 fn astToRedirectOp(op: ast.RedirectOp) redirect.RedirectOp {
     return switch (op) {

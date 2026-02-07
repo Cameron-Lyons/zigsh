@@ -10,12 +10,18 @@ pub const Arithmetic = struct {
     expr: []const u8,
     pos: usize,
     lookup: *const fn ([]const u8) ?[]const u8,
+    setter: ?*const fn ([]const u8, i64) void,
 
     pub fn evaluate(expr: []const u8, lookup: *const fn ([]const u8) ?[]const u8) ArithError!i64 {
+        return evaluateWithSetter(expr, lookup, null);
+    }
+
+    pub fn evaluateWithSetter(expr: []const u8, lookup: *const fn ([]const u8) ?[]const u8, setter: ?*const fn ([]const u8, i64) void) ArithError!i64 {
         var self = Arithmetic{
             .expr = expr,
             .pos = 0,
             .lookup = lookup,
+            .setter = setter,
         };
         self.skipWhitespace();
         const result = try self.parseAssign();
@@ -31,7 +37,69 @@ pub const Arithmetic = struct {
     }
 
     fn parseAssign(self: *Arithmetic) ArithError!i64 {
+        const saved_pos = self.pos;
+        self.skipWhitespace();
+
+        if (self.pos < self.expr.len and types.isNameStart(self.expr[self.pos])) {
+            const name_start = self.pos;
+            while (self.pos < self.expr.len and types.isNameCont(self.expr[self.pos])) {
+                self.pos += 1;
+            }
+            const name = self.expr[name_start..self.pos];
+            self.skipWhitespace();
+
+            const op = self.matchAssignOp();
+            if (op) |assign_op| {
+                self.skipWhitespace();
+                const rhs = try self.parseAssign();
+                const old_val = blk: {
+                    const v = self.lookup(name) orelse break :blk @as(i64, 0);
+                    break :blk std.fmt.parseInt(i64, v, 10) catch 0;
+                };
+                const new_val: i64 = switch (assign_op) {
+                    .eq => rhs,
+                    .add_eq => old_val +% rhs,
+                    .sub_eq => old_val -% rhs,
+                    .mul_eq => old_val *% rhs,
+                    .div_eq => if (rhs == 0) return error.DivisionByZero else @divTrunc(old_val, rhs),
+                    .mod_eq => if (rhs == 0) return error.DivisionByZero else @rem(old_val, rhs),
+                    .shl_eq => old_val << @intCast(@min(@max(rhs, 0), 63)),
+                    .shr_eq => old_val >> @intCast(@min(@max(rhs, 0), 63)),
+                    .and_eq => old_val & rhs,
+                    .or_eq => old_val | rhs,
+                    .xor_eq => old_val ^ rhs,
+                };
+                if (self.setter) |s| s(name, new_val);
+                return new_val;
+            }
+
+            self.pos = saved_pos;
+        }
+
         return self.parseTernary();
+    }
+
+    const AssignOp = enum { eq, add_eq, sub_eq, mul_eq, div_eq, mod_eq, shl_eq, shr_eq, and_eq, or_eq, xor_eq };
+
+    fn matchAssignOp(self: *Arithmetic) ?AssignOp {
+        if (self.pos >= self.expr.len) return null;
+        if (self.matchStr("<<=")) return .shl_eq;
+        if (self.matchStr(">>=")) return .shr_eq;
+        if (self.matchStr("+=")) return .add_eq;
+        if (self.matchStr("-=")) return .sub_eq;
+        if (self.matchStr("*=")) return .mul_eq;
+        if (self.matchStr("/=")) return .div_eq;
+        if (self.matchStr("%=")) return .mod_eq;
+        if (self.matchStr("&=")) return .and_eq;
+        if (self.matchStr("|=")) return .or_eq;
+        if (self.matchStr("^=")) return .xor_eq;
+        if (self.pos < self.expr.len and self.expr[self.pos] == '=' and
+            (self.pos + 1 >= self.expr.len or self.expr[self.pos + 1] != '='))
+        {
+            self.pos += 1;
+            return .eq;
+        }
+        return null;
     }
 
     fn parseTernary(self: *Arithmetic) ArithError!i64 {
@@ -194,12 +262,16 @@ pub const Arithmetic = struct {
         var left = try self.parseMulDiv();
         while (true) {
             self.skipWhitespace();
-            if (self.pos < self.expr.len and self.expr[self.pos] == '+') {
+            if (self.pos < self.expr.len and self.expr[self.pos] == '+' and
+                (self.pos + 1 >= self.expr.len or (self.expr[self.pos + 1] != '+' and self.expr[self.pos + 1] != '=')))
+            {
                 self.pos += 1;
                 self.skipWhitespace();
                 const right = try self.parseMulDiv();
                 left = left +% right;
-            } else if (self.pos < self.expr.len and self.expr[self.pos] == '-') {
+            } else if (self.pos < self.expr.len and self.expr[self.pos] == '-' and
+                (self.pos + 1 >= self.expr.len or (self.expr[self.pos + 1] != '-' and self.expr[self.pos + 1] != '=')))
+            {
                 self.pos += 1;
                 self.skipWhitespace();
                 const right = try self.parseMulDiv();
@@ -238,6 +310,40 @@ pub const Arithmetic = struct {
     fn parseUnary(self: *Arithmetic) ArithError!i64 {
         self.skipWhitespace();
         if (self.pos < self.expr.len) {
+            if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '+' and self.expr[self.pos + 1] == '+') {
+                self.pos += 2;
+                self.skipWhitespace();
+                if (self.pos < self.expr.len and types.isNameStart(self.expr[self.pos])) {
+                    const name_start = self.pos;
+                    while (self.pos < self.expr.len and types.isNameCont(self.expr[self.pos])) self.pos += 1;
+                    const name = self.expr[name_start..self.pos];
+                    const old_val = blk: {
+                        const v = self.lookup(name) orelse break :blk @as(i64, 0);
+                        break :blk std.fmt.parseInt(i64, v, 10) catch 0;
+                    };
+                    const new_val = old_val +% 1;
+                    if (self.setter) |s| s(name, new_val);
+                    return new_val;
+                }
+                return error.InvalidExpression;
+            }
+            if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '-' and self.expr[self.pos + 1] == '-') {
+                self.pos += 2;
+                self.skipWhitespace();
+                if (self.pos < self.expr.len and types.isNameStart(self.expr[self.pos])) {
+                    const name_start = self.pos;
+                    while (self.pos < self.expr.len and types.isNameCont(self.expr[self.pos])) self.pos += 1;
+                    const name = self.expr[name_start..self.pos];
+                    const old_val = blk: {
+                        const v = self.lookup(name) orelse break :blk @as(i64, 0);
+                        break :blk std.fmt.parseInt(i64, v, 10) catch 0;
+                    };
+                    const new_val = old_val -% 1;
+                    if (self.setter) |s| s(name, new_val);
+                    return new_val;
+                }
+                return error.InvalidExpression;
+            }
             if (self.expr[self.pos] == '+') {
                 self.pos += 1;
                 return self.parseUnary();
@@ -342,8 +448,23 @@ pub const Arithmetic = struct {
             self.pos += 1;
         }
         const name = self.expr[start..self.pos];
-        const value = self.lookup(name) orelse return 0;
-        return std.fmt.parseInt(i64, value, 10) catch 0;
+        const val = blk: {
+            const v = self.lookup(name) orelse break :blk @as(i64, 0);
+            break :blk std.fmt.parseInt(i64, v, 10) catch 0;
+        };
+
+        if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '+' and self.expr[self.pos + 1] == '+') {
+            self.pos += 2;
+            if (self.setter) |s| s(name, val +% 1);
+            return val;
+        }
+        if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '-' and self.expr[self.pos + 1] == '-') {
+            self.pos += 2;
+            if (self.setter) |s| s(name, val -% 1);
+            return val;
+        }
+
+        return val;
     }
 
     fn matchStr(self: *Arithmetic, s: []const u8) bool {
@@ -499,4 +620,65 @@ test "invalid expression" {
     try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("", lookup));
     try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("1 +", lookup));
     try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("(1 + 2", lookup));
+}
+
+test "assignment operators" {
+    const S = struct {
+        var last_name: [32]u8 = undefined;
+        var last_name_len: usize = 0;
+        var last_val: i64 = 0;
+        var stored_val_buf: [16]u8 = undefined;
+        var stored_val: []const u8 = "";
+
+        fn lookup(name: []const u8) ?[]const u8 {
+            if (last_name_len > 0 and std.mem.eql(u8, name, last_name[0..last_name_len])) {
+                return stored_val;
+            }
+            if (std.mem.eql(u8, name, "x")) return "5";
+            return null;
+        }
+
+        fn setter(name: []const u8, val: i64) void {
+            @memcpy(last_name[0..name.len], name);
+            last_name_len = name.len;
+            last_val = val;
+            stored_val = std.fmt.bufPrint(&stored_val_buf, "{d}", .{val}) catch "0";
+        }
+    };
+    S.last_name_len = 0;
+    try std.testing.expectEqual(@as(i64, 10), try Arithmetic.evaluateWithSetter("x = 10", &S.lookup, &S.setter));
+    try std.testing.expectEqual(@as(i64, 10), S.last_val);
+
+    S.last_name_len = 0;
+    try std.testing.expectEqual(@as(i64, 8), try Arithmetic.evaluateWithSetter("x += 3", &S.lookup, &S.setter));
+}
+
+test "post increment decrement" {
+    const S = struct {
+        var last_val: i64 = 0;
+        fn lookup(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "x")) return "5";
+            return null;
+        }
+        fn setter(_: []const u8, val: i64) void {
+            last_val = val;
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 5), try Arithmetic.evaluateWithSetter("x++", &S.lookup, &S.setter));
+    try std.testing.expectEqual(@as(i64, 6), S.last_val);
+}
+
+test "pre increment decrement" {
+    const S = struct {
+        var last_val: i64 = 0;
+        fn lookup(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "x")) return "5";
+            return null;
+        }
+        fn setter(_: []const u8, val: i64) void {
+            last_val = val;
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 6), try Arithmetic.evaluateWithSetter("++x", &S.lookup, &S.setter));
+    try std.testing.expectEqual(@as(i64, 6), S.last_val);
 }

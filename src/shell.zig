@@ -97,6 +97,21 @@ pub const Shell = struct {
         return status;
     }
 
+    fn isIncompleteError(err: anyerror) bool {
+        return err == error.UnexpectedEOF or
+            err == error.UnterminatedSingleQuote or
+            err == error.UnterminatedDoubleQuote or
+            err == error.UnterminatedBackquote or
+            err == error.UnterminatedParenthesis or
+            err == error.ExpectedDo or
+            err == error.ExpectedDone or
+            err == error.ExpectedThen or
+            err == error.ExpectedFi or
+            err == error.ExpectedEsac or
+            err == error.ExpectedBraceClose or
+            err == error.ExpectedIn;
+    }
+
     pub fn executeFile(self: *Shell, path: []const u8) u8 {
         const fd = posix.open(path, posix.oRdonly(), 0) catch {
             posix.writeAll(2, "zigsh: ");
@@ -142,11 +157,39 @@ pub const Shell = struct {
             const line = editor.readLine(prompt) orelse break;
             if (line.len == 0) continue;
 
-            if (self.env.options.verbose) {
-                posix.writeAll(2, line);
-                posix.writeAll(2, "\n");
+            var accum: std.ArrayListUnmanaged(u8) = .empty;
+            defer accum.deinit(self.gpa);
+            accum.appendSlice(self.gpa, line) catch continue;
+
+            while (true) {
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+
+                var lexer = Lexer.init(accum.items);
+                var parser = Parser.init(alloc, &lexer) catch break;
+                if (parser.parseProgram()) |program| {
+                    if (self.env.options.verbose) {
+                        posix.writeAll(2, accum.items);
+                        posix.writeAll(2, "\n");
+                    }
+                    var executor = Executor.init(alloc, &self.env, &self.jobs);
+                    const status = executor.executeProgram(program);
+                    self.env.last_exit_status = status;
+                    break;
+                } else |err| {
+                    if (isIncompleteError(err)) {
+                        const ps2 = self.env.get("PS2") orelse "> ";
+                        const cont = editor.readLine(ps2) orelse break;
+                        accum.append(self.gpa, '\n') catch break;
+                        accum.appendSlice(self.gpa, cont) catch break;
+                    } else {
+                        self.reportError("syntax error", err);
+                        self.env.last_exit_status = 2;
+                        break;
+                    }
+                }
             }
-            _ = self.executeSource(line);
         }
         self.executeExitTrap();
         return self.env.exit_value;
@@ -165,15 +208,51 @@ pub const Shell = struct {
 
             const n = posix.read(0, &buf) catch break;
             if (n == 0) break;
-            const line = buf[0..n];
+            var line = buf[0..n];
+            if (line.len > 0 and line[line.len - 1] == '\n') {
+                line = line[0 .. line.len - 1];
+            }
+            if (line.len == 0) continue;
 
-            if (self.env.options.verbose) {
-                posix.writeAll(2, line);
-                if (line.len > 0 and line[line.len - 1] != '\n') {
-                    posix.writeAll(2, "\n");
+            var accum: std.ArrayListUnmanaged(u8) = .empty;
+            defer accum.deinit(self.gpa);
+            accum.appendSlice(self.gpa, line) catch continue;
+
+            while (true) {
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+
+                var lexer = Lexer.init(accum.items);
+                var parser = Parser.init(alloc, &lexer) catch break;
+                if (parser.parseProgram()) |program| {
+                    if (self.env.options.verbose) {
+                        posix.writeAll(2, accum.items);
+                        posix.writeAll(2, "\n");
+                    }
+                    var executor = Executor.init(alloc, &self.env, &self.jobs);
+                    const status = executor.executeProgram(program);
+                    self.env.last_exit_status = status;
+                    break;
+                } else |err| {
+                    if (isIncompleteError(err)) {
+                        const ps2 = self.env.get("PS2") orelse "> ";
+                        posix.writeAll(2, ps2);
+                        const n2 = posix.read(0, &buf) catch break;
+                        if (n2 == 0) break;
+                        var cont = buf[0..n2];
+                        if (cont.len > 0 and cont[cont.len - 1] == '\n') {
+                            cont = cont[0 .. cont.len - 1];
+                        }
+                        accum.append(self.gpa, '\n') catch break;
+                        accum.appendSlice(self.gpa, cont) catch break;
+                    } else {
+                        self.reportError("syntax error", err);
+                        self.env.last_exit_status = 2;
+                        break;
+                    }
                 }
             }
-            _ = self.executeSource(line);
         }
         self.executeExitTrap();
         return self.env.exit_value;

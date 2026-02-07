@@ -86,6 +86,11 @@ pub fn chdirZ(path: [*:0]const u8) !void {
 pub const StatResult = struct {
     mode: u16,
     size: u64,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    dev_major: u32,
+    dev_minor: u32,
+    ino: u64,
 };
 
 pub fn stat(path: [*:0]const u8) !StatResult {
@@ -94,12 +99,20 @@ pub fn stat(path: [*:0]const u8) !StatResult {
         @as(i32, -100),
         path,
         0,
-        .{ .TYPE = true, .MODE = true, .SIZE = true },
+        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true },
         &stx,
     );
     const signed: isize = @bitCast(rc);
     if (signed < 0) return error.StatFailed;
-    return .{ .mode = stx.mode, .size = stx.size };
+    return .{
+        .mode = stx.mode,
+        .size = stx.size,
+        .mtime_sec = stx.mtime.sec,
+        .mtime_nsec = stx.mtime.nsec,
+        .dev_major = stx.dev_major,
+        .dev_minor = stx.dev_minor,
+        .ino = stx.ino,
+    };
 }
 
 pub fn lstat(path: [*:0]const u8) !StatResult {
@@ -108,12 +121,20 @@ pub fn lstat(path: [*:0]const u8) !StatResult {
         @as(i32, -100),
         path,
         linux.AT.SYMLINK_NOFOLLOW,
-        .{ .TYPE = true, .MODE = true, .SIZE = true },
+        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true },
         &stx,
     );
     const signed: isize = @bitCast(rc);
     if (signed < 0) return error.StatFailed;
-    return .{ .mode = stx.mode, .size = stx.size };
+    return .{
+        .mode = stx.mode,
+        .size = stx.size,
+        .mtime_sec = stx.mtime.sec,
+        .mtime_nsec = stx.mtime.nsec,
+        .dev_major = stx.dev_major,
+        .dev_minor = stx.dev_minor,
+        .ino = stx.ino,
+    };
 }
 
 pub fn access(path: [*:0]const u8, mode: c_uint) bool {
@@ -232,6 +253,32 @@ const ext = struct {
     extern "c" fn tcsetpgrp(fd: c_int, pgrp: pid_t) c_int;
     extern "c" fn setpgid(pid: pid_t, pgid: pid_t) c_int;
     extern "c" fn getpwnam(name: [*:0]const u8) ?*const Passwd;
+    extern "c" fn getrusage(who: c_int, usage: *rusage) c_int;
+    extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+
+    const timeval = extern struct {
+        tv_sec: i64,
+        tv_usec: i64,
+    };
+
+    const rusage = extern struct {
+        ru_utime: timeval,
+        ru_stime: timeval,
+        ru_maxrss: isize,
+        ru_ixrss: isize,
+        ru_idrss: isize,
+        ru_isrss: isize,
+        ru_minflt: isize,
+        ru_majflt: isize,
+        ru_nswap: isize,
+        ru_inblock: isize,
+        ru_oublock: isize,
+        ru_msgsnd: isize,
+        ru_msgrcv: isize,
+        ru_nsignals: isize,
+        ru_nvcsw: isize,
+        ru_nivcsw: isize,
+    };
 };
 
 pub fn tcgetpgrp(fd: fd_t) !pid_t {
@@ -258,6 +305,34 @@ pub fn killpg(pgrp: pid_t, sig: u6) !void {
 
 pub fn exit(status: u8) noreturn {
     std.process.exit(status);
+}
+
+pub const RUsage = struct {
+    user_sec: i64,
+    user_usec: i64,
+    sys_sec: i64,
+    sys_usec: i64,
+};
+
+pub fn getrusage(who: c_int) RUsage {
+    var ru: ext.rusage = undefined;
+    _ = ext.getrusage(who, &ru);
+    return .{
+        .user_sec = ru.ru_utime.tv_sec,
+        .user_usec = ru.ru_utime.tv_usec,
+        .sys_sec = ru.ru_stime.tv_sec,
+        .sys_usec = ru.ru_stime.tv_usec,
+    };
+}
+
+pub const RUSAGE_SELF: c_int = 0;
+pub const RUSAGE_CHILDREN: c_int = -1;
+
+pub fn realpath(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const result = ext.realpath(path, buf.ptr);
+    if (result == null) return null;
+    const ptr: [*:0]const u8 = @ptrCast(result.?);
+    return std.mem.sliceTo(ptr, 0);
 }
 
 test "statusFromWait normal exit" {

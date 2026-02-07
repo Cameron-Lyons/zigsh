@@ -42,6 +42,7 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "hash", &builtinHash },
     .{ "printf", &builtinPrintf },
     .{ "fc", &builtinFc },
+    .{ "times", &builtinTimes },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
@@ -71,8 +72,23 @@ fn builtinExit(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinCd(args: []const []const u8, env: *Environment) u8 {
-    const target = if (args.len > 1)
-        args[1]
+    var physical = false;
+    var arg_start: usize = 1;
+
+    while (arg_start < args.len) {
+        if (std.mem.eql(u8, args[arg_start], "-L")) {
+            physical = false;
+            arg_start += 1;
+        } else if (std.mem.eql(u8, args[arg_start], "-P")) {
+            physical = true;
+            arg_start += 1;
+        } else {
+            break;
+        }
+    }
+
+    const target = if (arg_start < args.len)
+        args[arg_start]
     else
         env.get("HOME") orelse {
             posix.writeAll(2, "cd: HOME not set\n");
@@ -128,13 +144,30 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         env.set("OLDPWD", pwd, false) catch {};
     }
 
-    var new_buf: [4096]u8 = undefined;
-    const new_pwd = posix.getcwd(&new_buf) catch null;
-    if (new_pwd) |pwd| {
-        env.set("PWD", pwd, false) catch {};
-        if (cdpath_hit and is_relative) {
-            posix.writeAll(1, pwd);
-            posix.writeAll(1, "\n");
+    if (physical) {
+        var new_buf: [4096]u8 = undefined;
+        const cwd = posix.getcwd(&new_buf) catch null;
+        if (cwd) |cwd_str| {
+            const cwd_z = std.posix.toPosixPath(cwd_str) catch {
+                env.set("PWD", cwd_str, false) catch {};
+                return 0;
+            };
+            var real_buf: [4096]u8 = undefined;
+            if (posix.realpath(&cwd_z, &real_buf)) |resolved| {
+                env.set("PWD", resolved, false) catch {};
+            } else {
+                env.set("PWD", cwd_str, false) catch {};
+            }
+        }
+    } else {
+        var new_buf: [4096]u8 = undefined;
+        const new_pwd = posix.getcwd(&new_buf) catch null;
+        if (new_pwd) |pwd| {
+            env.set("PWD", pwd, false) catch {};
+            if (cdpath_hit and is_relative) {
+                posix.writeAll(1, pwd);
+                posix.writeAll(1, "\n");
+            }
         }
     }
 
@@ -153,9 +186,21 @@ fn builtinPwd(_: []const []const u8, _: *Environment) u8 {
 }
 
 fn builtinExport(args: []const []const u8, env: *Environment) u8 {
-    if (args.len < 2) return 0;
+    if (args.len < 2 or (args.len == 2 and std.mem.eql(u8, args[1], "-p"))) {
+        var it = env.vars.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.exported) continue;
+            posix.writeAll(1, "export ");
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "=\"");
+            posix.writeAll(1, entry.value_ptr.value);
+            posix.writeAll(1, "\"\n");
+        }
+        return 0;
+    }
 
-    for (args[1..]) |arg| {
+    const start: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
+    for (args[start..]) |arg| {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             const name = arg[0..eq];
             const value = arg[eq + 1 ..];
@@ -432,6 +477,7 @@ fn isTestUnaryOp(op: []const u8) bool {
 fn isTestBinaryOp(op: []const u8) bool {
     const ops = [_][]const u8{
         "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+        "-nt", "-ot", "-ef",
     };
     for (ops) |o| {
         if (std.mem.eql(u8, op, o)) return true;
@@ -512,6 +558,29 @@ fn testBinary(left: []const u8, op: []const u8, right: []const u8) u8 {
     }
     if (std.mem.eql(u8, op, "!=")) {
         return if (!std.mem.eql(u8, left, right)) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, op, "-nt") or std.mem.eql(u8, op, "-ot") or std.mem.eql(u8, op, "-ef")) {
+        const left_z = std.posix.toPosixPath(left) catch return 1;
+        const right_z = std.posix.toPosixPath(right) catch return 1;
+        const left_st = posix.stat(&left_z) catch return 1;
+        const right_st = posix.stat(&right_z) catch return 1;
+
+        if (std.mem.eql(u8, op, "-nt")) {
+            if (left_st.mtime_sec != right_st.mtime_sec)
+                return if (left_st.mtime_sec > right_st.mtime_sec) 0 else 1;
+            return if (left_st.mtime_nsec > right_st.mtime_nsec) 0 else 1;
+        }
+        if (std.mem.eql(u8, op, "-ot")) {
+            if (left_st.mtime_sec != right_st.mtime_sec)
+                return if (left_st.mtime_sec < right_st.mtime_sec) 0 else 1;
+            return if (left_st.mtime_nsec < right_st.mtime_nsec) 0 else 1;
+        }
+        if (std.mem.eql(u8, op, "-ef")) {
+            return if (left_st.dev_major == right_st.dev_major and
+                left_st.dev_minor == right_st.dev_minor and
+                left_st.ino == right_st.ino) 0 else 1;
+        }
     }
 
     const lhs = std.fmt.parseInt(i64, left, 10) catch return 2;
@@ -595,6 +664,10 @@ fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(1, "EXIT HUP INT QUIT TERM USR1 USR2 ERR\n");
             return 0;
         }
+        if (args.len == 1 or (args.len == 2 and std.mem.eql(u8, args[1], "-p"))) {
+            printTraps();
+            return 0;
+        }
         return 0;
     }
 
@@ -631,8 +704,21 @@ fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
-    if (args.len < 2) return 0;
-    for (args[1..]) |arg| {
+    if (args.len < 2 or (args.len == 2 and std.mem.eql(u8, args[1], "-p"))) {
+        var it = env.vars.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.readonly) continue;
+            posix.writeAll(1, "readonly ");
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "=\"");
+            posix.writeAll(1, entry.value_ptr.value);
+            posix.writeAll(1, "\"\n");
+        }
+        return 0;
+    }
+
+    const start: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
+    for (args[start..]) |arg| {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             const name = arg[0..eq];
             const value = arg[eq + 1 ..];
@@ -1515,6 +1601,29 @@ fn builtinHash(args: []const []const u8, env: *Environment) u8 {
         return 0;
     }
 
+    if (std.mem.eql(u8, args[1], "-d")) {
+        for (args[2..]) |name| {
+            env.removeCachedCommand(name);
+        }
+        return 0;
+    }
+
+    if (std.mem.eql(u8, args[1], "-t")) {
+        var status: u8 = 0;
+        for (args[2..]) |name| {
+            if (env.getCachedCommand(name)) |path| {
+                posix.writeAll(1, path);
+                posix.writeAll(1, "\n");
+            } else {
+                posix.writeAll(2, "hash: ");
+                posix.writeAll(2, name);
+                posix.writeAll(2, ": not found\n");
+                status = 1;
+            }
+        }
+        return status;
+    }
+
     var status: u8 = 0;
     for (args[1..]) |name| {
         if (findInPath(name, env)) {
@@ -1670,6 +1779,73 @@ pub fn fcGetReexecCommand(extra_args: []const []const u8, history: *const LineEd
         return out_buf[0..out_len];
     }
     return entry;
+}
+
+fn printTraps() void {
+    if (signals.getExitTrap()) |action| {
+        posix.writeAll(1, "trap -- '");
+        posix.writeAll(1, action);
+        posix.writeAll(1, "' EXIT\n");
+    }
+    if (signals.getErrTrap()) |action| {
+        posix.writeAll(1, "trap -- '");
+        posix.writeAll(1, action);
+        posix.writeAll(1, "' ERR\n");
+    }
+    const sig_names = [_]struct { num: u6, name: []const u8 }{
+        .{ .num = signals.SIGHUP, .name = "HUP" },
+        .{ .num = signals.SIGINT, .name = "INT" },
+        .{ .num = signals.SIGQUIT, .name = "QUIT" },
+        .{ .num = signals.SIGTERM, .name = "TERM" },
+        .{ .num = signals.SIGTSTP, .name = "TSTP" },
+        .{ .num = signals.SIGCONT, .name = "CONT" },
+        .{ .num = signals.SIGCHLD, .name = "CHLD" },
+        .{ .num = signals.SIGUSR1, .name = "USR1" },
+        .{ .num = signals.SIGUSR2, .name = "USR2" },
+        .{ .num = signals.SIGPIPE, .name = "PIPE" },
+    };
+    for (sig_names) |entry| {
+        if (signals.trap_handlers[@intCast(entry.num)]) |action| {
+            posix.writeAll(1, "trap -- '");
+            posix.writeAll(1, action);
+            posix.writeAll(1, "' ");
+            posix.writeAll(1, entry.name);
+            posix.writeAll(1, "\n");
+        }
+    }
+}
+
+fn builtinTimes(_: []const []const u8, _: *Environment) u8 {
+    const self_ru = posix.getrusage(posix.RUSAGE_SELF);
+    const children_ru = posix.getrusage(posix.RUSAGE_CHILDREN);
+
+    const self_user_ms: u64 = @intCast(@divTrunc(self_ru.user_usec, 1000));
+    const self_sys_ms: u64 = @intCast(@divTrunc(self_ru.sys_usec, 1000));
+    const child_user_ms: u64 = @intCast(@divTrunc(children_ru.user_usec, 1000));
+    const child_sys_ms: u64 = @intCast(@divTrunc(children_ru.sys_usec, 1000));
+
+    var buf: [128]u8 = undefined;
+    const line1 = std.fmt.bufPrint(&buf, "{d}m{d}.{d:0>3}s {d}m{d}.{d:0>3}s\n", .{
+        @divTrunc(self_ru.user_sec, 60),
+        @rem(self_ru.user_sec, 60),
+        self_user_ms,
+        @divTrunc(self_ru.sys_sec, 60),
+        @rem(self_ru.sys_sec, 60),
+        self_sys_ms,
+    }) catch return 1;
+    posix.writeAll(1, line1);
+
+    var buf2: [128]u8 = undefined;
+    const line2 = std.fmt.bufPrint(&buf2, "{d}m{d}.{d:0>3}s {d}m{d}.{d:0>3}s\n", .{
+        @divTrunc(children_ru.user_sec, 60),
+        @rem(children_ru.user_sec, 60),
+        child_user_ms,
+        @divTrunc(children_ru.sys_sec, 60),
+        @rem(children_ru.sys_sec, 60),
+        child_sys_ms,
+    }) catch return 1;
+    posix.writeAll(1, line2);
+    return 0;
 }
 
 fn sigFromName(name: []const u8) ?u6 {
