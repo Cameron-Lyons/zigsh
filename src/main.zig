@@ -34,6 +34,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     sh.env.set("PPID", ppid_str, false) catch {};
     sh.env.markReadonly("PPID");
 
+    sh.env.set("PS2", "> ", false) catch {};
+
     var args_buf: [256][]const u8 = undefined;
     var args_count: usize = 0;
     var args_iter = std.process.Args.Iterator.init(init.args);
@@ -67,7 +69,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (posix.isatty(0)) {
         sh.env.set("PS1", "$ ", false) catch {};
     }
-    sh.env.set("PS2", "> ", false) catch {};
 
     sh.env.options.interactive = true;
     sh.loadEnvFile();

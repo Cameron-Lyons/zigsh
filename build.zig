@@ -71,4 +71,20 @@ pub fn build(b: *std.Build) void {
     const read_test_step = b.step("test-read", "Run read integration tests");
     read_test_step.dependOn(&run_read_tests.step);
     test_step.dependOn(&run_read_tests.step);
+
+    const posix_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_posix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const posix_tests = b.addTest(.{
+        .root_module = posix_test_mod,
+    });
+    const run_posix_tests = b.addRunArtifact(posix_tests);
+    run_posix_tests.step.dependOn(b.getInstallStep());
+
+    const posix_test_step = b.step("test-posix", "Run POSIX integration tests");
+    posix_test_step.dependOn(&run_posix_tests.step);
+    test_step.dependOn(&run_posix_tests.step);
 }
