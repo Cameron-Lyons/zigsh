@@ -27,6 +27,11 @@ pub const Executor = struct {
         for (program.commands) |cmd| {
             status = self.executeCompleteCommand(cmd);
             if (self.env.should_exit) break;
+            if (self.env.options.errexit and status != 0) {
+                self.env.should_exit = true;
+                self.env.exit_value = status;
+                break;
+            }
         }
         return status;
     }
@@ -60,6 +65,11 @@ pub const Executor = struct {
         } else {
             status = self.executeAndOr(list.first);
         }
+        if (self.env.options.errexit and status != 0 and !self.env.should_exit) {
+            self.env.should_exit = true;
+            self.env.exit_value = status;
+            return status;
+        }
 
         for (list.rest, 0..) |item, idx| {
             if (self.env.should_exit or self.env.should_return or
@@ -69,6 +79,11 @@ pub const Executor = struct {
                 status = self.runInBackground(item.and_or);
             } else {
                 status = self.executeAndOr(item.and_or);
+            }
+            if (self.env.options.errexit and status != 0 and !self.env.should_exit) {
+                self.env.should_exit = true;
+                self.env.exit_value = status;
+                return status;
             }
         }
         return status;
@@ -205,6 +220,8 @@ pub const Executor = struct {
     }
 
     fn executeSimpleCommand(self: *Executor, simple: ast.SimpleCommand) u8 {
+        if (self.env.options.noexec) return 0;
+
         var expander = Expander.init(self.alloc, self.env, self.jobs);
 
         for (simple.assigns) |assign| {
@@ -234,7 +251,7 @@ pub const Executor = struct {
         }
 
         if (self.env.options.xtrace) {
-            posix.writeAll(2, "+ ");
+            posix.writeAll(2, self.env.get("PS4") orelse "+ ");
             for (fields, 0..) |f, idx| {
                 if (idx > 0) posix.writeAll(2, " ");
                 posix.writeAll(2, f);
@@ -264,6 +281,8 @@ pub const Executor = struct {
             return status;
         } else if (std.mem.eql(u8, cmd_name, "command")) {
             status = self.executeCommandBuiltin(fields, simple.assigns, &expander);
+        } else if (std.mem.eql(u8, cmd_name, "fc")) {
+            status = self.executeFcBuiltin(fields);
         } else if (builtins.lookup(cmd_name)) |builtin_fn| {
             if (simple.assigns.len > 0 and simple.words.len > 0) {
                 for (simple.assigns) |assign| {
@@ -554,7 +573,7 @@ pub const Executor = struct {
             .word => |word| {
                 const expanded = expander.expandWord(word) catch return error.RedirectionFailed;
                 const path_z = self.alloc.dupeZ(u8, expanded) catch return error.RedirectionFailed;
-                try redirect.applyFileRedirect(fd, path_z.ptr, op, state);
+                try redirect.applyFileRedirect(fd, path_z.ptr, op, state, self.env.options.noclobber);
             },
             .fd => |target_fd| try redirect.applyDupRedirect(fd, target_fd, state),
             .close => try redirect.applyCloseRedirect(fd, state),
@@ -635,10 +654,13 @@ pub const Executor = struct {
         if (fields.len < 2) return 0;
 
         var start: usize = 1;
-        var show_type = false;
+        var mode: enum { execute, short, verbose } = .execute;
         while (start < fields.len) {
-            if (std.mem.eql(u8, fields[start], "-v") or std.mem.eql(u8, fields[start], "-V")) {
-                show_type = true;
+            if (std.mem.eql(u8, fields[start], "-v")) {
+                mode = .short;
+                start += 1;
+            } else if (std.mem.eql(u8, fields[start], "-V")) {
+                mode = .verbose;
                 start += 1;
             } else if (std.mem.eql(u8, fields[start], "-p")) {
                 start += 1;
@@ -648,19 +670,57 @@ pub const Executor = struct {
         }
         if (start >= fields.len) return 0;
 
-        if (show_type) {
-            const name = fields[start];
-            if (builtins.lookup(name) != null) {
-                posix.writeAll(1, name);
-                posix.writeAll(1, "\n");
-                return 0;
+        if (mode == .short) {
+            var status: u8 = 0;
+            for (fields[start..]) |name| {
+                if (self.env.getAlias(name)) |alias_val| {
+                    posix.writeAll(1, "alias ");
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "='");
+                    posix.writeAll(1, alias_val);
+                    posix.writeAll(1, "'\n");
+                } else if (self.env.functions.get(name) != null) {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "\n");
+                } else if (builtins.lookup(name) != null) {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "\n");
+                } else if (self.findExecutable(name)) |path| {
+                    posix.writeAll(1, std.mem.sliceTo(path, 0));
+                    posix.writeAll(1, "\n");
+                } else {
+                    status = 1;
+                }
             }
-            if (self.findExecutable(name)) |path| {
-                posix.writeAll(1, std.mem.sliceTo(path, 0));
-                posix.writeAll(1, "\n");
-                return 0;
+            return status;
+        }
+
+        if (mode == .verbose) {
+            var status: u8 = 0;
+            for (fields[start..]) |name| {
+                if (self.env.getAlias(name)) |alias_val| {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is an alias for ");
+                    posix.writeAll(1, alias_val);
+                    posix.writeAll(1, "\n");
+                } else if (self.env.functions.get(name) != null) {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is a function\n");
+                } else if (builtins.lookup(name) != null) {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is a shell builtin\n");
+                } else if (self.findExecutable(name)) |path| {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is ");
+                    posix.writeAll(1, std.mem.sliceTo(path, 0));
+                    posix.writeAll(1, "\n");
+                } else {
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": not found\n");
+                    status = 1;
+                }
             }
-            return 1;
+            return status;
         }
 
         const cmd_name = fields[start];
@@ -668,6 +728,41 @@ pub const Executor = struct {
             return builtin_fn(fields[start..], self.env);
         }
         return self.executeExternal(fields[start..], assigns, expander);
+    }
+
+    fn executeFcBuiltin(self: *Executor, fields: []const []const u8) u8 {
+        var has_s = false;
+        var arg_start: usize = 1;
+        while (arg_start < fields.len) {
+            const arg = fields[arg_start];
+            if (arg.len == 0 or arg[0] != '-') break;
+            if (std.mem.eql(u8, arg, "--")) {
+                arg_start += 1;
+                break;
+            }
+            for (arg[1..]) |fc| {
+                if (fc == 's') has_s = true;
+            }
+            arg_start += 1;
+        }
+
+        if (!has_s) {
+            return builtins.builtins.get("fc").?(fields, self.env);
+        }
+
+        const history = self.env.history orelse {
+            posix.writeAll(2, "fc: no history available\n");
+            return 1;
+        };
+        if (history.count == 0) {
+            posix.writeAll(2, "fc: no history\n");
+            return 1;
+        }
+
+        const cmd = builtins.fcGetReexecCommand(fields[arg_start..], history) orelse return 1;
+        posix.writeAll(1, cmd);
+        posix.writeAll(1, "\n");
+        return self.executeInline(cmd);
     }
 
     fn executeInline(self: *Executor, source: []const u8) u8 {

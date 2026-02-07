@@ -102,8 +102,28 @@ pub fn stat(path: [*:0]const u8) !StatResult {
     return .{ .mode = stx.mode, .size = stx.size };
 }
 
+pub fn lstat(path: [*:0]const u8) !StatResult {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(
+        @as(i32, -100),
+        path,
+        linux.AT.SYMLINK_NOFOLLOW,
+        .{ .TYPE = true, .MODE = true, .SIZE = true },
+        &stx,
+    );
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) return error.StatFailed;
+    return .{ .mode = stx.mode, .size = stx.size };
+}
+
 pub fn access(path: [*:0]const u8, mode: c_uint) bool {
     return c.access(path, mode) == 0;
+}
+
+pub fn getpwnam(name: [*:0]const u8) ?[*:0]const u8 {
+    const pw = ext.getpwnam(name);
+    if (pw == null) return null;
+    return pw.?.pw_dir;
 }
 
 pub fn read(fd: fd_t, buf: []u8) !usize {
@@ -129,6 +149,10 @@ pub fn writeAll(fd: fd_t, data: []const u8) void {
 
 pub fn getpid() pid_t {
     return c.getpid();
+}
+
+pub fn getppid() pid_t {
+    return c.getppid();
 }
 
 pub fn isatty(fd: fd_t) bool {
@@ -158,9 +182,24 @@ pub fn oRdwrCreat() OpenFlags {
     return .{ .ACCMODE = .RDWR, .CREAT = true };
 }
 
+pub fn oWronlyCreatExcl() OpenFlags {
+    return .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
+}
+
 pub const S_IFMT: u16 = 0o170000;
 pub const S_IFDIR: u16 = 0o040000;
 pub const S_IFREG: u16 = 0o100000;
+pub const S_IFBLK: u16 = 0o060000;
+pub const S_IFCHR: u16 = 0o020000;
+pub const S_IFIFO: u16 = 0o010000;
+pub const S_IFLNK: u16 = 0o120000;
+pub const S_IFSOCK: u16 = 0o140000;
+pub const S_ISUID: u16 = 0o4000;
+pub const S_ISGID: u16 = 0o2000;
+
+pub const R_OK: c_uint = 4;
+pub const W_OK: c_uint = 2;
+pub const X_OK: c_uint = 1;
 
 pub fn statusFromWait(status: u32) u8 {
     if (status & 0x7f == 0) {
@@ -178,10 +217,21 @@ pub fn readToEnd(fd: fd_t, alloc: std.mem.Allocator, list: *std.ArrayListUnmanag
     }
 }
 
+const Passwd = extern struct {
+    pw_name: ?[*:0]const u8,
+    pw_passwd: ?[*:0]const u8,
+    pw_uid: c.uid_t,
+    pw_gid: c.gid_t,
+    pw_gecos: ?[*:0]const u8,
+    pw_dir: ?[*:0]const u8,
+    pw_shell: ?[*:0]const u8,
+};
+
 const ext = struct {
     extern "c" fn tcgetpgrp(fd: c_int) pid_t;
     extern "c" fn tcsetpgrp(fd: c_int, pgrp: pid_t) c_int;
     extern "c" fn setpgid(pid: pid_t, pgid: pid_t) c_int;
+    extern "c" fn getpwnam(name: [*:0]const u8) ?*const Passwd;
 };
 
 pub fn tcgetpgrp(fd: fd_t) !pid_t {

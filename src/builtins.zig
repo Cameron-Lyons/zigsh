@@ -1,6 +1,7 @@
 const std = @import("std");
 const Environment = @import("env.zig").Environment;
 const JobTable = @import("jobs.zig").JobTable;
+const LineEditor = @import("line_editor.zig").LineEditor;
 const signals = @import("signals.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
@@ -40,6 +41,7 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "unalias", &builtinUnalias },
     .{ "hash", &builtinHash },
     .{ "printf", &builtinPrintf },
+    .{ "fc", &builtinFc },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
@@ -180,8 +182,19 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
         const arg = args[i];
         if (arg.len < 2 or (arg[0] != '-' and arg[0] != '+')) break;
         const enable = arg[0] == '-';
-        for (arg[1..]) |c| {
-            switch (c) {
+
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "+o")) {
+            if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-' and args[i + 1][0] != '+') {
+                i += 1;
+                setOptionByName(&env.options, args[i], enable);
+            } else if (enable) {
+                printOptions(&env.options);
+            }
+            continue;
+        }
+
+        for (arg[1..]) |opt_c| {
+            switch (opt_c) {
                 'e' => env.options.errexit = enable,
                 'u' => env.options.nounset = enable,
                 'x' => env.options.xtrace = enable,
@@ -191,6 +204,9 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
                 'v' => env.options.verbose = enable,
                 'C' => env.options.noclobber = enable,
                 'm' => env.options.monitor = enable,
+                'o' => {
+                    if (enable) printOptions(&env.options);
+                },
                 else => {},
             }
         }
@@ -204,6 +220,43 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
         env.positional_params = args[i..];
     }
     return 0;
+}
+
+fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable: bool) void {
+    if (std.mem.eql(u8, name, "errexit")) { options.errexit = enable; }
+    else if (std.mem.eql(u8, name, "nounset")) { options.nounset = enable; }
+    else if (std.mem.eql(u8, name, "xtrace")) { options.xtrace = enable; }
+    else if (std.mem.eql(u8, name, "noglob")) { options.noglob = enable; }
+    else if (std.mem.eql(u8, name, "noexec")) { options.noexec = enable; }
+    else if (std.mem.eql(u8, name, "allexport")) { options.allexport = enable; }
+    else if (std.mem.eql(u8, name, "monitor")) { options.monitor = enable; }
+    else if (std.mem.eql(u8, name, "noclobber")) { options.noclobber = enable; }
+    else if (std.mem.eql(u8, name, "verbose")) { options.verbose = enable; }
+    else {
+        posix.writeAll(2, "set: unknown option: ");
+        posix.writeAll(2, name);
+        posix.writeAll(2, "\n");
+    }
+}
+
+fn printOptions(options: *const Environment.ShellOptions) void {
+    const entries = [_]struct { name: []const u8, value: bool }{
+        .{ .name = "allexport", .value = options.allexport },
+        .{ .name = "errexit", .value = options.errexit },
+        .{ .name = "monitor", .value = options.monitor },
+        .{ .name = "noclobber", .value = options.noclobber },
+        .{ .name = "noexec", .value = options.noexec },
+        .{ .name = "noglob", .value = options.noglob },
+        .{ .name = "nounset", .value = options.nounset },
+        .{ .name = "verbose", .value = options.verbose },
+        .{ .name = "xtrace", .value = options.xtrace },
+    };
+    for (entries) |entry| {
+        posix.writeAll(1, "set ");
+        posix.writeAll(1, if (entry.value) "-o " else "+o ");
+        posix.writeAll(1, entry.name);
+        posix.writeAll(1, "\n");
+    }
 }
 
 fn builtinShift(args: []const []const u8, env: *Environment) u8 {
@@ -272,53 +325,204 @@ fn builtinTest(args: []const []const u8, _: *Environment) u8 {
         break :blk args[1 .. args.len - 1];
     } else args[1..];
 
-    if (effective_args.len == 0) return 1;
+    return testEvaluate(effective_args);
+}
 
-    if (effective_args.len == 1) {
-        return if (effective_args[0].len > 0) 0 else 1;
+fn testEvaluate(targs: []const []const u8) u8 {
+    if (targs.len == 0) return 1;
+
+    if (targs.len == 1) {
+        return if (targs[0].len > 0) 0 else 1;
     }
 
-    if (effective_args.len == 2) {
-        if (std.mem.eql(u8, effective_args[0], "!")) {
-            return if (effective_args[1].len > 0) 1 else 0;
+    if (targs.len == 2) {
+        if (std.mem.eql(u8, targs[0], "!")) {
+            return if (testEvaluate(targs[1..]) == 0) 1 else 0;
         }
-        if (std.mem.eql(u8, effective_args[0], "-n")) {
-            return if (effective_args[1].len > 0) 0 else 1;
-        }
-        if (std.mem.eql(u8, effective_args[0], "-z")) {
-            return if (effective_args[1].len == 0) 0 else 1;
-        }
-        if (std.mem.eql(u8, effective_args[0], "-e") or std.mem.eql(u8, effective_args[0], "-f")) {
-            const path_z = std.posix.toPosixPath(effective_args[1]) catch return 1;
-            _ = posix.stat(&path_z) catch return 1;
-            return 0;
-        }
-        if (std.mem.eql(u8, effective_args[0], "-d")) {
-            const path_z = std.posix.toPosixPath(effective_args[1]) catch return 1;
-            const st = posix.stat(&path_z) catch return 1;
-            return if (st.mode & posix.S_IFMT == posix.S_IFDIR) 0 else 1;
-        }
+        return testUnary(targs[0], targs[1]);
     }
 
-    if (effective_args.len == 3) {
-        if (std.mem.eql(u8, effective_args[1], "=") or std.mem.eql(u8, effective_args[1], "==")) {
-            return if (std.mem.eql(u8, effective_args[0], effective_args[2])) 0 else 1;
+    if (targs.len == 3) {
+        if (std.mem.eql(u8, targs[0], "!")) {
+            return if (testEvaluate(targs[1..]) == 0) 1 else 0;
         }
-        if (std.mem.eql(u8, effective_args[1], "!=")) {
-            return if (!std.mem.eql(u8, effective_args[0], effective_args[2])) 0 else 1;
+        if (std.mem.eql(u8, targs[0], "(") and std.mem.eql(u8, targs[2], ")")) {
+            return testEvaluate(targs[1..2]);
         }
-
-        const lhs = std.fmt.parseInt(i64, effective_args[0], 10) catch return 2;
-        const rhs = std.fmt.parseInt(i64, effective_args[2], 10) catch return 2;
-
-        if (std.mem.eql(u8, effective_args[1], "-eq")) return if (lhs == rhs) 0 else 1;
-        if (std.mem.eql(u8, effective_args[1], "-ne")) return if (lhs != rhs) 0 else 1;
-        if (std.mem.eql(u8, effective_args[1], "-lt")) return if (lhs < rhs) 0 else 1;
-        if (std.mem.eql(u8, effective_args[1], "-le")) return if (lhs <= rhs) 0 else 1;
-        if (std.mem.eql(u8, effective_args[1], "-gt")) return if (lhs > rhs) 0 else 1;
-        if (std.mem.eql(u8, effective_args[1], "-ge")) return if (lhs >= rhs) 0 else 1;
+        return testBinary(targs[0], targs[1], targs[2]);
     }
 
+    if (targs.len == 4 and std.mem.eql(u8, targs[0], "!")) {
+        return if (testEvaluate(targs[1..]) == 0) 1 else 0;
+    }
+
+    var pos: usize = 0;
+    return testParseOr(targs, &pos);
+}
+
+fn testParseOr(targs: []const []const u8, pos: *usize) u8 {
+    var result = testParseAnd(targs, pos);
+    while (pos.* < targs.len and std.mem.eql(u8, targs[pos.*], "-o")) {
+        pos.* += 1;
+        const right = testParseAnd(targs, pos);
+        result = if (result == 0 or right == 0) 0 else 1;
+    }
+    return result;
+}
+
+fn testParseAnd(targs: []const []const u8, pos: *usize) u8 {
+    var result = testParsePrimary(targs, pos);
+    while (pos.* < targs.len and std.mem.eql(u8, targs[pos.*], "-a")) {
+        pos.* += 1;
+        const right = testParsePrimary(targs, pos);
+        result = if (result == 0 and right == 0) 0 else 1;
+    }
+    return result;
+}
+
+fn testParsePrimary(targs: []const []const u8, pos: *usize) u8 {
+    if (pos.* >= targs.len) return 1;
+
+    if (std.mem.eql(u8, targs[pos.*], "!")) {
+        pos.* += 1;
+        return if (testParsePrimary(targs, pos) == 0) 1 else 0;
+    }
+
+    if (std.mem.eql(u8, targs[pos.*], "(")) {
+        pos.* += 1;
+        const result = testParseOr(targs, pos);
+        if (pos.* < targs.len and std.mem.eql(u8, targs[pos.*], ")")) {
+            pos.* += 1;
+        }
+        return result;
+    }
+
+    if (isTestUnaryOp(targs[pos.*]) and pos.* + 1 < targs.len) {
+        const op = targs[pos.*];
+        pos.* += 1;
+        const operand = targs[pos.*];
+        pos.* += 1;
+        return testUnary(op, operand);
+    }
+
+    if (pos.* + 2 < targs.len and isTestBinaryOp(targs[pos.* + 1])) {
+        const left = targs[pos.*];
+        const op = targs[pos.* + 1];
+        const right = targs[pos.* + 2];
+        pos.* += 3;
+        return testBinary(left, op, right);
+    }
+
+    const result: u8 = if (targs[pos.*].len > 0) 0 else 1;
+    pos.* += 1;
+    return result;
+}
+
+fn isTestUnaryOp(op: []const u8) bool {
+    const ops = [_][]const u8{
+        "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-L", "-n", "-p",
+        "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-z",
+    };
+    for (ops) |o| {
+        if (std.mem.eql(u8, op, o)) return true;
+    }
+    return false;
+}
+
+fn isTestBinaryOp(op: []const u8) bool {
+    const ops = [_][]const u8{
+        "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+    };
+    for (ops) |o| {
+        if (std.mem.eql(u8, op, o)) return true;
+    }
+    return false;
+}
+
+fn testUnary(op: []const u8, operand: []const u8) u8 {
+    if (std.mem.eql(u8, op, "-n")) return if (operand.len > 0) 0 else 1;
+    if (std.mem.eql(u8, op, "-z")) return if (operand.len == 0) 0 else 1;
+
+    if (std.mem.eql(u8, op, "-t")) {
+        const fd_num = std.fmt.parseInt(posix.fd_t, operand, 10) catch return 1;
+        return if (posix.isatty(fd_num)) 0 else 1;
+    }
+
+    const path_z = std.posix.toPosixPath(operand) catch return 1;
+
+    if (std.mem.eql(u8, op, "-e")) {
+        _ = posix.stat(&path_z) catch return 1;
+        return 0;
+    }
+    if (std.mem.eql(u8, op, "-f")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFREG) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-d")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFDIR) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-b")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFBLK) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-c")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFCHR) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-p")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFIFO) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-h") or std.mem.eql(u8, op, "-L")) {
+        const st = posix.lstat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFLNK) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-S")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_IFMT == posix.S_IFSOCK) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-g")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_ISGID != 0) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-u")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_ISUID != 0) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-r")) {
+        return if (posix.access(&path_z, posix.R_OK)) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-w")) {
+        return if (posix.access(&path_z, posix.W_OK)) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-x")) {
+        return if (posix.access(&path_z, posix.X_OK)) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-s")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.size > 0) 0 else 1;
+    }
+    return 2;
+}
+
+fn testBinary(left: []const u8, op: []const u8, right: []const u8) u8 {
+    if (std.mem.eql(u8, op, "=") or std.mem.eql(u8, op, "==")) {
+        return if (std.mem.eql(u8, left, right)) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "!=")) {
+        return if (!std.mem.eql(u8, left, right)) 0 else 1;
+    }
+
+    const lhs = std.fmt.parseInt(i64, left, 10) catch return 2;
+    const rhs = std.fmt.parseInt(i64, right, 10) catch return 2;
+
+    if (std.mem.eql(u8, op, "-eq")) return if (lhs == rhs) 0 else 1;
+    if (std.mem.eql(u8, op, "-ne")) return if (lhs != rhs) 0 else 1;
+    if (std.mem.eql(u8, op, "-lt")) return if (lhs < rhs) 0 else 1;
+    if (std.mem.eql(u8, op, "-le")) return if (lhs <= rhs) 0 else 1;
+    if (std.mem.eql(u8, op, "-gt")) return if (lhs > rhs) 0 else 1;
+    if (std.mem.eql(u8, op, "-ge")) return if (lhs >= rhs) 0 else 1;
     return 2;
 }
 
@@ -1333,6 +1537,139 @@ fn builtinHash(args: []const []const u8, env: *Environment) u8 {
         }
     }
     return status;
+}
+
+fn builtinFc(args: []const []const u8, env: *Environment) u8 {
+    const history = env.history orelse {
+        posix.writeAll(2, "fc: no history available\n");
+        return 1;
+    };
+    if (history.count == 0) {
+        posix.writeAll(2, "fc: no history\n");
+        return 1;
+    }
+
+    var list_mode = false;
+    var suppress_numbers = false;
+    var arg_start: usize = 1;
+
+    while (arg_start < args.len) {
+        const arg = args[arg_start];
+        if (arg.len == 0 or arg[0] != '-') break;
+        if (std.mem.eql(u8, arg, "--")) {
+            arg_start += 1;
+            break;
+        }
+        for (arg[1..]) |flag_c| {
+            switch (flag_c) {
+                'l' => list_mode = true,
+                'n' => suppress_numbers = true,
+                's' => {},
+                else => {},
+            }
+        }
+        arg_start += 1;
+    }
+
+    if (list_mode) {
+        return fcList(args[arg_start..], history, suppress_numbers);
+    }
+
+    posix.writeAll(2, "fc: use fc -l to list or fc -s to re-execute\n");
+    return 1;
+}
+
+fn fcResolveNum(spec: []const u8, count: usize) usize {
+    if (std.fmt.parseInt(i64, spec, 10)) |n| {
+        if (n < 0) {
+            const abs: usize = @intCast(-n);
+            if (abs >= count) return 1;
+            return count - abs + 1;
+        }
+        const un: usize = @intCast(n);
+        if (un > count) return count;
+        if (un == 0) return 1;
+        return un;
+    } else |_| {}
+    return count;
+}
+
+fn fcList(extra_args: []const []const u8, history: *const LineEditor.History, suppress_numbers: bool) u8 {
+    const count = history.count;
+    var first: usize = if (count > 16) count - 16 + 1 else 1;
+    var last: usize = count;
+
+    if (extra_args.len >= 1) {
+        first = fcResolveNum(extra_args[0], count);
+    }
+    if (extra_args.len >= 2) {
+        last = fcResolveNum(extra_args[1], count);
+    }
+
+    if (first < 1) first = 1;
+    if (last > count) last = count;
+    if (first > last) return 0;
+
+    var i: usize = first;
+    while (i <= last) : (i += 1) {
+        if (history.entries[i - 1]) |entry| {
+            if (!suppress_numbers) {
+                var num_buf: [16]u8 = undefined;
+                const num_str = std.fmt.bufPrint(&num_buf, "{d}\t", .{i}) catch continue;
+                posix.writeAll(1, num_str);
+            }
+            posix.writeAll(1, entry);
+            posix.writeAll(1, "\n");
+        }
+    }
+    return 0;
+}
+
+pub fn fcGetReexecCommand(extra_args: []const []const u8, history: *const LineEditor.History) ?[]const u8 {
+    var old_pat: ?[]const u8 = null;
+    var new_pat: ?[]const u8 = null;
+    var cmd_spec: ?[]const u8 = null;
+
+    for (extra_args) |arg| {
+        if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
+            old_pat = arg[0..eq];
+            new_pat = arg[eq + 1 ..];
+        } else {
+            cmd_spec = arg;
+        }
+    }
+
+    const entry_idx = if (cmd_spec) |spec| fcResolveNum(spec, history.count) else history.count;
+    if (entry_idx < 1 or entry_idx > history.count) {
+        posix.writeAll(2, "fc: no such history entry\n");
+        return null;
+    }
+
+    const entry = history.entries[entry_idx - 1] orelse {
+        posix.writeAll(2, "fc: no such history entry\n");
+        return null;
+    };
+
+    if (old_pat != null and new_pat != null) {
+        var out_buf: [4096]u8 = undefined;
+        var out_len: usize = 0;
+        var j: usize = 0;
+        while (j < entry.len and out_len < out_buf.len) {
+            if (j + old_pat.?.len <= entry.len and std.mem.eql(u8, entry[j .. j + old_pat.?.len], old_pat.?)) {
+                const remaining = out_buf.len - out_len;
+                const copy_len = @min(new_pat.?.len, remaining);
+                @memcpy(out_buf[out_len .. out_len + copy_len], new_pat.?[0..copy_len]);
+                out_len += copy_len;
+                j += old_pat.?.len;
+            } else {
+                out_buf[out_len] = entry[j];
+                out_len += 1;
+                j += 1;
+            }
+        }
+        return out_buf[0..out_len];
+    }
+    return entry;
 }
 
 fn sigFromName(name: []const u8) ?u6 {

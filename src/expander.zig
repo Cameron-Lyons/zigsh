@@ -97,14 +97,26 @@ pub const Expander = struct {
         switch (param) {
             .simple => |name| {
                 if (self.env.get(name)) |val| return try self.alloc.dupe(u8, val);
+                if (self.env.options.nounset) {
+                    const msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter not set\n", .{name}) catch return error.OutOfMemory;
+                    _ = std.c.write(2, msg.ptr, msg.len);
+                    self.alloc.free(msg);
+                    return error.UnsetVariable;
+                }
                 return try self.alloc.dupe(u8, "");
             },
-            .special => |c| return try self.expandSpecial(c),
+            .special => |ch| return try self.expandSpecial(ch),
             .positional => |n| {
                 if (n == 0) {
                     return try self.alloc.dupe(u8, "zigsh");
                 }
                 if (self.env.getPositional(n)) |val| return try self.alloc.dupe(u8, val);
+                if (self.env.options.nounset) {
+                    const msg = std.fmt.allocPrint(self.alloc, "zigsh: {d}: parameter not set\n", .{n}) catch return error.OutOfMemory;
+                    _ = std.c.write(2, msg.ptr, msg.len);
+                    self.alloc.free(msg);
+                    return error.UnsetVariable;
+                }
                 return try self.alloc.dupe(u8, "");
             },
             .length => |name| {
@@ -232,8 +244,25 @@ pub const Expander = struct {
     }
 
     fn expandTilde(self: *Expander, text: []const u8) ExpandError![]const u8 {
-        if (text.len == 1) {
+        if (text.len == 1 and text[0] == '~') {
             if (self.env.get("HOME")) |home| return try self.alloc.dupe(u8, home);
+            return try self.alloc.dupe(u8, text);
+        }
+        if (text.len == 2 and text[0] == '~' and text[1] == '+') {
+            if (self.env.get("PWD")) |pwd| return try self.alloc.dupe(u8, pwd);
+            return try self.alloc.dupe(u8, text);
+        }
+        if (text.len == 2 and text[0] == '~' and text[1] == '-') {
+            if (self.env.get("OLDPWD")) |oldpwd| return try self.alloc.dupe(u8, oldpwd);
+            return try self.alloc.dupe(u8, text);
+        }
+        if (text.len > 1 and text[0] == '~') {
+            const username = text[1..];
+            const username_z = self.alloc.dupeZ(u8, username) catch return error.OutOfMemory;
+            defer self.alloc.free(username_z);
+            if (posix.getpwnam(username_z.ptr)) |home_dir| {
+                return try self.alloc.dupe(u8, std.mem.sliceTo(home_dir, 0));
+            }
         }
         return try self.alloc.dupe(u8, text);
     }

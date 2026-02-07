@@ -29,6 +29,16 @@ pub const Shell = struct {
         self.env.job_table = &self.jobs;
     }
 
+    pub fn linkHistory(self: *Shell) void {
+        self.env.history = &self.history;
+    }
+
+    pub fn loadEnvFile(self: *Shell) void {
+        if (self.env.get("ENV")) |env_path| {
+            _ = self.executeFile(env_path);
+        }
+    }
+
     pub fn deinit(self: *Shell) void {
         self.history.saveFile();
         self.history.deinit();
@@ -63,6 +73,13 @@ pub const Shell = struct {
     }
 
     pub fn executeSource(self: *Shell, source: []const u8) u8 {
+        if (self.env.options.verbose) {
+            posix.writeAll(2, source);
+            if (source.len > 0 and source[source.len - 1] != '\n') {
+                posix.writeAll(2, "\n");
+            }
+        }
+
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -125,6 +142,10 @@ pub const Shell = struct {
             const line = editor.readLine(prompt) orelse break;
             if (line.len == 0) continue;
 
+            if (self.env.options.verbose) {
+                posix.writeAll(2, line);
+                posix.writeAll(2, "\n");
+            }
             _ = self.executeSource(line);
         }
         self.executeExitTrap();
@@ -146,6 +167,12 @@ pub const Shell = struct {
             if (n == 0) break;
             const line = buf[0..n];
 
+            if (self.env.options.verbose) {
+                posix.writeAll(2, line);
+                if (line.len > 0 and line[line.len - 1] != '\n') {
+                    posix.writeAll(2, "\n");
+                }
+            }
             _ = self.executeSource(line);
         }
         self.executeExitTrap();

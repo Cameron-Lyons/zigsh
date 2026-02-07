@@ -67,11 +67,12 @@ pub const RedirectOp = enum {
     heredoc_strip,
 };
 
-pub fn applyFileRedirect(fd: types.Fd, path: [*:0]const u8, op: RedirectOp, state: *RedirectState) ApplyError!void {
+pub fn applyFileRedirect(fd: types.Fd, path: [*:0]const u8, op: RedirectOp, state: *RedirectState, noclobber: bool) ApplyError!void {
     try state.save(fd);
     const flags: posix.OpenFlags = switch (op) {
         .input, .heredoc, .heredoc_strip => posix.oRdonly(),
-        .output, .clobber => posix.oWronlyCreatTrunc(),
+        .output => if (noclobber) posix.oWronlyCreatExcl() else posix.oWronlyCreatTrunc(),
+        .clobber => posix.oWronlyCreatTrunc(),
         .append => posix.oWronlyCreatAppend(),
         .read_write => posix.oRdwrCreat(),
         .dup_input, .dup_output => posix.oRdonly(),
