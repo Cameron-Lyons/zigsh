@@ -55,4 +55,20 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-printf", "Run printf integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+
+    const read_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_read.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const read_tests = b.addTest(.{
+        .root_module = read_test_mod,
+    });
+    const run_read_tests = b.addRunArtifact(read_tests);
+    run_read_tests.step.dependOn(b.getInstallStep());
+
+    const read_test_step = b.step("test-read", "Run read integration tests");
+    read_test_step.dependOn(&run_read_tests.step);
+    test_step.dependOn(&run_read_tests.step);
 }
