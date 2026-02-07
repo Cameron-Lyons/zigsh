@@ -8,6 +8,7 @@ pub const Program = struct {
 pub const CompleteCommand = struct {
     list: List,
     bg: bool = false,
+    line: u32 = 0,
 };
 
 pub const List = struct {
@@ -25,6 +26,7 @@ pub const ListOp = enum { semi, amp };
 pub const AndOr = struct {
     first: Pipeline,
     rest: []const AndOrRest,
+    line: u32 = 0,
 };
 
 pub const AndOrRest = struct {
