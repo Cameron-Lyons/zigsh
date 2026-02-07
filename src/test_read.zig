@@ -233,3 +233,128 @@ test "read successive reads consume lines" {
         "first,second\n",
     );
 }
+
+test "read -p displays prompt on stderr" {
+    const result = try runShellWithInput(
+        "read -p 'Enter: ' x; printf '%s\\n' \"$x\"",
+        "hello\n",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("hello\n", result.stdout);
+    try testing.expectEqualStrings("Enter: ", result.stderr);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "read -p with empty prompt" {
+    const result = try runShellWithInput(
+        "read -p '' x; printf '%s\\n' \"$x\"",
+        "hello\n",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("hello\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "read -p prompt with REPLY default" {
+    const result = try runShellWithInput(
+        "read -p '> '; printf '%s\\n' \"$REPLY\"",
+        "test\n",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("test\n", result.stdout);
+    try testing.expectEqualStrings("> ", result.stderr);
+}
+
+test "read -d custom delimiter" {
+    try expectReadOutput(
+        "read -d : x; printf '<%s>\\n' \"$x\"",
+        "hello:world\n",
+        "<hello>\n",
+    );
+}
+
+test "read -d reads up to delimiter ignoring newlines" {
+    try expectReadOutput(
+        "read -d : x; printf '<%s>\\n' \"$x\"",
+        "line1\nline2:",
+        "<line1\nline2>\n",
+    );
+}
+
+test "read -d with multiple variables" {
+    try expectReadOutput(
+        "read -d : a b; printf '<%s><%s>\\n' \"$a\" \"$b\"",
+        "one two three:",
+        "<one><two three>\n",
+    );
+}
+
+test "read -d EOF without delimiter" {
+    const result = try runShellWithInput(
+        "read -d : x; printf '<%s>' \"$x\"",
+        "no delimiter here",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("<no delimiter here>", result.stdout);
+}
+
+test "read -d with single char arg" {
+    try expectReadOutput(
+        "read -d , x; printf '<%s>\\n' \"$x\"",
+        "a,b,c\n",
+        "<a>\n",
+    );
+}
+
+test "read -rp combined flags" {
+    const result = try runShellWithInput(
+        "read -rp 'prompt: ' x; printf '%s\\n' \"$x\"",
+        "back\\slash\n",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("back\\slash\n", result.stdout);
+    try testing.expectEqualStrings("prompt: ", result.stderr);
+}
+
+test "read -r -d combined separate flags" {
+    try expectReadOutput(
+        "read -r -d : x; printf '<%s>\\n' \"$x\"",
+        "back\\slash:",
+        "<back\\slash>\n",
+    );
+}
+
+test "read -r -p -d all three flags" {
+    const result = try runShellWithInput(
+        "read -r -p 'go: ' -d , x; printf '<%s>\\n' \"$x\"",
+        "a\\b,rest",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("<a\\b>\n", result.stdout);
+    try testing.expectEqualStrings("go: ", result.stderr);
+}
+
+test "read -p with prompt as next arg" {
+    const result = try runShellWithInput(
+        "read -p 'ask: ' x; printf '%s\\n' \"$x\"",
+        "val\n",
+    );
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("val\n", result.stdout);
+    try testing.expectEqualStrings("ask: ", result.stderr);
+}
+
+test "read -d with delimiter as next arg" {
+    try expectReadOutput(
+        "read -d ';' x; printf '<%s>\\n' \"$x\"",
+        "hello;world",
+        "<hello>\n",
+    );
+}

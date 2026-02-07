@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = @import("posix.zig");
 const JobTable = @import("jobs.zig").JobTable;
+const LineEditor = @import("line_editor.zig").LineEditor;
 
 pub const Environment = struct {
     vars: std.StringHashMap(Variable),
@@ -26,6 +27,7 @@ pub const Environment = struct {
     should_exit: bool,
     exit_value: u8,
     job_table: ?*JobTable,
+    history: ?*LineEditor.History,
 
     pub const Variable = struct {
         value: []const u8,
@@ -47,10 +49,23 @@ pub const Environment = struct {
         monitor: bool = false,
         noclobber: bool = false,
         verbose: bool = false,
+        interactive: bool = false,
 
-        pub fn toFlagString(self: *const ShellOptions) []const u8 {
-            _ = self;
-            return "";
+        flag_buf: [16]u8 = undefined,
+
+        pub fn toFlagString(self: *ShellOptions) []const u8 {
+            var len: usize = 0;
+            if (self.errexit) { self.flag_buf[len] = 'e'; len += 1; }
+            if (self.nounset) { self.flag_buf[len] = 'u'; len += 1; }
+            if (self.xtrace) { self.flag_buf[len] = 'x'; len += 1; }
+            if (self.noglob) { self.flag_buf[len] = 'f'; len += 1; }
+            if (self.noexec) { self.flag_buf[len] = 'n'; len += 1; }
+            if (self.allexport) { self.flag_buf[len] = 'a'; len += 1; }
+            if (self.monitor) { self.flag_buf[len] = 'm'; len += 1; }
+            if (self.noclobber) { self.flag_buf[len] = 'C'; len += 1; }
+            if (self.verbose) { self.flag_buf[len] = 'v'; len += 1; }
+            if (self.interactive) { self.flag_buf[len] = 'i'; len += 1; }
+            return self.flag_buf[0..len];
         }
     };
 
@@ -76,6 +91,7 @@ pub const Environment = struct {
             .should_exit = false,
             .exit_value = 0,
             .job_table = null,
+            .history = null,
         };
 
         env.importEnviron();

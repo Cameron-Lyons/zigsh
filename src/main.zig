@@ -26,7 +26,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var sh = Shell.init(gpa);
     sh.linkJobTable();
+    sh.linkHistory();
     defer sh.deinit();
+
+    var ppid_buf: [16]u8 = undefined;
+    const ppid_str = std.fmt.bufPrint(&ppid_buf, "{d}", .{posix.getppid()}) catch "0";
+    sh.env.set("PPID", ppid_str, false) catch {};
+    sh.env.markReadonly("PPID");
 
     var args_buf: [256][]const u8 = undefined;
     var args_count: usize = 0;
@@ -62,6 +68,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         sh.env.set("PS1", "$ ", false) catch {};
     }
 
+    sh.env.options.interactive = true;
+    sh.loadEnvFile();
     return sh.runInteractive();
 }
 
