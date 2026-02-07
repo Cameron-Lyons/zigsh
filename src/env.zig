@@ -195,6 +195,15 @@ pub const Environment = struct {
         }
     }
 
+    pub fn unsetFunction(self: *Environment, name: []const u8) bool {
+        if (self.functions.fetchRemove(name)) |kv| {
+            self.alloc.free(kv.key);
+            self.alloc.free(kv.value.source);
+            return true;
+        }
+        return false;
+    }
+
     pub fn markExported(self: *Environment, name: []const u8) void {
         if (self.vars.getPtr(name)) |v| {
             v.exported = true;

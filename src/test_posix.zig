@@ -366,3 +366,189 @@ test "readonly var preserves value" {
 test "PS2 defaults to '> '" {
     try expectOutput("echo \"$PS2\"", "> \n");
 }
+
+// --- set no args prints variables ---
+
+test "set no args prints variables" {
+    const result = try runShell("X_TEST_SET=hello; set");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "X_TEST_SET=hello") != null);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+// --- set -- clears positional params ---
+
+test "set -- clears positional params" {
+    try expectOutput("set -- a b c; echo $#; set --; echo $#", "3\n0\n");
+}
+
+test "set -- with args" {
+    try expectOutput("set -- x y; echo $1 $2", "x y\n");
+}
+
+// --- set +o reinput format ---
+
+test "set +o shows reinput format" {
+    const result = try runShell("set +o");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "set +o errexit") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "set +o nounset") != null);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+// --- unset -f ---
+
+test "unset -f removes function" {
+    try expectExitCode("f(){ echo x; }; unset -f f; f", 127);
+}
+
+test "unset -v removes variable" {
+    try expectOutput("X=42; unset -v X; echo ${X-gone}", "gone\n");
+}
+
+// --- kill signal names ---
+
+test "kill -l lists signals" {
+    const result = try runShell("kill -l");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "HUP") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "INT") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "TERM") != null);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "kill -l exit_status converts to signal name" {
+    try expectOutput("kill -l 130", "INT\n");
+}
+
+test "kill -l 137 gives KILL" {
+    try expectOutput("kill -l 137", "KILL\n");
+}
+
+test "kill -l 2 gives INT" {
+    try expectOutput("kill -l 2", "INT\n");
+}
+
+// --- umask -S ---
+
+test "umask -S symbolic display" {
+    try expectOutput("umask 022; umask -S", "u=rwx,g=rx,o=rx\n");
+}
+
+test "umask -S with 077" {
+    try expectOutput("umask 077; umask -S", "u=rwx,g=,o=\n");
+}
+
+test "umask symbolic input" {
+    try expectOutput("umask u=rwx,g=rx,o=rx; umask", "0022\n");
+}
+
+test "umask symbolic input restrictive" {
+    try expectOutput("umask u=rwx,g=,o=; umask", "0077\n");
+}
+
+// --- pwd -L/-P ---
+
+test "pwd -P shows physical path" {
+    try expectOutput("cd /tmp; pwd -P", "/tmp\n");
+}
+
+test "pwd -L shows logical path" {
+    try expectOutput("cd /tmp; pwd -L", "/tmp\n");
+}
+
+// --- type full path ---
+
+test "type shows full path for external commands" {
+    const result = try runShell("type ls");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "ls is /") != null);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "type shows builtin for shell builtins" {
+    try expectOutput("type echo", "echo is a shell builtin\n");
+}
+
+test "type not found returns 1" {
+    try expectExitCode("type nonexistent_command_xyz123", 1);
+}
+
+// --- getopts clustering ---
+
+test "getopts processes clustered options" {
+    try expectOutput("while getopts abc opt -abc; do printf '%s ' \"$opt\"; done; echo", "a b c \n");
+}
+
+test "getopts with option argument" {
+    try expectOutput("while getopts a:b opt -afoo -b; do printf '%s:%s ' \"$opt\" \"$OPTARG\"; done; echo", "a:foo b: \n");
+}
+
+test "getopts silent mode unknown option" {
+    try expectOutput(
+        "while getopts :ab opt -a -x -b; do printf '%s:%s ' \"$opt\" \"$OPTARG\"; done; echo",
+        "a: ?:x b: \n",
+    );
+}
+
+// --- cd - prints directory ---
+
+test "cd - prints new directory" {
+    const result = try runShell("cd /tmp; cd /; cd -");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqualStrings("/tmp\n", result.stdout);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+// --- trap -p SIGNAL ---
+
+test "trap -p INT shows specific trap" {
+    try expectOutput(
+        "trap 'echo bye' INT; trap -p INT",
+        "trap -- 'echo bye' INT\n",
+    );
+}
+
+test "trap -p with no matching trap shows nothing" {
+    try expectOutput("trap -p INT", "");
+}
+
+test "trap -p EXIT shows exit trap" {
+    try expectOutput(
+        "trap 'cleanup' EXIT; trap -p EXIT",
+        "trap -- 'cleanup' EXIT\n",
+    );
+}
+
+// --- ulimit ---
+
+test "ulimit -n shows open files" {
+    const result = try runShell("ulimit -n");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(result.stdout.len > 0);
+    try testing.expect(result.stdout[result.stdout.len - 1] == '\n');
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "ulimit -a shows all limits" {
+    const result = try runShell("ulimit -a");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "open files") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "stack size") != null);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}
+
+test "ulimit default is file size" {
+    const result = try runShell("ulimit");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(result.stdout.len > 0);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+}

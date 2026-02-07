@@ -19,6 +19,32 @@ pub const SIGHUP: u6 = 1;
 pub const SIGPIPE: u6 = 13;
 pub const SIGUSR1: u6 = 10;
 pub const SIGUSR2: u6 = 12;
+pub const SIGABRT: u6 = 6;
+pub const SIGALRM: u6 = 14;
+pub const SIGKILL: u6 = 9;
+pub const SIGSTOP: u6 = 19;
+
+pub fn sigNameFromNum(signum: u6) ?[]const u8 {
+    return switch (signum) {
+        1 => "HUP",
+        2 => "INT",
+        3 => "QUIT",
+        6 => "ABRT",
+        9 => "KILL",
+        10 => "USR1",
+        12 => "USR2",
+        13 => "PIPE",
+        14 => "ALRM",
+        15 => "TERM",
+        17 => "CHLD",
+        18 => "CONT",
+        19 => "STOP",
+        20 => "TSTP",
+        21 => "TTIN",
+        22 => "TTOU",
+        else => null,
+    };
+}
 
 pub const TRAP_EXIT: usize = 0;
 pub const TRAP_ERR: usize = 33;

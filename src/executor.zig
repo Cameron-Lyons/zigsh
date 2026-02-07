@@ -759,6 +759,8 @@ pub const Executor = struct {
 
     fn executeFcBuiltin(self: *Executor, fields: []const []const u8) u8 {
         var has_s = false;
+        var has_e = false;
+        var editor: ?[]const u8 = null;
         var arg_start: usize = 1;
         while (arg_start < fields.len) {
             const arg = fields[arg_start];
@@ -767,13 +769,23 @@ pub const Executor = struct {
                 arg_start += 1;
                 break;
             }
+            if (std.mem.eql(u8, arg, "-e")) {
+                has_e = true;
+                arg_start += 1;
+                if (arg_start < fields.len) {
+                    editor = fields[arg_start];
+                    arg_start += 1;
+                }
+                continue;
+            }
             for (arg[1..]) |fc| {
                 if (fc == 's') has_s = true;
+                if (fc == 'e') has_e = true;
             }
             arg_start += 1;
         }
 
-        if (!has_s) {
+        if (!has_s and !has_e) {
             return builtins.builtins.get("fc").?(fields, self.env);
         }
 
@@ -786,10 +798,72 @@ pub const Executor = struct {
             return 1;
         }
 
-        const cmd = builtins.fcGetReexecCommand(fields[arg_start..], history) orelse return 1;
-        posix.writeAll(1, cmd);
-        posix.writeAll(1, "\n");
-        return self.executeInline(cmd);
+        if (has_s) {
+            const cmd = builtins.fcGetReexecCommand(fields[arg_start..], history) orelse return 1;
+            posix.writeAll(1, cmd);
+            posix.writeAll(1, "\n");
+            return self.executeInline(cmd);
+        }
+
+        const ed = editor orelse self.env.get("FCEDIT") orelse self.env.get("EDITOR") orelse "ed";
+
+        var first: usize = history.count;
+        var last: usize = history.count;
+        if (arg_start < fields.len) {
+            first = builtins.fcResolveNum(fields[arg_start], history.count);
+            if (arg_start + 1 < fields.len) {
+                last = builtins.fcResolveNum(fields[arg_start + 1], history.count);
+            } else {
+                last = first;
+            }
+        }
+        if (first < 1) first = 1;
+        if (last > history.count) last = history.count;
+        if (first > last) {
+            const tmp = first;
+            first = last;
+            last = tmp;
+        }
+
+        const tmp_path = "/tmp/.zigsh_fc_edit";
+        const tmp_fd = posix.open(tmp_path, posix.oWronlyCreatTrunc(), 0o600) catch {
+            posix.writeAll(2, "fc: cannot create temp file\n");
+            return 1;
+        };
+        var ii: usize = first;
+        while (ii <= last) : (ii += 1) {
+            if (history.entries[ii - 1]) |entry| {
+                _ = posix.write(tmp_fd, entry) catch {};
+                _ = posix.write(tmp_fd, "\n") catch {};
+            }
+        }
+        posix.close(tmp_fd);
+
+        var ed_cmd_buf: [4096]u8 = undefined;
+        const ed_cmd = std.fmt.bufPrint(&ed_cmd_buf, "{s} {s}", .{ ed, tmp_path }) catch {
+            posix.writeAll(2, "fc: editor command too long\n");
+            return 1;
+        };
+
+        _ = self.executeInline(ed_cmd);
+
+        const read_fd = posix.open(tmp_path, posix.oRdonly(), 0) catch {
+            posix.writeAll(2, "fc: cannot read temp file\n");
+            return 1;
+        };
+        var content: std.ArrayListUnmanaged(u8) = .empty;
+        defer content.deinit(self.alloc);
+        posix.readToEnd(read_fd, self.alloc, &content) catch {
+            posix.close(read_fd);
+            return 1;
+        };
+        posix.close(read_fd);
+
+        const unlink_path = std.posix.toPosixPath(tmp_path) catch return 1;
+        _ = std.c.unlink(&unlink_path);
+
+        if (content.items.len == 0) return 0;
+        return self.executeInline(content.items);
     }
 
     fn executeInline(self: *Executor, source: []const u8) u8 {
