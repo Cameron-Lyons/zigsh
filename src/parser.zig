@@ -86,6 +86,7 @@ pub const Parser = struct {
     }
 
     fn parseCompleteCommand(self: *Parser) ParseError!ast.CompleteCommand {
+        const line = self.lexer.line;
         const list = try self.parseList();
 
         var bg = false;
@@ -100,7 +101,7 @@ pub const Parser = struct {
             try self.advance();
         }
 
-        return .{ .list = list, .bg = bg };
+        return .{ .list = list, .bg = bg, .line = line };
     }
 
     fn parseList(self: *Parser) ParseError!ast.List {
@@ -158,6 +159,7 @@ pub const Parser = struct {
     }
 
     fn parseAndOr(self: *Parser) ParseError!ast.AndOr {
+        const line = self.lexer.line;
         const first = try self.parsePipeline();
         var rest: List(ast.AndOrRest) = .empty;
 
@@ -169,7 +171,7 @@ pub const Parser = struct {
             try rest.append(self.alloc, .{ .op = op, .pipeline = pipeline });
         }
 
-        return .{ .first = first, .rest = try rest.toOwnedSlice(self.alloc) };
+        return .{ .first = first, .rest = try rest.toOwnedSlice(self.alloc), .line = line };
     }
 
     fn parsePipeline(self: *Parser) ParseError!ast.Pipeline {

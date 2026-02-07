@@ -113,6 +113,11 @@ pub const Executor = struct {
     }
 
     fn executeAndOr(self: *Executor, and_or: ast.AndOr) u8 {
+        if (and_or.line > 0) {
+            var buf: [16]u8 = undefined;
+            const line_str = std.fmt.bufPrint(&buf, "{d}", .{and_or.line}) catch "0";
+            self.env.set("LINENO", line_str, false) catch {};
+        }
         var status = self.executePipeline(and_or.first);
         for (and_or.rest) |item| {
             if (self.env.should_exit or self.env.should_return or
@@ -579,7 +584,11 @@ pub const Executor = struct {
             .close => try redirect.applyCloseRedirect(fd, state),
             .heredoc => |hd| {
                 const pipe_fds = posix.pipe() catch return error.RedirectionFailed;
-                _ = posix.write(pipe_fds[1], hd.body_ptr.*) catch {};
+                const body = if (!hd.quoted)
+                    expander.expandHeredocBody(hd.body_ptr.*) catch hd.body_ptr.*
+                else
+                    hd.body_ptr.*;
+                _ = posix.write(pipe_fds[1], body) catch {};
                 posix.close(pipe_fds[1]);
                 try state.save(fd);
                 posix.dup2(pipe_fds[0], fd) catch return error.RedirectionFailed;

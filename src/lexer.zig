@@ -7,6 +7,7 @@ pub const Lexer = struct {
     source: []const u8,
     pos: u32,
     reserved_word_context: bool,
+    line: u32,
 
     pending_heredocs: [16]HeredocPending = undefined,
     pending_heredoc_count: u8 = 0,
@@ -22,6 +23,7 @@ pub const Lexer = struct {
             .source = source,
             .pos = 0,
             .reserved_word_context = true,
+            .line = 1,
         };
     }
 
@@ -40,6 +42,7 @@ pub const Lexer = struct {
         if (self.source[self.pos] == '\n') {
             const start = self.pos;
             self.pos += 1;
+            self.line += 1;
             self.collectPendingHeredocs();
             return Token{ .tag = .newline, .start = start, .end = self.pos };
         }

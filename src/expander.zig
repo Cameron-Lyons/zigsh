@@ -243,6 +243,141 @@ pub const Expander = struct {
         }
     }
 
+    pub fn expandHeredocBody(self: *Expander, body: []const u8) ExpandError![]const u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        var i: usize = 0;
+        while (i < body.len) {
+            if (body[i] == '\\' and i + 1 < body.len) {
+                const next_ch = body[i + 1];
+                if (next_ch == '$' or next_ch == '`' or next_ch == '\\') {
+                    try result.append(self.alloc, next_ch);
+                    i += 2;
+                    continue;
+                }
+                try result.append(self.alloc, body[i]);
+                i += 1;
+            } else if (body[i] == '$' and i + 1 < body.len) {
+                if (body[i + 1] == '(') {
+                    if (i + 2 < body.len and body[i + 2] == '(') {
+                        const arith_start = i + 3;
+                        var depth: usize = 1;
+                        var j = arith_start;
+                        while (j + 1 < body.len) {
+                            if (body[j] == '(' and body[j + 1] == '(') { depth += 1; j += 2; continue; }
+                            if (body[j] == ')' and body[j + 1] == ')') {
+                                depth -= 1;
+                                if (depth == 0) break;
+                                j += 2;
+                                continue;
+                            }
+                            j += 1;
+                        }
+                        const expr = body[arith_start..j];
+                        const val = try self.expandArithmetic(expr);
+                        try result.appendSlice(self.alloc, val);
+                        self.alloc.free(val);
+                        i = if (j + 1 < body.len) j + 2 else body.len;
+                    } else {
+                        const cmd_start = i + 2;
+                        var depth: usize = 1;
+                        var j = cmd_start;
+                        while (j < body.len) {
+                            if (body[j] == '(') { depth += 1; }
+                            else if (body[j] == ')') {
+                                depth -= 1;
+                                if (depth == 0) break;
+                            }
+                            j += 1;
+                        }
+                        const cmd_body = body[cmd_start..j];
+                        const val = try self.expandCommandSub(.{ .body = cmd_body });
+                        try result.appendSlice(self.alloc, val);
+                        self.alloc.free(val);
+                        i = if (j < body.len) j + 1 else body.len;
+                    }
+                } else if (body[i + 1] == '{') {
+                    const brace_start = i + 2;
+                    var j = brace_start;
+                    while (j < body.len and body[j] != '}') : (j += 1) {}
+                    const name = body[brace_start..j];
+                    if (self.env.get(name)) |val| {
+                        try result.appendSlice(self.alloc, val);
+                    } else if (self.env.options.nounset) {
+                        const msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter not set\n", .{name}) catch return error.OutOfMemory;
+                        _ = std.c.write(2, msg.ptr, msg.len);
+                        self.alloc.free(msg);
+                        return error.UnsetVariable;
+                    }
+                    i = if (j < body.len) j + 1 else body.len;
+                } else if (types.isNameStart(body[i + 1])) {
+                    var j = i + 1;
+                    while (j < body.len and types.isNameCont(body[j])) : (j += 1) {}
+                    const name = body[i + 1 .. j];
+                    if (self.env.get(name)) |val| {
+                        try result.appendSlice(self.alloc, val);
+                    } else if (self.env.options.nounset) {
+                        const msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter not set\n", .{name}) catch return error.OutOfMemory;
+                        _ = std.c.write(2, msg.ptr, msg.len);
+                        self.alloc.free(msg);
+                        return error.UnsetVariable;
+                    }
+                    i = j;
+                } else if (body[i + 1] >= '1' and body[i + 1] <= '9') {
+                    const digit: u32 = body[i + 1] - '0';
+                    const val = self.env.getPositional(digit) orelse "";
+                    try result.appendSlice(self.alloc, val);
+                    i += 2;
+                } else {
+                    const special = body[i + 1];
+                    const val = switch (special) {
+                        '?' => std.fmt.allocPrint(self.alloc, "{d}", .{self.env.last_exit_status}) catch return error.OutOfMemory,
+                        '$' => std.fmt.allocPrint(self.alloc, "{d}", .{self.env.shell_pid}) catch return error.OutOfMemory,
+                        '#' => std.fmt.allocPrint(self.alloc, "{d}", .{self.env.positional_params.len}) catch return error.OutOfMemory,
+                        '!' => blk: {
+                            if (self.env.last_bg_pid) |pid| {
+                                break :blk std.fmt.allocPrint(self.alloc, "{d}", .{pid}) catch return error.OutOfMemory;
+                            }
+                            break :blk try self.alloc.dupe(u8, "");
+                        },
+                        '-' => try self.alloc.dupe(u8, self.env.options.toFlagString()),
+                        '@', '*' => blk: {
+                            var params: std.ArrayListUnmanaged(u8) = .empty;
+                            for (self.env.positional_params, 0..) |param, pi| {
+                                if (pi > 0) try params.append(self.alloc, ' ');
+                                try params.appendSlice(self.alloc, param);
+                            }
+                            break :blk try params.toOwnedSlice(self.alloc);
+                        },
+                        '0' => try self.alloc.dupe(u8, "zigsh"),
+                        else => blk: {
+                            try result.append(self.alloc, '$');
+                            i += 1;
+                            break :blk null;
+                        },
+                    };
+                    if (val) |v| {
+                        try result.appendSlice(self.alloc, v);
+                        self.alloc.free(v);
+                        i += 2;
+                    }
+                }
+            } else if (body[i] == '`') {
+                const bt_start = i + 1;
+                var j = bt_start;
+                while (j < body.len and body[j] != '`') : (j += 1) {}
+                const cmd_body = body[bt_start..j];
+                const val = try self.expandCommandSub(.{ .body = cmd_body });
+                try result.appendSlice(self.alloc, val);
+                self.alloc.free(val);
+                i = if (j < body.len) j + 1 else body.len;
+            } else {
+                try result.append(self.alloc, body[i]);
+                i += 1;
+            }
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
     fn expandTilde(self: *Expander, text: []const u8) ExpandError![]const u8 {
         if (text.len == 1 and text[0] == '~') {
             if (self.env.get("HOME")) |home| return try self.alloc.dupe(u8, home);
