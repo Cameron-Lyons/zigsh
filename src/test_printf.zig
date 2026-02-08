@@ -128,8 +128,8 @@ test "printf escape \\t in format" {
     try expectOutput("printf 'a\\tb'", "a\tb");
 }
 
-test "printf escape \\0101 octal in format" {
-    try expectOutput("printf '\\0101'", "A");
+test "printf escape \\101 octal in format" {
+    try expectOutput("printf '\\101'", "A");
 }
 
 test "printf escape \\x41 hex in format" {

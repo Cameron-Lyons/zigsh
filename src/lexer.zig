@@ -34,6 +34,12 @@ pub const Lexer = struct {
             return Token{ .tag = .eof, .start = self.pos, .end = self.pos };
         }
 
+        if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '\n') {
+            self.pos += 2;
+            self.line += 1;
+            return self.next();
+        }
+
         if (self.source[self.pos] == '#') {
             self.skipComment();
             return self.next();
@@ -58,6 +64,12 @@ pub const Lexer = struct {
         while (self.pos < self.source.len) {
             switch (self.source[self.pos]) {
                 ' ', '\t' => self.pos += 1,
+                '\\' => {
+                    if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '\n') {
+                        self.pos += 2;
+                        self.line += 1;
+                    } else break;
+                },
                 else => break,
             }
         }
@@ -80,6 +92,14 @@ pub const Lexer = struct {
                     self.pos += 2;
                     return Token{ .tag = .and_if, .start = start, .end = self.pos };
                 }
+                if (next_c == '>') {
+                    if (self.pos + 2 < self.source.len and self.source[self.pos + 2] == '>') {
+                        self.pos += 3;
+                        return Token{ .tag = .and_dgreat, .start = start, .end = self.pos };
+                    }
+                    self.pos += 2;
+                    return Token{ .tag = .and_great, .start = start, .end = self.pos };
+                }
                 self.pos += 1;
                 return Token{ .tag = .ampersand, .start = start, .end = self.pos };
             },
@@ -88,19 +108,35 @@ pub const Lexer = struct {
                     self.pos += 2;
                     return Token{ .tag = .or_if, .start = start, .end = self.pos };
                 }
+                if (next_c == '&') {
+                    self.pos += 2;
+                    return Token{ .tag = .pipe_and, .start = start, .end = self.pos };
+                }
                 self.pos += 1;
                 return Token{ .tag = .pipe, .start = start, .end = self.pos };
             },
             ';' => {
                 if (next_c == ';') {
+                    if (self.pos + 2 < self.source.len and self.source[self.pos + 2] == '&') {
+                        self.pos += 3;
+                        return Token{ .tag = .dsemi_and, .start = start, .end = self.pos };
+                    }
                     self.pos += 2;
                     return Token{ .tag = .dsemi, .start = start, .end = self.pos };
+                }
+                if (next_c == '&') {
+                    self.pos += 2;
+                    return Token{ .tag = .semi_and, .start = start, .end = self.pos };
                 }
                 self.pos += 1;
                 return Token{ .tag = .semicolon, .start = start, .end = self.pos };
             },
             '<' => {
                 if (next_c == '<') {
+                    if (self.pos + 2 < self.source.len and self.source[self.pos + 2] == '<') {
+                        self.pos += 3;
+                        return Token{ .tag = .tless, .start = start, .end = self.pos };
+                    }
                     if (self.pos + 2 < self.source.len and self.source[self.pos + 2] == '-') {
                         self.pos += 3;
                         return Token{ .tag = .dlessdash, .start = start, .end = self.pos };
@@ -143,6 +179,19 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return Token{ .tag = .rparen, .start = start, .end = self.pos };
             },
+            '!' => {
+                if (self.reserved_word_context) {
+                    if (self.pos + 1 >= self.source.len or
+                        self.source[self.pos + 1] == ' ' or self.source[self.pos + 1] == '\t' or
+                        self.source[self.pos + 1] == '\n' or self.source[self.pos + 1] == '(' or
+                        self.source[self.pos + 1] == '{')
+                    {
+                        self.pos += 1;
+                        return Token{ .tag = .bang, .start = start, .end = self.pos };
+                    }
+                }
+                return null;
+            },
             else => return null,
         }
     }
@@ -154,11 +203,16 @@ pub const Lexer = struct {
             const c = self.source[self.pos];
             switch (c) {
                 ' ', '\t', '\n' => break,
-                '&', '|', ';', '<', '>', '(', ')', '#' => break,
+                '&', '|', ';', '<', '>', '(', ')' => break,
                 '\\' => {
-                    self.pos += 1;
-                    if (self.pos < self.source.len) {
+                    if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '\n') {
+                        self.pos += 2;
+                        self.line += 1;
+                    } else {
                         self.pos += 1;
+                        if (self.pos < self.source.len) {
+                            self.pos += 1;
+                        }
                     }
                 },
                 '\'' => try self.skipSingleQuote(),
@@ -214,9 +268,14 @@ pub const Lexer = struct {
                     return;
                 },
                 '\\' => {
-                    self.pos += 1;
-                    if (self.pos < self.source.len) {
+                    if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '\n') {
+                        self.pos += 2;
+                        self.line += 1;
+                    } else {
                         self.pos += 1;
+                        if (self.pos < self.source.len) {
+                            self.pos += 1;
+                        }
                     }
                 },
                 '$' => self.skipDollar(),
@@ -265,6 +324,16 @@ pub const Lexer = struct {
                 self.pos += 1;
                 self.skipUntilCloseBrace();
             },
+            '\'' => self.skipDollarSingleQuote(),
+            '[' => {
+                self.pos += 1;
+                var depth: u32 = 1;
+                while (self.pos < self.source.len and depth > 0) {
+                    if (self.source[self.pos] == '[') depth += 1 else if (self.source[self.pos] == ']') depth -= 1;
+                    if (depth > 0) self.pos += 1;
+                }
+                if (self.pos < self.source.len) self.pos += 1;
+            },
             '@', '*', '#', '?', '-', '$', '!' => self.pos += 1,
             '0'...'9' => {
                 while (self.pos < self.source.len and self.source[self.pos] >= '0' and self.source[self.pos] <= '9') {
@@ -277,6 +346,23 @@ pub const Lexer = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    fn skipDollarSingleQuote(self: *Lexer) void {
+        self.pos += 1;
+        while (self.pos < self.source.len) {
+            switch (self.source[self.pos]) {
+                '\'' => {
+                    self.pos += 1;
+                    return;
+                },
+                '\\' => {
+                    self.pos += 1;
+                    if (self.pos < self.source.len) self.pos += 1;
+                },
+                else => self.pos += 1,
+            }
         }
     }
 
@@ -312,10 +398,17 @@ pub const Lexer = struct {
     }
 
     fn skipUntilDoubleCloseParen(self: *Lexer) void {
+        var depth: u32 = 0;
         while (self.pos < self.source.len) {
-            if (self.source[self.pos] == ')' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == ')') {
-                self.pos += 2;
-                return;
+            if (self.source[self.pos] == '(') {
+                depth += 1;
+            } else if (self.source[self.pos] == ')') {
+                if (depth > 0) {
+                    depth -= 1;
+                } else if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == ')') {
+                    self.pos += 2;
+                    return;
+                }
             }
             self.pos += 1;
         }
@@ -349,10 +442,9 @@ pub const Lexer = struct {
         const c = self.source[self.pos];
         if (c != '<' and c != '>') return false;
 
-        for (self.source[start..self.pos]) |ch| {
-            if (ch < '0' or ch > '9') return false;
-        }
-        return true;
+        if (self.pos - start != 1) return false;
+        const ch = self.source[start];
+        return ch >= '0' and ch <= '9';
     }
 
     fn isAssignmentWord(self: *Lexer, start: u32) bool {
@@ -564,6 +656,15 @@ test "lex all reserved words" {
 test "lex unterminated single quote" {
     var lex = Lexer.init("'hello");
     try std.testing.expectError(error.UnterminatedSingleQuote, lex.next());
+}
+
+test "lex bang as reserved word" {
+    var lex = Lexer.init("! false");
+    const t1 = try lex.next();
+    try std.testing.expectEqual(Tag.bang, t1.tag);
+    try std.testing.expectEqualStrings("!", t1.slice(lex.source));
+    const t2 = try lex.next();
+    try std.testing.expectEqual(Tag.word, t2.tag);
 }
 
 test "lex unterminated double quote" {

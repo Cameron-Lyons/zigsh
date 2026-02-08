@@ -66,6 +66,7 @@ pub const Parser = struct {
 
     fn skipNewlines(self: *Parser) ParseError!void {
         while (self.current.tag == .newline) {
+            self.lexer.reserved_word_context = true;
             try self.advance();
         }
     }
@@ -111,6 +112,7 @@ pub const Parser = struct {
         while (true) {
             if (self.current.tag == .semicolon) {
                 const peek_save = self.lexer.pos;
+                self.lexer.reserved_word_context = true;
                 try self.advance();
                 if (self.isCommandStart()) {
                     const and_or = try self.parseAndOr();
@@ -123,6 +125,7 @@ pub const Parser = struct {
             } else if (self.current.tag == .ampersand) {
                 const save_pos = self.lexer.pos;
                 const save_tok = self.current;
+                self.lexer.reserved_word_context = true;
                 try self.advance();
                 if (self.isCommandStart()) {
                     const and_or = try self.parseAndOr();
@@ -180,14 +183,56 @@ pub const Parser = struct {
             bang = true;
             try self.advance();
         }
+        if (self.current.tag == .word and std.mem.eql(u8, self.tokenText(self.current), "time")) {
+            const save_pos = self.lexer.pos;
+            const save_tok = self.current;
+            try self.advance();
+            if (self.current.tag == .word and std.mem.eql(u8, self.tokenText(self.current), "-p")) {
+                try self.advance();
+            }
+            if (self.current.tag == .eof or self.current.tag == .newline or self.current.tag == .semicolon) {
+                self.lexer.pos = save_pos;
+                self.current = save_tok;
+            }
+        }
 
         var commands: List(ast.Command) = .empty;
         const first_cmd = try self.parseCommand();
         try commands.append(self.alloc, first_cmd);
 
-        while (self.current.tag == .pipe) {
+        while (self.current.tag == .pipe or self.current.tag == .pipe_and) {
+            const is_pipe_and = self.current.tag == .pipe_and;
             try self.advance();
             try self.skipNewlines();
+            if (is_pipe_and) {
+                const last_idx = commands.items.len - 1;
+                const last_cmd = &commands.items[last_idx];
+                switch (last_cmd.*) {
+                    .simple => |*sc| {
+                        const stderr_redir = ast.Redirect{
+                            .fd = 2,
+                            .op = .dup_output,
+                            .target = .{ .fd = 1 },
+                        };
+                        var new_redirs: List(ast.Redirect) = .empty;
+                        try new_redirs.appendSlice(self.alloc, sc.redirects);
+                        try new_redirs.append(self.alloc, stderr_redir);
+                        sc.redirects = try new_redirs.toOwnedSlice(self.alloc);
+                    },
+                    .compound => |*cp| {
+                        const stderr_redir = ast.Redirect{
+                            .fd = 2,
+                            .op = .dup_output,
+                            .target = .{ .fd = 1 },
+                        };
+                        var new_redirs: List(ast.Redirect) = .empty;
+                        try new_redirs.appendSlice(self.alloc, cp.redirects);
+                        try new_redirs.append(self.alloc, stderr_redir);
+                        cp.redirects = try new_redirs.toOwnedSlice(self.alloc);
+                    },
+                    .function_def => {},
+                }
+            }
             const cmd = try self.parseCommand();
             try commands.append(self.alloc, cmd);
         }
@@ -202,10 +247,19 @@ pub const Parser = struct {
             .kw_if => return .{ .compound = try self.parseCompoundWithRedirects(.{ .if_clause = try self.parseIfClause() }) },
             .kw_while => return .{ .compound = try self.parseCompoundWithRedirects(.{ .while_clause = try self.parseWhileClause() }) },
             .kw_until => return .{ .compound = try self.parseCompoundWithRedirects(.{ .until_clause = try self.parseUntilClause() }) },
-            .kw_for => return .{ .compound = try self.parseCompoundWithRedirects(.{ .for_clause = try self.parseForClause() }) },
+            .kw_for => {
+                const for_cmd = try self.parseForOrArithFor();
+                return .{ .compound = try self.parseCompoundWithRedirects(for_cmd) };
+            },
             .kw_case => return .{ .compound = try self.parseCompoundWithRedirects(.{ .case_clause = try self.parseCaseClause() }) },
+            .kw_dbracket => return .{ .compound = try self.parseCompoundWithRedirects(.{ .double_bracket = try self.parseDoubleBracket() }) },
             .lbrace => return .{ .compound = try self.parseCompoundWithRedirects(.{ .brace_group = try self.parseBraceGroup() }) },
-            .lparen => return .{ .compound = try self.parseCompoundWithRedirects(.{ .subshell = try self.parseSubshell() }) },
+            .lparen => {
+                if (self.current.end < self.source.len and self.source[self.current.end] == '(') {
+                    return .{ .compound = try self.parseCompoundWithRedirects(.{ .arith_command = try self.parseArithCommand() }) };
+                }
+                return .{ .compound = try self.parseCompoundWithRedirects(.{ .subshell = try self.parseSubshell() }) };
+            },
             else => {
                 if (try self.tryParseFunctionDef()) |func_def| {
                     return .{ .function_def = func_def };
@@ -245,6 +299,12 @@ pub const Parser = struct {
 
         self.lexer.reserved_word_context = true;
 
+        if (assigns.items.len == 0 and words.items.len == 0 and redirects.items.len == 0) {
+            if (self.current.tag == .semicolon or self.current.tag == .ampersand) {
+                return error.UnexpectedToken;
+            }
+        }
+
         return .{
             .assigns = try assigns.toOwnedSlice(self.alloc),
             .words = try words.toOwnedSlice(self.alloc),
@@ -269,7 +329,15 @@ pub const Parser = struct {
         return self.buildWord(text);
     }
 
-    fn buildWord(self: *Parser, text: []const u8) ParseError!ast.Word {
+    pub fn buildWord(self: *Parser, text: []const u8) ParseError!ast.Word {
+        return self.buildWordImpl(text, false);
+    }
+
+    fn buildWordParamExp(self: *Parser, text: []const u8) ParseError!ast.Word {
+        return self.buildWordImpl(text, true);
+    }
+
+    fn buildWordImpl(self: *Parser, text: []const u8, in_param_exp: bool) ParseError!ast.Word {
         var parts: List(ast.WordPart) = .empty;
         var i: usize = 0;
         var literal_start: usize = 0;
@@ -298,12 +366,27 @@ pub const Parser = struct {
                     literal_start = i;
                 },
                 '\\' => {
+                    if (i + 1 < text.len and text[i + 1] == '\n') {
+                        if (i > literal_start) {
+                            try parts.append(self.alloc, .{ .literal = text[literal_start..i] });
+                        }
+                        i += 2;
+                        literal_start = i;
+                        continue;
+                    }
+                    if (i + 1 < text.len) {
+                        const next = text[i + 1];
+                        if (in_param_exp and next != '$' and next != '`' and next != '"' and next != '\\') {
+                            i += 1;
+                            continue;
+                        }
+                    }
                     if (i > literal_start) {
                         try parts.append(self.alloc, .{ .literal = text[literal_start..i] });
                     }
                     i += 1;
                     if (i < text.len) {
-                        try parts.append(self.alloc, .{ .literal = text[i .. i + 1] });
+                        try parts.append(self.alloc, .{ .single_quoted = text[i .. i + 1] });
                         i += 1;
                     }
                     literal_start = i;
@@ -366,13 +449,21 @@ pub const Parser = struct {
         while (i.* < text.len and text[i.*] != '"') {
             switch (text[i.*]) {
                 '\\' => {
+                    if (i.* + 1 < text.len and text[i.* + 1] == '\n') {
+                        if (i.* > literal_start) {
+                            try parts.append(self.alloc, .{ .literal = text[literal_start..i.*] });
+                        }
+                        i.* += 2;
+                        literal_start = i.*;
+                        continue;
+                    }
                     if (i.* > literal_start) {
                         try parts.append(self.alloc, .{ .literal = text[literal_start..i.*] });
                     }
                     i.* += 1;
                     if (i.* < text.len) {
-                        const c = text[i.*];
-                        if (c == '$' or c == '`' or c == '"' or c == '\\' or c == '\n') {
+                        const ch = text[i.*];
+                        if (ch == '$' or ch == '`' or ch == '"' or ch == '\\') {
                             try parts.append(self.alloc, .{ .literal = text[i.* .. i.* + 1] });
                         } else {
                             try parts.append(self.alloc, .{ .literal = text[i.* - 1 .. i.* + 1] });
@@ -382,6 +473,10 @@ pub const Parser = struct {
                     literal_start = i.*;
                 },
                 '$' => {
+                    if (i.* + 1 >= text.len or text[i.* + 1] == '"') {
+                        i.* += 1;
+                        continue;
+                    }
                     if (i.* > literal_start) {
                         try parts.append(self.alloc, .{ .literal = text[literal_start..i.*] });
                     }
@@ -424,11 +519,18 @@ pub const Parser = struct {
                 if (i.* + 1 < text.len and text[i.* + 1] == '(') {
                     i.* += 2;
                     const start = i.*;
+                    var depth: u32 = 0;
                     while (i.* + 1 < text.len) {
-                        if (text[i.*] == ')' and text[i.* + 1] == ')') {
-                            const body = text[start..i.*];
-                            i.* += 2;
-                            return .{ .arith_sub = body };
+                        if (text[i.*] == '(') {
+                            depth += 1;
+                        } else if (text[i.*] == ')') {
+                            if (depth > 0) {
+                                depth -= 1;
+                            } else if (text[i.* + 1] == ')') {
+                                const body = text[start..i.*];
+                                i.* += 2;
+                                return .{ .arith_sub = body };
+                            }
                         }
                         i.* += 1;
                     }
@@ -445,6 +547,13 @@ pub const Parser = struct {
                 const body = text[start..i.*];
                 if (i.* < text.len) i.* += 1;
                 return .{ .command_sub = .{ .body = body } };
+            },
+            '\'' => return try self.parseDollarSingleQuote(text, i),
+            '"' => {
+                i.* += 1;
+                const dq_parts = try self.parseDoubleQuoteContents(text, i);
+                if (i.* < text.len and text[i.*] == '"') i.* += 1;
+                return .{ .double_quoted = dq_parts };
             },
             '@', '*', '#', '?', '-', '$', '!' => {
                 const special = text[i.*];
@@ -463,8 +572,167 @@ pub const Parser = struct {
                 while (i.* < text.len and (std.ascii.isAlphanumeric(text[i.*]) or text[i.*] == '_')) : (i.* += 1) {}
                 return .{ .parameter = .{ .simple = text[start..i.*] } };
             },
+            '[' => {
+                i.* += 1;
+                const start = i.*;
+                var depth: u32 = 1;
+                while (i.* < text.len and depth > 0) {
+                    if (text[i.*] == '[') depth += 1;
+                    if (text[i.*] == ']') depth -= 1;
+                    if (depth > 0) i.* += 1;
+                }
+                const body = text[start..i.*];
+                if (i.* < text.len) i.* += 1;
+                return .{ .arith_sub = body };
+            },
             else => return .{ .literal = "$" },
         }
+    }
+
+    fn parseDollarSingleQuote(self: *Parser, text: []const u8, i: *usize) ParseError!ast.WordPart {
+        i.* += 1;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        while (i.* < text.len) {
+            const ch = text[i.*];
+            if (ch == '\'') {
+                i.* += 1;
+                break;
+            }
+            if (ch == '\\' and i.* + 1 < text.len) {
+                i.* += 1;
+                const esc = text[i.*];
+                switch (esc) {
+                    'a' => {
+                        try buf.append(self.alloc, 0x07);
+                        i.* += 1;
+                    },
+                    'b' => {
+                        try buf.append(self.alloc, 0x08);
+                        i.* += 1;
+                    },
+                    'e', 'E' => {
+                        try buf.append(self.alloc, 0x1B);
+                        i.* += 1;
+                    },
+                    'f' => {
+                        try buf.append(self.alloc, 0x0C);
+                        i.* += 1;
+                    },
+                    'n' => {
+                        try buf.append(self.alloc, '\n');
+                        i.* += 1;
+                    },
+                    'r' => {
+                        try buf.append(self.alloc, '\r');
+                        i.* += 1;
+                    },
+                    't' => {
+                        try buf.append(self.alloc, '\t');
+                        i.* += 1;
+                    },
+                    'v' => {
+                        try buf.append(self.alloc, 0x0B);
+                        i.* += 1;
+                    },
+                    '\\' => {
+                        try buf.append(self.alloc, '\\');
+                        i.* += 1;
+                    },
+                    '\'' => {
+                        try buf.append(self.alloc, '\'');
+                        i.* += 1;
+                    },
+                    '"' => {
+                        try buf.append(self.alloc, '"');
+                        i.* += 1;
+                    },
+                    '0'...'7' => {
+                        var val: u8 = esc - '0';
+                        i.* += 1;
+                        var count: u8 = 1;
+                        while (count < 3 and i.* < text.len and text[i.*] >= '0' and text[i.*] <= '7') {
+                            val = val *% 8 +% (text[i.*] - '0');
+                            i.* += 1;
+                            count += 1;
+                        }
+                        try buf.append(self.alloc, val);
+                    },
+                    'x' => {
+                        i.* += 1;
+                        var val: u8 = 0;
+                        var count: u8 = 0;
+                        while (count < 2 and i.* < text.len) {
+                            const d = text[i.*];
+                            if (d >= '0' and d <= '9') {
+                                val = val *% 16 +% (d - '0');
+                            } else if (d >= 'a' and d <= 'f') {
+                                val = val *% 16 +% (d - 'a' + 10);
+                            } else if (d >= 'A' and d <= 'F') {
+                                val = val *% 16 +% (d - 'A' + 10);
+                            } else break;
+                            i.* += 1;
+                            count += 1;
+                        }
+                        try buf.append(self.alloc, val);
+                    },
+                    'c' => {
+                        i.* += 1;
+                        if (i.* < text.len) {
+                            const ctrl_char: u8 = text[i.*] & 0x1f;
+                            try buf.append(self.alloc, ctrl_char);
+                            i.* += 1;
+                        }
+                    },
+                    'u', 'U' => {
+                        const max_digits: u8 = if (esc == 'u') 4 else 8;
+                        i.* += 1;
+                        var has_brace = false;
+                        if (i.* < text.len and text[i.*] == '{') {
+                            has_brace = true;
+                            i.* += 1;
+                        }
+                        var val: u21 = 0;
+                        var count: u8 = 0;
+                        const limit: u8 = if (has_brace) 8 else max_digits;
+                        while (count < limit and i.* < text.len) {
+                            const d = text[i.*];
+                            if (d >= '0' and d <= '9') {
+                                val = val * 16 + (d - '0');
+                            } else if (d >= 'a' and d <= 'f') {
+                                val = val * 16 + (d - 'a' + 10);
+                            } else if (d >= 'A' and d <= 'F') {
+                                val = val * 16 + (d - 'A' + 10);
+                            } else break;
+                            i.* += 1;
+                            count += 1;
+                        }
+                        if (count == 0 or (has_brace and (i.* >= text.len or text[i.*] != '}'))) {
+                            try buf.append(self.alloc, '\\');
+                            try buf.append(self.alloc, esc);
+                            if (has_brace) {
+                                try buf.append(self.alloc, '{');
+                                const hex_start = i.* - count;
+                                try buf.appendSlice(self.alloc, text[hex_start..i.*]);
+                            }
+                        } else {
+                            if (has_brace) i.* += 1;
+                            var utf8_buf: [4]u8 = undefined;
+                            const len = std.unicode.utf8Encode(val, &utf8_buf) catch 1;
+                            try buf.appendSlice(self.alloc, utf8_buf[0..len]);
+                        }
+                    },
+                    else => {
+                        try buf.append(self.alloc, '\\');
+                        try buf.append(self.alloc, esc);
+                        i.* += 1;
+                    },
+                }
+            } else {
+                try buf.append(self.alloc, ch);
+                i.* += 1;
+            }
+        }
+        return .{ .ansi_c_quoted = buf.toOwnedSlice(self.alloc) catch "" };
     }
 
     fn parseBraceParam(self: *Parser, text: []const u8, i: *usize) ParseError!ast.WordPart {
@@ -478,6 +746,25 @@ pub const Parser = struct {
             const name = text[start..i.*];
             if (i.* < text.len) i.* += 1;
             return .{ .parameter = .{ .length = name } };
+        }
+
+        if (i.* < text.len and text[i.*] == '!') {
+            const after_bang = i.* + 1;
+            if (after_bang < text.len and text[after_bang] == '}') {
+                i.* = after_bang + 1;
+                return .{ .parameter = .{ .special = '!' } };
+            }
+            if (after_bang < text.len and (std.ascii.isAlphabetic(text[after_bang]) or text[after_bang] == '_')) {
+                i.* = after_bang;
+                const name_s = i.*;
+                while (i.* < text.len and (std.ascii.isAlphanumeric(text[i.*]) or text[i.*] == '_')) : (i.* += 1) {}
+                const indirect_name = text[name_s..i.*];
+                if (i.* < text.len and text[i.*] == '}') {
+                    i.* += 1;
+                    return .{ .parameter = .{ .indirect = indirect_name } };
+                }
+                i.* = after_bang - 1;
+            }
         }
 
         const name_start = i.*;
@@ -502,10 +789,22 @@ pub const Parser = struct {
             return .{ .parameter = .{ .simple = name } };
         }
 
+        if (text[i.*] == '^' or text[i.*] == ',') {
+            return try self.parseCaseConv(text, i, name);
+        }
+
+        if (text[i.*] == '/') {
+            return try self.parsePatternSub(text, i, name);
+        }
+
         const colon = text[i.*] == ':';
         if (colon) i.* += 1;
 
         if (i.* >= text.len) return .{ .parameter = .{ .simple = name } };
+
+        if (colon and (i.* >= text.len or (text[i.*] != '-' and text[i.*] != '=' and text[i.*] != '?' and text[i.*] != '+'))) {
+            return try self.parseSubstring(text, i, name);
+        }
 
         const op_char = text[i.*];
         i.* += 1;
@@ -524,7 +823,7 @@ pub const Parser = struct {
         const word_text = text[word_start..i.*];
         if (i.* < text.len) i.* += 1;
 
-        const word = try self.buildWord(word_text);
+        const word = try self.buildWordParamExp(word_text);
 
         return switch (op_char) {
             '-' => .{ .parameter = .{ .default = .{ .name = name, .colon = colon, .word = word } } },
@@ -549,6 +848,326 @@ pub const Parser = struct {
         };
     }
 
+    fn parsePatternSub(self: *Parser, text: []const u8, i: *usize, name: []const u8) ParseError!ast.WordPart {
+        i.* += 1;
+        var mode: ast.PatSubMode = .first;
+        if (i.* < text.len) {
+            switch (text[i.*]) {
+                '/' => {
+                    mode = .all;
+                    i.* += 1;
+                },
+                '#' => {
+                    mode = .prefix;
+                    i.* += 1;
+                },
+                '%' => {
+                    mode = .suffix;
+                    i.* += 1;
+                },
+                else => {},
+            }
+        }
+
+        const pat_start = i.*;
+        var depth: u32 = 1;
+        var found_slash = false;
+        while (i.* < text.len and depth > 0) {
+            if (text[i.*] == '\\' and i.* + 1 < text.len) {
+                i.* += 2;
+                continue;
+            }
+            if (text[i.*] == '\'' and depth == 1) {
+                i.* += 1;
+                while (i.* < text.len and text[i.*] != '\'') : (i.* += 1) {}
+                if (i.* < text.len) i.* += 1;
+                continue;
+            }
+            if (text[i.*] == '"' and depth == 1) {
+                i.* += 1;
+                while (i.* < text.len and text[i.*] != '"') {
+                    if (text[i.*] == '\\' and i.* + 1 < text.len) {
+                        i.* += 2;
+                    } else {
+                        i.* += 1;
+                    }
+                }
+                if (i.* < text.len) i.* += 1;
+                continue;
+            }
+            if (text[i.*] == '{') {
+                depth += 1;
+            } else if (text[i.*] == '}') {
+                depth -= 1;
+                if (depth == 0) break;
+            } else if (text[i.*] == '/' and depth == 1 and i.* > pat_start) {
+                found_slash = true;
+                break;
+            }
+            i.* += 1;
+        }
+
+        const pat_text = text[pat_start..i.*];
+        var rep_text: []const u8 = "";
+
+        if (found_slash) {
+            i.* += 1;
+            const rep_start = i.*;
+            depth = 1;
+            while (i.* < text.len and depth > 0) {
+                if (text[i.*] == '\\' and i.* + 1 < text.len) {
+                    i.* += 2;
+                    continue;
+                }
+                if (text[i.*] == '{') {
+                    depth += 1;
+                } else if (text[i.*] == '}') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+                i.* += 1;
+            }
+            rep_text = text[rep_start..i.*];
+        }
+
+        if (i.* < text.len and text[i.*] == '}') i.* += 1;
+
+        const pattern = try self.buildWordParamExp(pat_text);
+        const replacement = try self.buildWordParamExp(rep_text);
+
+        return .{ .parameter = .{ .pattern_sub = .{
+            .name = name,
+            .pattern = pattern,
+            .replacement = replacement,
+            .mode = mode,
+        } } };
+    }
+
+    fn parseSubstring(_: *Parser, text: []const u8, i: *usize, name: []const u8) ParseError!ast.WordPart {
+        const offset_start = i.*;
+        var depth: u32 = 1;
+        var paren_depth: u32 = 0;
+        while (i.* < text.len and depth > 0) {
+            if (text[i.*] == '(') {
+                paren_depth += 1;
+            } else if (text[i.*] == ')') {
+                if (paren_depth > 0) paren_depth -= 1;
+            } else if (text[i.*] == '{') {
+                depth += 1;
+            } else if (text[i.*] == '}') {
+                depth -= 1;
+                if (depth == 0) break;
+            } else if (text[i.*] == ':' and depth == 1 and paren_depth == 0) {
+                break;
+            }
+            i.* += 1;
+        }
+        const offset_text = text[offset_start..i.*];
+        var length_text: ?[]const u8 = null;
+
+        if (i.* < text.len and text[i.*] == ':') {
+            i.* += 1;
+            const len_start = i.*;
+            depth = 1;
+            while (i.* < text.len and depth > 0) {
+                if (text[i.*] == '{') {
+                    depth += 1;
+                } else if (text[i.*] == '}') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+                i.* += 1;
+            }
+            length_text = text[len_start..i.*];
+        }
+
+        if (i.* < text.len and text[i.*] == '}') i.* += 1;
+
+        return .{ .parameter = .{ .substring = .{
+            .name = name,
+            .offset = offset_text,
+            .length = length_text,
+        } } };
+    }
+
+    fn parseDoubleBracket(self: *Parser) ParseError!*ast.DoubleBracketExpr {
+        _ = try self.expect(.kw_dbracket);
+        try self.skipDbNewlines();
+        const expr = try self.parseDbOr();
+        if (self.current.tag != .kw_dbracket_close) {
+            return error.UnexpectedToken;
+        }
+        try self.advance();
+        return expr;
+    }
+
+    fn skipDbNewlines(self: *Parser) ParseError!void {
+        while (self.current.tag == .newline) {
+            try self.advance();
+        }
+    }
+
+    fn parseDbOr(self: *Parser) ParseError!*ast.DoubleBracketExpr {
+        var left = try self.parseDbAnd();
+        while (true) {
+            try self.skipDbNewlines();
+            if (self.current.tag != .or_if) break;
+            try self.advance();
+            try self.skipDbNewlines();
+            const right = try self.parseDbAnd();
+            const node = try self.alloc.create(ast.DoubleBracketExpr);
+            node.* = .{ .or_expr = .{ .left = left, .right = right } };
+            left = node;
+        }
+        return left;
+    }
+
+    fn parseDbAnd(self: *Parser) ParseError!*ast.DoubleBracketExpr {
+        var left = try self.parseDbPrimary();
+        while (true) {
+            try self.skipDbNewlines();
+            if (self.current.tag != .and_if) break;
+            try self.advance();
+            try self.skipDbNewlines();
+            const right = try self.parseDbPrimary();
+            const node = try self.alloc.create(ast.DoubleBracketExpr);
+            node.* = .{ .and_expr = .{ .left = left, .right = right } };
+            left = node;
+        }
+        return left;
+    }
+
+    fn parseDbPrimary(self: *Parser) ParseError!*ast.DoubleBracketExpr {
+        if (self.current.tag == .bang) {
+            try self.advance();
+            const inner = try self.parseDbPrimary();
+            const node = try self.alloc.create(ast.DoubleBracketExpr);
+            node.* = .{ .not_expr = inner };
+            return node;
+        }
+        if (self.current.tag == .lparen) {
+            try self.advance();
+            const inner = try self.parseDbOr();
+            if (self.current.tag == .rparen) try self.advance();
+            return inner;
+        }
+        const first_text = self.tokenText(self.current);
+        const first_word = try self.parseDbWord();
+        if (self.isDbBinaryOp()) {
+            const op = self.getDbBinaryOpText();
+            try self.advance();
+            const rhs = try self.parseDbWord();
+            const node = try self.alloc.create(ast.DoubleBracketExpr);
+            node.* = .{ .binary_test = .{ .lhs = first_word, .op = op, .rhs = rhs } };
+            return node;
+        }
+        if (isDbUnaryOp(first_text)) {
+            if (self.current.tag == .kw_dbracket_close or
+                self.current.tag == .and_if or self.current.tag == .or_if or
+                self.current.tag == .rparen)
+            {
+                return error.UnexpectedToken;
+            }
+            const operand = try self.parseDbWord();
+            const node = try self.alloc.create(ast.DoubleBracketExpr);
+            node.* = .{ .unary_test = .{ .op = first_text, .operand = operand } };
+            return node;
+        }
+        const node = try self.alloc.create(ast.DoubleBracketExpr);
+        node.* = .{ .unary_test = .{ .op = "-n", .operand = first_word } };
+        return node;
+    }
+
+    fn parseDbWord(self: *Parser) ParseError!ast.Word {
+        if (self.current.tag == .word or self.current.tag == .assignment_word or
+            isDbWordTag(self.current.tag))
+        {
+            return self.parseWordToken();
+        }
+        return error.ExpectedWord;
+    }
+
+    fn isDbBinaryOp(self: *Parser) bool {
+        if (self.current.tag == .less_than or self.current.tag == .greater_than) return true;
+        if (self.current.tag != .word) return false;
+        const text = self.tokenText(self.current);
+        const ops = [_][]const u8{ "==", "!=", "=~", "=", "-eq", "-ne", "-lt", "-gt", "-le", "-ge", "-nt", "-ot", "-ef" };
+        for (ops) |op| {
+            if (std.mem.eql(u8, text, op)) return true;
+        }
+        return false;
+    }
+
+    fn getDbBinaryOpText(self: *Parser) []const u8 {
+        if (self.current.tag == .less_than) return "<";
+        if (self.current.tag == .greater_than) return ">";
+        return self.tokenText(self.current);
+    }
+
+    fn isDbWordTag(tag: Tag) bool {
+        return switch (tag) {
+            .kw_if, .kw_then, .kw_else, .kw_elif, .kw_fi,
+            .kw_do, .kw_done, .kw_case, .kw_esac,
+            .kw_while, .kw_until, .kw_for, .kw_in,
+            .bang => true,
+            else => false,
+        };
+    }
+
+    fn isDbUnaryOp(text: []const u8) bool {
+        const ops = [_][]const u8{
+            "-n", "-z", "-e", "-f", "-d", "-r", "-w", "-x", "-s",
+            "-h", "-L", "-p", "-b", "-c", "-S", "-t", "-o", "-v",
+            "-a", "-u", "-g", "-k", "-G", "-O", "-N", "-R",
+        };
+        for (ops) |op| {
+            if (std.mem.eql(u8, text, op)) return true;
+        }
+        return false;
+    }
+
+    fn parseCaseConv(self: *Parser, text: []const u8, i: *usize, name: []const u8) ParseError!ast.WordPart {
+        const first_char = text[i.*];
+        i.* += 1;
+        var mode: ast.CaseConvMode = undefined;
+        if (first_char == '^') {
+            if (i.* < text.len and text[i.*] == '^') {
+                mode = .upper_all;
+                i.* += 1;
+            } else {
+                mode = .upper_first;
+            }
+        } else {
+            if (i.* < text.len and text[i.*] == ',') {
+                mode = .lower_all;
+                i.* += 1;
+            } else {
+                mode = .lower_first;
+            }
+        }
+        var pattern: ?ast.Word = null;
+        if (i.* < text.len and text[i.*] != '}') {
+            const pat_start = i.*;
+            var depth: u32 = 1;
+            while (i.* < text.len and depth > 0) {
+                if (text[i.*] == '{') {
+                    depth += 1;
+                } else if (text[i.*] == '}') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+                i.* += 1;
+            }
+            pattern = try self.buildWordParamExp(text[pat_start..i.*]);
+        }
+        if (i.* < text.len and text[i.*] == '}') i.* += 1;
+        return .{ .parameter = .{ .case_conv = .{
+            .name = name,
+            .mode = mode,
+            .pattern = pattern,
+        } } };
+    }
+
     fn parseRedirect(self: *Parser) ParseError!ast.Redirect {
         var fd: ?i32 = null;
 
@@ -568,6 +1187,9 @@ pub const Parser = struct {
             .clobber => .clobber,
             .dless => .heredoc,
             .dlessdash => .heredoc_strip,
+            .tless => .here_string,
+            .and_great => .and_great,
+            .and_dgreat => .and_dgreat,
             else => return error.InvalidRedirection,
         };
         try self.advance();
@@ -692,10 +1314,101 @@ pub const Parser = struct {
         return .{ .condition = condition, .body = body };
     }
 
-    fn parseForClause(self: *Parser) ParseError!ast.ForClause {
+    fn parseForOrArithFor(self: *Parser) ParseError!ast.CompoundCommand {
         _ = try self.expect(.kw_for);
-        if (self.current.tag != .word) return error.ExpectedName;
-        const name = self.tokenText(self.current);
+        if (self.current.tag == .lparen and self.current.end < self.source.len and self.source[self.current.end] == '(') {
+            return .{ .arith_for_clause = try self.parseArithForClause() };
+        }
+        return .{ .for_clause = try self.parseForClauseAfterFor() };
+    }
+
+    fn parseArithForClause(self: *Parser) ParseError!ast.ArithForClause {
+        var pos = self.current.start + 2;
+        var exprs: [3][]const u8 = .{ "", "", "" };
+        var expr_idx: usize = 0;
+
+        while (expr_idx < 3 and pos < self.source.len) {
+            while (pos < self.source.len and (self.source[pos] == ' ' or self.source[pos] == '\t' or self.source[pos] == '\n')) {
+                pos += 1;
+            }
+            const start = pos;
+            var depth: u32 = 0;
+            while (pos < self.source.len) {
+                const ch = self.source[pos];
+                if (ch == '(') {
+                    depth += 1;
+                    pos += 1;
+                } else if (ch == ')') {
+                    if (depth == 0) break;
+                    depth -= 1;
+                    pos += 1;
+                } else if (ch == ';' and depth == 0 and expr_idx < 2) {
+                    break;
+                } else if (ch == '\'' or ch == '"') {
+                    pos += 1;
+                    while (pos < self.source.len and self.source[pos] != ch) : (pos += 1) {}
+                    if (pos < self.source.len) pos += 1;
+                } else if (ch == '$' and pos + 1 < self.source.len and self.source[pos + 1] == '\'') {
+                    pos += 2;
+                    while (pos < self.source.len and self.source[pos] != '\'') : (pos += 1) {}
+                    if (pos < self.source.len) pos += 1;
+                } else if (ch == '$' and pos + 1 < self.source.len and self.source[pos + 1] == '"') {
+                    pos += 2;
+                    while (pos < self.source.len and self.source[pos] != '"') : (pos += 1) {}
+                    if (pos < self.source.len) pos += 1;
+                } else {
+                    pos += 1;
+                }
+            }
+            var end = pos;
+            while (end > start and (self.source[end - 1] == ' ' or self.source[end - 1] == '\t' or self.source[end - 1] == '\n')) {
+                end -= 1;
+            }
+            exprs[expr_idx] = self.source[start..end];
+            expr_idx += 1;
+            if (pos < self.source.len and self.source[pos] == ';') {
+                pos += 1;
+            }
+        }
+
+        if (pos + 1 < self.source.len and self.source[pos] == ')' and self.source[pos + 1] == ')') {
+            pos += 2;
+        } else {
+            return error.ExpectedParenClose;
+        }
+
+        self.lexer.pos = pos;
+        self.current = try self.lexer.next();
+
+        if (self.current.tag == .semicolon or self.current.tag == .newline) {
+            try self.advance();
+        }
+        try self.skipNewlines();
+
+        if (self.current.tag == .lbrace) {
+            try self.advance();
+            const body = try self.parseCompoundList();
+            if (self.current.tag == .rbrace) {
+                try self.advance();
+            }
+            return .{ .init = exprs[0], .cond = exprs[1], .step = exprs[2], .body = body };
+        }
+
+        _ = try self.expect(.kw_do);
+        const body = try self.parseCompoundList();
+        _ = try self.expect(.kw_done);
+        return .{ .init = exprs[0], .cond = exprs[1], .step = exprs[2], .body = body };
+    }
+
+    fn parseForClauseAfterFor(self: *Parser) ParseError!ast.ForClause {
+        const name_text = self.tokenText(self.current);
+        if (self.current.tag != .word and self.current.tag != .kw_in and
+            self.current.tag != .kw_do and self.current.tag != .kw_done)
+        {
+            return error.ExpectedName;
+        }
+        if (!isValidName(name_text)) return error.ExpectedName;
+        const name = name_text;
         try self.advance();
 
         var wordlist: ?[]const ast.Word = null;
@@ -726,6 +1439,7 @@ pub const Parser = struct {
     fn parseCaseClause(self: *Parser) ParseError!ast.CaseClause {
         _ = try self.expect(.kw_case);
         self.lexer.reserved_word_context = false;
+        if (self.current.tag == .newline or self.current.tag == .eof) return error.ExpectedWord;
         const word_text = self.tokenText(self.current);
         self.lexer.reserved_word_context = true;
         try self.advance();
@@ -765,16 +1479,27 @@ pub const Parser = struct {
         try self.skipNewlines();
 
         var body: ?[]const ast.CompleteCommand = null;
-        if (self.current.tag != .dsemi and self.current.tag != .kw_esac) {
+        if (self.current.tag != .dsemi and self.current.tag != .semi_and and
+            self.current.tag != .dsemi_and and self.current.tag != .kw_esac)
+        {
             body = try self.parseCompoundList();
         }
 
+        var terminator: ast.CaseTerminator = .dsemi;
         if (self.current.tag == .dsemi) {
+            try self.advance();
+            try self.skipNewlines();
+        } else if (self.current.tag == .semi_and) {
+            terminator = .fall_through;
+            try self.advance();
+            try self.skipNewlines();
+        } else if (self.current.tag == .dsemi_and) {
+            terminator = .continue_testing;
             try self.advance();
             try self.skipNewlines();
         }
 
-        return .{ .patterns = try patterns.toOwnedSlice(self.alloc), .body = body };
+        return .{ .patterns = try patterns.toOwnedSlice(self.alloc), .body = body, .terminator = terminator };
     }
 
     fn parseBraceGroup(self: *Parser) ParseError!ast.BraceGroup {
@@ -782,6 +1507,32 @@ pub const Parser = struct {
         const body = try self.parseCompoundList();
         _ = try self.expect(.rbrace);
         return .{ .body = body };
+    }
+
+    fn parseArithCommand(self: *Parser) ParseError![]const u8 {
+        _ = try self.expect(.lparen);
+        const start = self.lexer.pos;
+        if (start < self.source.len and self.source[start] == '(') {
+            self.lexer.pos += 1;
+        }
+        const expr_start = self.lexer.pos;
+        var depth: u32 = 0;
+        while (self.lexer.pos < self.source.len) {
+            if (self.source[self.lexer.pos] == '(') {
+                depth += 1;
+            } else if (self.source[self.lexer.pos] == ')') {
+                if (depth > 0) {
+                    depth -= 1;
+                } else if (self.lexer.pos + 1 < self.source.len and self.source[self.lexer.pos + 1] == ')') {
+                    const expr = self.source[expr_start..self.lexer.pos];
+                    self.lexer.pos += 2;
+                    self.current = try self.lexer.next();
+                    return expr;
+                }
+            }
+            self.lexer.pos += 1;
+        }
+        return error.UnexpectedEOF;
     }
 
     fn parseSubshell(self: *Parser) ParseError!ast.Subshell {
@@ -837,10 +1588,19 @@ pub const Parser = struct {
         return commands.toOwnedSlice(self.alloc);
     }
 
+    fn isValidName(text: []const u8) bool {
+        if (text.len == 0) return false;
+        if (text[0] != '_' and !std.ascii.isAlphabetic(text[0])) return false;
+        for (text[1..]) |ch| {
+            if (ch != '_' and !std.ascii.isAlphanumeric(ch)) return false;
+        }
+        return true;
+    }
+
     fn isCommandStart(self: *Parser) bool {
         return switch (self.current.tag) {
             .word, .assignment_word, .io_number, .bang => true,
-            .kw_if, .kw_while, .kw_until, .kw_for, .kw_case => true,
+            .kw_if, .kw_while, .kw_until, .kw_for, .kw_case, .kw_dbracket => true,
             .lbrace, .lparen => true,
             .less_than, .greater_than, .dless, .dgreat, .lessand, .greatand, .lessgreat, .dlessdash, .clobber => true,
             else => false,

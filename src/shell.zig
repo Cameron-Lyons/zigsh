@@ -64,10 +64,17 @@ pub const Shell = struct {
         }
     }
 
-    fn executeExitTrap(self: *Shell) void {
+    pub fn runExitTrap(self: *Shell) void {
         if (signals.getExitTrap()) |action| {
             signals.setExitTrap(null);
-            self.executeTrap(action);
+            const saved_exit = self.env.should_exit;
+            const saved_value = self.env.exit_value;
+            self.env.should_exit = false;
+            _ = self.executeSource(action);
+            if (self.env.should_exit) {} else {
+                self.env.should_exit = saved_exit;
+                self.env.exit_value = saved_value;
+            }
             self.gpa.free(action);
         }
     }
@@ -126,7 +133,8 @@ pub const Shell = struct {
         posix.readToEnd(fd, self.gpa, &content) catch return 1;
 
         const status = self.executeSource(content.items);
-        self.executeExitTrap();
+        self.runExitTrap();
+        if (self.env.should_exit) return self.env.exit_value;
         return status;
     }
 
@@ -191,7 +199,7 @@ pub const Shell = struct {
                 }
             }
         }
-        self.executeExitTrap();
+        self.runExitTrap();
         return self.env.exit_value;
     }
 
@@ -254,7 +262,7 @@ pub const Shell = struct {
                 }
             }
         }
-        self.executeExitTrap();
+        self.runExitTrap();
         return self.env.exit_value;
     }
 

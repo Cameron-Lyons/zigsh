@@ -56,10 +56,13 @@ pub const CompoundCommand = union(enum) {
     brace_group: BraceGroup,
     subshell: Subshell,
     for_clause: ForClause,
+    arith_for_clause: ArithForClause,
     case_clause: CaseClause,
     if_clause: IfClause,
     while_clause: WhileClause,
     until_clause: UntilClause,
+    arith_command: []const u8,
+    double_bracket: *DoubleBracketExpr,
 };
 
 pub const SimpleCommand = struct {
@@ -86,6 +89,7 @@ pub const WordPart = union(enum) {
     arith_sub: []const u8,
     backtick_sub: []const u8,
     tilde: []const u8,
+    ansi_c_quoted: []const u8,
 };
 
 pub const ParameterExp = union(enum) {
@@ -101,6 +105,10 @@ pub const ParameterExp = union(enum) {
     prefix_strip_long: PatternOp,
     suffix_strip: PatternOp,
     suffix_strip_long: PatternOp,
+    pattern_sub: PatternSubOp,
+    substring: SubstringOp,
+    case_conv: CaseConvOp,
+    indirect: []const u8,
 };
 
 pub const ParamOp = struct {
@@ -112,6 +120,21 @@ pub const ParamOp = struct {
 pub const PatternOp = struct {
     name: []const u8,
     pattern: Word,
+};
+
+pub const PatternSubOp = struct {
+    name: []const u8,
+    pattern: Word,
+    replacement: Word,
+    mode: PatSubMode,
+};
+
+pub const PatSubMode = enum { first, all, prefix, suffix };
+
+pub const SubstringOp = struct {
+    name: []const u8,
+    offset: []const u8,
+    length: ?[]const u8,
 };
 
 pub const CommandSub = struct {
@@ -134,6 +157,9 @@ pub const RedirectOp = enum {
     clobber, // >|
     heredoc, // <<
     heredoc_strip, // <<-
+    here_string, // <<<
+    and_great, // &>
+    and_dgreat, // &>>
 };
 
 pub const RedirectTarget = union(enum) {
@@ -185,6 +211,13 @@ pub const ForClause = struct {
     body: []const CompleteCommand,
 };
 
+pub const ArithForClause = struct {
+    init: []const u8,
+    cond: []const u8,
+    step: []const u8,
+    body: []const CompleteCommand,
+};
+
 pub const CaseClause = struct {
     word: Word,
     items: []const CaseItem,
@@ -193,7 +226,26 @@ pub const CaseClause = struct {
 pub const CaseItem = struct {
     patterns: []const Word,
     body: ?[]const CompleteCommand,
+    terminator: CaseTerminator = .dsemi,
 };
+
+pub const CaseTerminator = enum { dsemi, fall_through, continue_testing };
+
+pub const DoubleBracketExpr = union(enum) {
+    unary_test: struct { op: []const u8, operand: Word },
+    binary_test: struct { lhs: Word, op: []const u8, rhs: Word },
+    not_expr: *DoubleBracketExpr,
+    and_expr: struct { left: *DoubleBracketExpr, right: *DoubleBracketExpr },
+    or_expr: struct { left: *DoubleBracketExpr, right: *DoubleBracketExpr },
+};
+
+pub const CaseConvOp = struct {
+    name: []const u8,
+    mode: CaseConvMode,
+    pattern: ?Word,
+};
+
+pub const CaseConvMode = enum { upper_first, upper_all, lower_first, lower_all };
 
 pub const FunctionDef = struct {
     name: []const u8,

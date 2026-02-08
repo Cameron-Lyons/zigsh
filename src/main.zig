@@ -34,7 +34,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     sh.env.set("PPID", ppid_str, false) catch {};
     sh.env.markReadonly("PPID");
 
+    var uid_buf: [16]u8 = undefined;
+    const uid_str = std.fmt.bufPrint(&uid_buf, "{d}", .{std.c.getuid()}) catch "0";
+    sh.env.set("UID", uid_str, false) catch {};
+    sh.env.markReadonly("UID");
+
+    var euid_buf: [16]u8 = undefined;
+    const euid_str = std.fmt.bufPrint(&euid_buf, "{d}", .{posix.geteuid()}) catch "0";
+    sh.env.set("EUID", euid_str, false) catch {};
+    sh.env.markReadonly("EUID");
+
     sh.env.set("PS2", "> ", false) catch {};
+    sh.env.set("OPTIND", "1", false) catch {};
 
     var args_buf: [256][]const u8 = undefined;
     var args_count: usize = 0;
@@ -57,10 +68,50 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     posix.writeAll(2, "zigsh: -c: option requires an argument\n");
                     return 2;
                 }
-                return sh.executeSource(args[i]);
+                const cmd = args[i];
+                i += 1;
+                if (i < args.len) {
+                    sh.env.shell_name = args[i];
+                    i += 1;
+                    if (i < args.len) {
+                        sh.env.positional_params = args[i..];
+                    }
+                }
+                const status = sh.executeSource(cmd);
+                sh.runExitTrap();
+                if (sh.env.should_exit) return sh.env.exit_value;
+                return status;
             } else if (std.mem.eql(u8, args[i], "-s")) {
                 return sh.runInteractive();
+            } else if (std.mem.eql(u8, args[i], "-o")) {
+                i += 1;
+                if (i < args.len) {
+                    sh.env.setOption(args[i], true);
+                }
+            } else if (std.mem.eql(u8, args[i], "+o")) {
+                i += 1;
+                if (i < args.len) {
+                    sh.env.setOption(args[i], false);
+                }
+            } else if (std.mem.eql(u8, args[i], "-O")) {
+                i += 1;
+                if (i < args.len) {
+                    sh.env.setShoptOption(args[i], true);
+                }
+            } else if (std.mem.eql(u8, args[i], "+O")) {
+                i += 1;
+                if (i < args.len) {
+                    sh.env.setShoptOption(args[i], false);
+                }
+            } else if (args[i].len > 1 and args[i][0] == '-' and args[i][1] != '-') {
+                for (args[i][1..]) |ch| {
+                    sh.env.setShortOption(ch, true);
+                }
             } else if (args[i].len > 0 and args[i][0] != '-') {
+                sh.env.shell_name = args[i];
+                if (i + 1 < args.len) {
+                    sh.env.positional_params = args[i + 1 ..];
+                }
                 return sh.executeFile(args[i]);
             }
         }
