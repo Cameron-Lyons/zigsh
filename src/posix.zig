@@ -5,6 +5,7 @@ const c = std.c;
 pub const fd_t = i32;
 pub const pid_t = i32;
 pub const mode_t = u32;
+pub const WNOHANG: u32 = 1;
 
 pub fn pipe() ![2]fd_t {
     var fds: [2]fd_t = undefined;
@@ -16,6 +17,13 @@ pub fn pipe() ![2]fd_t {
 pub fn dup(old: fd_t) !fd_t {
     const rc = c.dup(old);
     if (rc < 0) return error.BadFd;
+    return rc;
+}
+
+pub fn dupHighFd(old: fd_t) !fd_t {
+    const rc = c.fcntl(old, c.F.DUPFD, @as(c_int, 100));
+    if (rc < 0) return error.BadFd;
+    _ = c.fcntl(rc, c.F.SETFD, @as(c_int, FD_CLOEXEC));
     return rc;
 }
 
@@ -91,6 +99,8 @@ pub const StatResult = struct {
     dev_major: u32,
     dev_minor: u32,
     ino: u64,
+    uid: u32,
+    gid: u32,
 };
 
 pub fn stat(path: [*:0]const u8) !StatResult {
@@ -99,7 +109,7 @@ pub fn stat(path: [*:0]const u8) !StatResult {
         @as(i32, -100),
         path,
         0,
-        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true },
+        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true, .UID = true, .GID = true },
         &stx,
     );
     const signed: isize = @bitCast(rc);
@@ -112,6 +122,8 @@ pub fn stat(path: [*:0]const u8) !StatResult {
         .dev_major = stx.dev_major,
         .dev_minor = stx.dev_minor,
         .ino = stx.ino,
+        .uid = stx.uid,
+        .gid = stx.gid,
     };
 }
 
@@ -121,7 +133,7 @@ pub fn lstat(path: [*:0]const u8) !StatResult {
         @as(i32, -100),
         path,
         linux.AT.SYMLINK_NOFOLLOW,
-        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true },
+        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true, .UID = true, .GID = true },
         &stx,
     );
     const signed: isize = @bitCast(rc);
@@ -134,6 +146,8 @@ pub fn lstat(path: [*:0]const u8) !StatResult {
         .dev_major = stx.dev_major,
         .dev_minor = stx.dev_minor,
         .ino = stx.ino,
+        .uid = stx.uid,
+        .gid = stx.gid,
     };
 }
 
@@ -174,6 +188,14 @@ pub fn getpid() pid_t {
 
 pub fn getppid() pid_t {
     return c.getppid();
+}
+
+pub fn geteuid() u32 {
+    return c.geteuid();
+}
+
+pub fn getegid() u32 {
+    return c.getegid();
 }
 
 pub fn isatty(fd: fd_t) bool {
@@ -217,6 +239,7 @@ pub const S_IFLNK: u16 = 0o120000;
 pub const S_IFSOCK: u16 = 0o140000;
 pub const S_ISUID: u16 = 0o4000;
 pub const S_ISGID: u16 = 0o2000;
+pub const S_ISVTX: u16 = 0o1000;
 
 pub const R_OK: c_uint = 4;
 pub const W_OK: c_uint = 2;

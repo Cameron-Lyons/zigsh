@@ -16,16 +16,20 @@ pub const Environment = struct {
     alloc: std.mem.Allocator,
 
     options: ShellOptions,
+    shopt: ShoptOptions,
     aliases: std.StringHashMap([]const u8),
     command_hash: std.StringHashMap([]const u8),
 
     loop_depth: u32,
     break_count: u32,
     continue_count: u32,
+    errexit_suppressed: u32,
     should_return: bool,
     return_value: u8,
     should_exit: bool,
     exit_value: u8,
+    in_subshell: bool,
+    shell_name: []const u8,
     job_table: ?*JobTable,
     history: ?*LineEditor.History,
 
@@ -33,6 +37,7 @@ pub const Environment = struct {
         value: []const u8,
         exported: bool,
         readonly: bool,
+        integer: bool = false,
     };
 
     pub const FunctionDef = struct {
@@ -50,6 +55,7 @@ pub const Environment = struct {
         noclobber: bool = false,
         verbose: bool = false,
         interactive: bool = false,
+        pipefail: bool = false,
 
         flag_buf: [16]u8 = undefined,
 
@@ -69,6 +75,65 @@ pub const Environment = struct {
         }
     };
 
+    pub const ShoptOptions = struct {
+        nullglob: bool = false,
+        failglob: bool = false,
+        extglob: bool = false,
+        dotglob: bool = false,
+        globstar: bool = false,
+        lastpipe: bool = false,
+        expand_aliases: bool = false,
+        nocaseglob: bool = false,
+        nocasematch: bool = false,
+        inherit_errexit: bool = false,
+        autocd: bool = false,
+        cdable_vars: bool = false,
+        checkwinsize: bool = false,
+        ignore_shopt_not_impl: bool = false,
+    };
+
+    pub fn setOption(self: *Environment, name: []const u8, enable: bool) void {
+        if (std.mem.eql(u8, name, "errexit")) { self.options.errexit = enable; }
+        else if (std.mem.eql(u8, name, "nounset")) { self.options.nounset = enable; }
+        else if (std.mem.eql(u8, name, "xtrace")) { self.options.xtrace = enable; }
+        else if (std.mem.eql(u8, name, "noglob")) { self.options.noglob = enable; }
+        else if (std.mem.eql(u8, name, "noexec")) { self.options.noexec = enable; }
+        else if (std.mem.eql(u8, name, "allexport")) { self.options.allexport = enable; }
+        else if (std.mem.eql(u8, name, "monitor")) { self.options.monitor = enable; }
+        else if (std.mem.eql(u8, name, "noclobber")) { self.options.noclobber = enable; }
+        else if (std.mem.eql(u8, name, "verbose")) { self.options.verbose = enable; }
+        else if (std.mem.eql(u8, name, "pipefail")) { self.options.pipefail = enable; }
+    }
+
+    pub fn setShortOption(self: *Environment, ch: u8, enable: bool) void {
+        switch (ch) {
+            'e' => self.options.errexit = enable,
+            'u' => self.options.nounset = enable,
+            'x' => self.options.xtrace = enable,
+            'f' => self.options.noglob = enable,
+            'n' => self.options.noexec = enable,
+            'a' => self.options.allexport = enable,
+            'v' => self.options.verbose = enable,
+            'C' => self.options.noclobber = enable,
+            'm' => self.options.monitor = enable,
+            'i' => self.options.interactive = enable,
+            else => {},
+        }
+    }
+
+    pub fn setShoptOption(self: *Environment, name: []const u8, enable: bool) void {
+        if (std.mem.eql(u8, name, "nullglob")) { self.shopt.nullglob = enable; }
+        else if (std.mem.eql(u8, name, "failglob")) { self.shopt.failglob = enable; }
+        else if (std.mem.eql(u8, name, "extglob")) { self.shopt.extglob = enable; }
+        else if (std.mem.eql(u8, name, "dotglob")) { self.shopt.dotglob = enable; }
+        else if (std.mem.eql(u8, name, "globstar")) { self.shopt.globstar = enable; }
+        else if (std.mem.eql(u8, name, "lastpipe")) { self.shopt.lastpipe = enable; }
+        else if (std.mem.eql(u8, name, "expand_aliases")) { self.shopt.expand_aliases = enable; }
+        else if (std.mem.eql(u8, name, "nocaseglob")) { self.shopt.nocaseglob = enable; }
+        else if (std.mem.eql(u8, name, "nocasematch")) { self.shopt.nocasematch = enable; }
+        else if (std.mem.eql(u8, name, "inherit_errexit")) { self.shopt.inherit_errexit = enable; }
+    }
+
     pub fn init(alloc: std.mem.Allocator) Environment {
         var env = Environment{
             .vars = std.StringHashMap(Variable).init(alloc),
@@ -81,15 +146,19 @@ pub const Environment = struct {
             .ifs = " \t\n",
             .alloc = alloc,
             .options = .{},
+            .shopt = .{},
             .aliases = std.StringHashMap([]const u8).init(alloc),
             .command_hash = std.StringHashMap([]const u8).init(alloc),
             .loop_depth = 0,
             .break_count = 0,
             .continue_count = 0,
+            .errexit_suppressed = 0,
             .should_return = false,
             .return_value = 0,
             .should_exit = false,
             .exit_value = 0,
+            .in_subshell = false,
+            .shell_name = "zigsh",
             .job_table = null,
             .history = null,
         };
@@ -164,7 +233,7 @@ pub const Environment = struct {
         if (self.vars.getPtr(name)) |existing| {
             self.alloc.free(existing.value);
             existing.value = owned_value;
-            if (exported) existing.exported = true;
+            if (exported or self.options.allexport or existing.exported) existing.exported = true;
         } else {
             const owned_name = try self.alloc.dupe(u8, name);
             try self.vars.put(owned_name, .{
@@ -182,9 +251,11 @@ pub const Environment = struct {
         }
     }
 
-    pub fn unset(self: *Environment, name: []const u8) void {
+    pub const UnsetResult = enum { ok, readonly };
+
+    pub fn unset(self: *Environment, name: []const u8) UnsetResult {
         if (self.vars.get(name)) |v| {
-            if (v.readonly) return;
+            if (v.readonly) return .readonly;
         }
         if (self.vars.fetchRemove(name)) |kv| {
             self.alloc.free(kv.key);
@@ -193,6 +264,7 @@ pub const Environment = struct {
         if (std.mem.eql(u8, name, "IFS")) {
             self.ifs = " \t\n";
         }
+        return .ok;
     }
 
     pub fn unsetFunction(self: *Environment, name: []const u8) bool {
@@ -207,6 +279,8 @@ pub const Environment = struct {
     pub fn markExported(self: *Environment, name: []const u8) void {
         if (self.vars.getPtr(name)) |v| {
             v.exported = true;
+        } else {
+            self.set(name, "", true) catch {};
         }
     }
 
@@ -326,7 +400,7 @@ test "env unset" {
     defer env.deinit();
 
     try env.set("FOO", "bar", false);
-    env.unset("FOO");
+    _ = env.unset("FOO");
     try std.testing.expect(env.get("FOO") == null);
 }
 
@@ -346,7 +420,7 @@ test "env readonly prevents unset" {
 
     try env.set("RO", "val", false);
     env.markReadonly("RO");
-    env.unset("RO");
+    try std.testing.expect(env.unset("RO") == .readonly);
     try std.testing.expectEqualStrings("val", env.get("RO").?);
 }
 
@@ -376,7 +450,7 @@ test "env IFS tracking" {
     try std.testing.expectEqualStrings(" \t\n", env.ifs);
     try env.set("IFS", ":", false);
     try std.testing.expectEqualStrings(":", env.ifs);
-    env.unset("IFS");
+    _ = env.unset("IFS");
     try std.testing.expectEqualStrings(" \t\n", env.ifs);
 }
 

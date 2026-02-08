@@ -202,11 +202,11 @@ test "read combined -r flag with other position" {
     );
 }
 
-test "read REPLY strips whitespace" {
+test "read REPLY preserves whitespace" {
     try expectReadOutput(
         "read; printf '<%s>\\n' \"$REPLY\"",
         "  spaced  \n",
-        "<spaced>\n",
+        "<  spaced  >\n",
     );
 }
 

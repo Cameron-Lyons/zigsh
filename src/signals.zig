@@ -26,12 +26,18 @@ pub const SIGSTOP: u6 = 19;
 
 pub fn sigNameFromNum(signum: u6) ?[]const u8 {
     return switch (signum) {
+        0 => "EXIT",
         1 => "HUP",
         2 => "INT",
         3 => "QUIT",
+        4 => "ILL",
+        5 => "TRAP",
         6 => "ABRT",
+        7 => "BUS",
+        8 => "FPE",
         9 => "KILL",
         10 => "USR1",
+        11 => "SEGV",
         12 => "USR2",
         13 => "PIPE",
         14 => "ALRM",
@@ -42,6 +48,37 @@ pub fn sigNameFromNum(signum: u6) ?[]const u8 {
         20 => "TSTP",
         21 => "TTIN",
         22 => "TTOU",
+        23 => "URG",
+        24 => "XCPU",
+        25 => "XFSZ",
+        26 => "VTALRM",
+        27 => "PROF",
+        28 => "WINCH",
+        29 => "IO",
+        30 => "PWR",
+        31 => "SYS",
+        else => null,
+    };
+}
+
+pub fn sigFullName(signum: u6) ?[]const u8 {
+    return switch (signum) {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        17 => "SIGCHLD",
+        18 => "SIGCONT",
+        19 => "SIGSTOP",
+        20 => "SIGTSTP",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
         else => null,
     };
 }
@@ -107,11 +144,29 @@ pub fn setupChildSignals() void {
     defaultSignal(SIGTTOU);
 }
 
+pub fn clearTrapsForSubshell() void {
+    for (1..32) |i| {
+        if (trap_handlers[i]) |action| {
+            if (action.len > 0) {
+                trap_handlers[i] = null;
+                defaultSignal(@intCast(i));
+            }
+        }
+    }
+    trap_handlers[TRAP_EXIT] = null;
+    trap_handlers[TRAP_ERR] = null;
+}
+
 pub fn setTrap(signum: u6, action: ?[]const u8) void {
     if (signum < 32) {
         trap_handlers[@intCast(signum)] = action;
-        if (action) |_| {
-            installHandler(signum);
+        if (signum == SIGKILL or signum == SIGSTOP) return;
+        if (action) |a| {
+            if (a.len == 0) {
+                ignoreSignal(signum);
+            } else {
+                installHandler(signum);
+            }
         } else {
             defaultSignal(signum);
         }

@@ -21,6 +21,8 @@ pub const Tag = enum {
     and_if, // &&
     or_if, // ||
     dsemi, // ;;
+    semi_and, // ;&
+    dsemi_and, // ;;&
 
     // Redirections
     dless, // <<
@@ -30,9 +32,12 @@ pub const Tag = enum {
     lessgreat, // <>
     dlessdash, // <<-
     clobber, // >|
+    and_great, // &>
+    and_dgreat, // &>>
 
     // Single-char operators
     pipe, // |
+    pipe_and, // |&
     ampersand, // &
     semicolon, // ;
     less_than, // <
@@ -57,10 +62,14 @@ pub const Tag = enum {
     kw_until,
     kw_for,
     kw_in,
+    kw_dbracket, // [[
+    kw_dbracket_close, // ]]
+
+    tless, // <<<
 
     pub fn isRedirectionOp(self: Tag) bool {
         return switch (self) {
-            .less_than, .greater_than, .dless, .dgreat, .lessand, .greatand, .lessgreat, .dlessdash, .clobber => true,
+            .less_than, .greater_than, .dless, .dgreat, .lessand, .greatand, .lessgreat, .dlessdash, .clobber, .tless, .and_great, .and_dgreat => true,
             else => false,
         };
     }
@@ -84,4 +93,6 @@ pub const reserved_words = std.StaticStringMap(Tag).initComptime(.{
     .{ "}", .rbrace },
     .{ "!", .bang },
     .{ "in", .kw_in },
+    .{ "[[", .kw_dbracket },
+    .{ "]]", .kw_dbracket_close },
 });

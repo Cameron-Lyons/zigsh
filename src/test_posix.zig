@@ -260,7 +260,7 @@ test "test -nt with [ syntax" {
 test "trap -p shows set traps" {
     try expectOutput(
         "trap 'echo bye' EXIT; trap -p",
-        "trap -- 'echo bye' EXIT\n",
+        "trap -- 'echo bye' EXIT\nbye\n",
     );
 }
 
@@ -270,15 +270,15 @@ test "trap -p with no traps is empty" {
 
 test "trap -p shows signal traps" {
     try expectOutput(
-        "trap 'handle int' INT; trap -p | grep INT",
-        "trap -- 'handle int' INT\n",
+        "trap 'handle int' INT; trap -p INT",
+        "trap -- 'handle int' SIGINT\n",
     );
 }
 
 test "trap with no args lists traps" {
     try expectOutput(
         "trap 'echo bye' EXIT; trap",
-        "trap -- 'echo bye' EXIT\n",
+        "trap -- 'echo bye' EXIT\nbye\n",
     );
 }
 
@@ -510,7 +510,7 @@ test "cd - prints new directory" {
 test "trap -p INT shows specific trap" {
     try expectOutput(
         "trap 'echo bye' INT; trap -p INT",
-        "trap -- 'echo bye' INT\n",
+        "trap -- 'echo bye' SIGINT\n",
     );
 }
 
@@ -520,8 +520,8 @@ test "trap -p with no matching trap shows nothing" {
 
 test "trap -p EXIT shows exit trap" {
     try expectOutput(
-        "trap 'cleanup' EXIT; trap -p EXIT",
-        "trap -- 'cleanup' EXIT\n",
+        "trap 'true' EXIT; trap -p EXIT",
+        "trap -- 'true' EXIT\n",
     );
 }
 

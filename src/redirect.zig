@@ -15,7 +15,7 @@ pub const RedirectState = struct {
     pub fn save(self: *RedirectState, fd: types.Fd) !void {
         if (self.count >= 16) return error.TooManyRedirections;
 
-        const saved_fd = posix.dup(fd) catch {
+        const saved_fd = posix.dupHighFd(fd) catch {
             self.saved[self.count] = .{
                 .original_fd = fd,
                 .saved_fd = -1,
@@ -24,8 +24,6 @@ pub const RedirectState = struct {
             self.count += 1;
             return;
         };
-
-        posix.fcntl_setfd(saved_fd, posix.FD_CLOEXEC) catch {};
 
         self.saved[self.count] = .{
             .original_fd = fd,
@@ -65,12 +63,13 @@ pub const RedirectOp = enum {
     clobber,
     heredoc,
     heredoc_strip,
+    here_string,
 };
 
 pub fn applyFileRedirect(fd: types.Fd, path: [*:0]const u8, op: RedirectOp, state: *RedirectState, noclobber: bool) ApplyError!void {
     try state.save(fd);
     const flags: posix.OpenFlags = switch (op) {
-        .input, .heredoc, .heredoc_strip => posix.oRdonly(),
+        .input, .heredoc, .heredoc_strip, .here_string => posix.oRdonly(),
         .output => if (noclobber) posix.oWronlyCreatExcl() else posix.oWronlyCreatTrunc(),
         .clobber => posix.oWronlyCreatTrunc(),
         .append => posix.oWronlyCreatAppend(),
@@ -96,7 +95,7 @@ pub fn applyCloseRedirect(fd: types.Fd, state: *RedirectState) ApplyError!void {
 
 pub fn defaultFdForOp(op: RedirectOp) types.Fd {
     return switch (op) {
-        .input, .heredoc, .heredoc_strip, .read_write, .dup_input => types.STDIN,
+        .input, .heredoc, .heredoc_strip, .here_string, .read_write, .dup_input => types.STDIN,
         .output, .append, .dup_output, .clobber => types.STDOUT,
     };
 }

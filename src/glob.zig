@@ -36,7 +36,10 @@ pub fn expand(alloc: std.mem.Allocator, pattern: []const u8) ![]const []const u8
         const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
         const name = std.mem.sliceTo(name_ptr, 0);
 
-        if (name[0] == '.' and (file_pattern.len == 0 or file_pattern[0] != '.')) continue;
+        if (name[0] == '.') {
+            if (file_pattern.len == 0 or file_pattern[0] != '.') continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        }
 
         if (fnmatch(file_pattern, name)) {
             const full = if (dir_path.len > 0)
@@ -70,20 +73,52 @@ pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
     var star_ti: usize = 0;
 
     while (ti < text.len) {
-        if (pi < pattern.len and pattern[pi] == '[') {
-            if (matchBracket(pattern, &pi, text[ti])) {
+        if (pi < pattern.len and pattern[pi] == '\\' and pi + 1 < pattern.len) {
+            pi += 1;
+            if (pattern[pi] == text[ti]) {
+                pi += 1;
                 ti += 1;
-                continue;
             } else if (star_pi) |sp| {
                 pi = sp + 1;
                 star_ti += 1;
                 ti = star_ti;
-                continue;
             } else {
                 return false;
             }
+            continue;
         }
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
+        if (pi < pattern.len and pattern[pi] == '[') {
+            const saved_pi = pi;
+            if (matchBracket(pattern, &pi, text[ti])) {
+                ti += 1;
+                continue;
+            } else if (pi != saved_pi) {
+                if (star_pi) |sp| {
+                    pi = sp + 1;
+                    star_ti += 1;
+                    ti = star_ti;
+                    continue;
+                } else {
+                    return false;
+                }
+            } else {
+                if (text[ti] == '[') {
+                    pi += 1;
+                    ti += 1;
+                } else if (star_pi) |sp| {
+                    pi = sp + 1;
+                    star_ti += 1;
+                    ti = star_ti;
+                } else {
+                    return false;
+                }
+                continue;
+            }
+        }
+        if (pi < pattern.len and pattern[pi] == '?') {
+            pi += 1;
+            ti += utf8CharLen(text[ti]);
+        } else if (pi < pattern.len and pattern[pi] == text[ti]) {
             pi += 1;
             ti += 1;
         } else if (pi < pattern.len and pattern[pi] == '*') {
@@ -92,13 +127,21 @@ pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
             pi += 1;
         } else if (star_pi) |sp| {
             pi = sp + 1;
-            star_ti += 1;
+            star_ti += utf8CharLen(text[star_ti]);
             ti = star_ti;
         } else {
             return false;
         }
     }
-    while (pi < pattern.len and pattern[pi] == '*') : (pi += 1) {}
+    while (pi < pattern.len) {
+        if (pattern[pi] == '*') {
+            pi += 1;
+        } else if (pattern[pi] == '\\' and pi + 1 < pattern.len) {
+            break;
+        } else {
+            break;
+        }
+    }
     return pi == pattern.len;
 }
 
@@ -138,16 +181,29 @@ fn matchBracket(pattern: []const u8, pi: *usize, ch: u8) bool {
             }
         }
 
-        if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
-            if (ch >= pattern[i] and ch <= pattern[i + 2]) {
+        var current_char = pattern[i];
+        var char_len: usize = 1;
+        if (current_char == '\\' and i + 1 < pattern.len) {
+            current_char = pattern[i + 1];
+            char_len = 2;
+        }
+
+        if (i + char_len + 1 < pattern.len and pattern[i + char_len] == '-' and pattern[i + char_len + 1] != ']') {
+            var end_char = pattern[i + char_len + 1];
+            var end_len: usize = 1;
+            if (end_char == '\\' and i + char_len + 2 < pattern.len) {
+                end_char = pattern[i + char_len + 2];
+                end_len = 2;
+            }
+            if (ch >= current_char and ch <= end_char) {
                 matched = true;
             }
-            i += 3;
+            i += char_len + 1 + end_len;
         } else {
-            if (pattern[i] == ch) {
+            if (current_char == ch) {
                 matched = true;
             }
-            i += 1;
+            i += char_len;
         }
     }
     return false;
@@ -180,6 +236,14 @@ fn matchCharClass(class_name: []const u8, ch: u8) bool {
         return ch == ' ' or ch == '\t';
     }
     return false;
+}
+
+fn utf8CharLen(byte: u8) usize {
+    if (byte < 0x80) return 1;
+    if (byte & 0xE0 == 0xC0) return 2;
+    if (byte & 0xF0 == 0xE0) return 3;
+    if (byte & 0xF8 == 0xF0) return 4;
+    return 1;
 }
 
 fn hasGlobChars(s: []const u8) bool {

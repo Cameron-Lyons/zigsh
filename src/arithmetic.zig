@@ -24,16 +24,30 @@ pub const Arithmetic = struct {
             .setter = setter,
         };
         self.skipWhitespace();
-        const result = try self.parseAssign();
+        if (self.pos >= self.expr.len) return 0;
+        const result = try self.parseComma();
         self.skipWhitespace();
         if (self.pos < self.expr.len) return error.InvalidExpression;
         return result;
     }
 
     fn skipWhitespace(self: *Arithmetic) void {
-        while (self.pos < self.expr.len and (self.expr[self.pos] == ' ' or self.expr[self.pos] == '\t')) {
+        while (self.pos < self.expr.len and (self.expr[self.pos] == ' ' or self.expr[self.pos] == '\t' or self.expr[self.pos] == '\n' or self.expr[self.pos] == '\r')) {
             self.pos += 1;
         }
+    }
+
+    fn parseComma(self: *Arithmetic) ArithError!i64 {
+        var result = try self.parseAssign();
+        while (true) {
+            self.skipWhitespace();
+            if (self.pos < self.expr.len and self.expr[self.pos] == ',') {
+                self.pos += 1;
+                self.skipWhitespace();
+                result = try self.parseAssign();
+            } else break;
+        }
+        return result;
     }
 
     fn parseAssign(self: *Arithmetic) ArithError!i64 {
@@ -108,13 +122,28 @@ pub const Arithmetic = struct {
         if (self.pos < self.expr.len and self.expr[self.pos] == '?') {
             self.pos += 1;
             self.skipWhitespace();
-            const then_val = try self.parseTernary();
-            self.skipWhitespace();
-            if (self.pos >= self.expr.len or self.expr[self.pos] != ':') return error.InvalidExpression;
-            self.pos += 1;
-            self.skipWhitespace();
-            const else_val = try self.parseTernary();
-            return if (cond != 0) then_val else else_val;
+            if (cond != 0) {
+                const then_val = try self.parseAssign();
+                self.skipWhitespace();
+                if (self.pos >= self.expr.len or self.expr[self.pos] != ':') return error.InvalidExpression;
+                self.pos += 1;
+                self.skipWhitespace();
+                const saved_setter = self.setter;
+                self.setter = null;
+                _ = try self.parseAssign();
+                self.setter = saved_setter;
+                return then_val;
+            } else {
+                const saved_setter = self.setter;
+                self.setter = null;
+                _ = try self.parseAssign();
+                self.setter = saved_setter;
+                self.skipWhitespace();
+                if (self.pos >= self.expr.len or self.expr[self.pos] != ':') return error.InvalidExpression;
+                self.pos += 1;
+                self.skipWhitespace();
+                return try self.parseAssign();
+            }
         }
         return cond;
     }
@@ -125,8 +154,16 @@ pub const Arithmetic = struct {
             self.skipWhitespace();
             if (self.matchStr("||")) {
                 self.skipWhitespace();
-                const right = try self.parseAnd();
-                left = if (left != 0 or right != 0) 1 else 0;
+                if (left != 0) {
+                    const saved_setter = self.setter;
+                    self.setter = null;
+                    _ = try self.parseAnd();
+                    self.setter = saved_setter;
+                    left = 1;
+                } else {
+                    const right = try self.parseAnd();
+                    left = if (right != 0) 1 else 0;
+                }
             } else break;
         }
         return left;
@@ -138,8 +175,16 @@ pub const Arithmetic = struct {
             self.skipWhitespace();
             if (self.matchStr("&&")) {
                 self.skipWhitespace();
-                const right = try self.parseBitOr();
-                left = if (left != 0 and right != 0) 1 else 0;
+                if (left == 0) {
+                    const saved_setter = self.setter;
+                    self.setter = null;
+                    _ = try self.parseBitOr();
+                    self.setter = saved_setter;
+                    left = 0;
+                } else {
+                    const right = try self.parseBitOr();
+                    left = if (right != 0) 1 else 0;
+                }
             } else break;
         }
         return left;
@@ -246,12 +291,14 @@ pub const Arithmetic = struct {
             if (self.matchStr("<<")) {
                 self.skipWhitespace();
                 const right = try self.parseAddSub();
-                const shift: u6 = @intCast(@min(@max(right, 0), 63));
+                if (right < 0) return error.InvalidExpression;
+                const shift: u6 = @intCast(@min(right, 63));
                 left = left << shift;
             } else if (self.matchStr(">>")) {
                 self.skipWhitespace();
                 const right = try self.parseAddSub();
-                const shift: u6 = @intCast(@min(@max(right, 0), 63));
+                if (right < 0) return error.InvalidExpression;
+                const shift: u6 = @intCast(@min(right, 63));
                 left = left >> shift;
             } else break;
         }
@@ -282,29 +329,59 @@ pub const Arithmetic = struct {
     }
 
     fn parseMulDiv(self: *Arithmetic) ArithError!i64 {
-        var left = try self.parseUnary();
+        var left = try self.parseExponent();
         while (true) {
             self.skipWhitespace();
-            if (self.pos < self.expr.len and self.expr[self.pos] == '*') {
+            if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '*' and self.expr[self.pos + 1] == '*') {
+                break;
+            }
+            if (self.pos < self.expr.len and self.expr[self.pos] == '*' and
+                (self.pos + 1 >= self.expr.len or self.expr[self.pos + 1] != '='))
+            {
                 self.pos += 1;
                 self.skipWhitespace();
-                const right = try self.parseUnary();
+                const right = try self.parseExponent();
                 left = left *% right;
-            } else if (self.pos < self.expr.len and self.expr[self.pos] == '/') {
+            } else if (self.pos < self.expr.len and self.expr[self.pos] == '/' and
+                (self.pos + 1 >= self.expr.len or self.expr[self.pos + 1] != '='))
+            {
                 self.pos += 1;
                 self.skipWhitespace();
-                const right = try self.parseUnary();
+                const right = try self.parseExponent();
                 if (right == 0) return error.DivisionByZero;
                 left = @divTrunc(left, right);
-            } else if (self.pos < self.expr.len and self.expr[self.pos] == '%') {
+            } else if (self.pos < self.expr.len and self.expr[self.pos] == '%' and
+                (self.pos + 1 >= self.expr.len or self.expr[self.pos + 1] != '='))
+            {
                 self.pos += 1;
                 self.skipWhitespace();
-                const right = try self.parseUnary();
+                const right = try self.parseExponent();
                 if (right == 0) return error.DivisionByZero;
                 left = @rem(left, right);
             } else break;
         }
         return left;
+    }
+
+    fn parseExponent(self: *Arithmetic) ArithError!i64 {
+        const base = try self.parseUnary();
+        self.skipWhitespace();
+        if (self.matchStr("**")) {
+            self.skipWhitespace();
+            const exp = try self.parseExponent();
+            if (exp < 0) return error.InvalidExpression;
+            if (exp == 0) return 1;
+            var result: i64 = 1;
+            var e: i64 = exp;
+            var b: i64 = base;
+            while (e > 0) {
+                if (@rem(e, 2) == 1) result = result *% b;
+                b = b *% b;
+                e = @divTrunc(e, 2);
+            }
+            return result;
+        }
+        return base;
     }
 
     fn parseUnary(self: *Arithmetic) ArithError!i64 {
@@ -374,7 +451,7 @@ pub const Arithmetic = struct {
         if (self.expr[self.pos] == '(') {
             self.pos += 1;
             self.skipWhitespace();
-            const val = try self.parseAssign();
+            const val = try self.parseComma();
             self.skipWhitespace();
             if (self.pos >= self.expr.len or self.expr[self.pos] != ')') return error.InvalidExpression;
             self.pos += 1;
@@ -389,13 +466,23 @@ pub const Arithmetic = struct {
         }
 
         if (self.expr[self.pos] == '0' and self.pos + 1 < self.expr.len and
-            self.expr[self.pos + 1] >= '0' and self.expr[self.pos + 1] <= '7')
+            self.expr[self.pos + 1] >= '0' and self.expr[self.pos + 1] <= '9')
         {
+            if (self.expr[self.pos + 1] >= '8') return error.InvalidExpression;
             return self.parseOctalNumber();
         }
 
         if (self.expr[self.pos] >= '0' and self.expr[self.pos] <= '9') {
             return self.parseDecimalNumber();
+        }
+
+        if (self.expr[self.pos] == '\'') {
+            if (self.pos + 2 < self.expr.len and self.expr[self.pos + 2] == '\'') {
+                const ch_val: i64 = @intCast(self.expr[self.pos + 1]);
+                self.pos += 3;
+                return ch_val;
+            }
+            return error.InvalidExpression;
         }
 
         if (types.isNameStart(self.expr[self.pos])) {
@@ -411,6 +498,36 @@ pub const Arithmetic = struct {
             val = val *% 10 +% @as(i64, self.expr[self.pos] - '0');
             self.pos += 1;
         }
+        if (self.pos < self.expr.len and self.expr[self.pos] == '#') {
+            self.pos += 1;
+            return self.parseBaseN(@intCast(@min(@max(val, 2), 64)));
+        }
+        return val;
+    }
+
+    fn parseBaseN(self: *Arithmetic, base: u7) ArithError!i64 {
+        var val: i64 = 0;
+        var has_digit = false;
+        while (self.pos < self.expr.len) {
+            const ch = self.expr[self.pos];
+            const digit: i64 = if (ch >= '0' and ch <= '9')
+                @as(i64, ch - '0')
+            else if (ch >= 'a' and ch <= 'z')
+                @as(i64, ch - 'a' + 10)
+            else if (ch >= 'A' and ch <= 'Z')
+                if (base <= 36) @as(i64, ch - 'A' + 10) else @as(i64, ch - 'A' + 36)
+            else if (ch == '@')
+                62
+            else if (ch == '_')
+                63
+            else
+                break;
+            if (digit >= base) break;
+            val = val *% base +% digit;
+            has_digit = true;
+            self.pos += 1;
+        }
+        if (!has_digit) return error.InvalidExpression;
         return val;
     }
 
@@ -450,7 +567,23 @@ pub const Arithmetic = struct {
         const name = self.expr[start..self.pos];
         const val = blk: {
             const v = self.lookup(name) orelse break :blk @as(i64, 0);
-            break :blk std.fmt.parseInt(i64, v, 10) catch 0;
+            break :blk std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\n"), 10) catch blk2: {
+                if (v.len > 0) {
+                    var sub = Arithmetic{
+                        .expr = v,
+                        .pos = 0,
+                        .lookup = self.lookup,
+                        .setter = self.setter,
+                    };
+                    sub.skipWhitespace();
+                    if (sub.pos < sub.expr.len) {
+                        const sub_result = sub.parseComma() catch break :blk2 @as(i64, 0);
+                        sub.skipWhitespace();
+                        if (sub.pos >= sub.expr.len) break :blk2 sub_result;
+                    }
+                }
+                break :blk2 @as(i64, 0);
+            };
         };
 
         if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '+' and self.expr[self.pos + 1] == '+') {
@@ -617,7 +750,7 @@ test "invalid expression" {
             return null;
         }
     }.f;
-    try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("", lookup));
+    try std.testing.expectEqual(@as(i64, 0), try Arithmetic.evaluate("", lookup));
     try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("1 +", lookup));
     try std.testing.expectError(error.InvalidExpression, Arithmetic.evaluate("(1 + 2", lookup));
 }

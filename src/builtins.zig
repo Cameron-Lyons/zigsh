@@ -44,6 +44,13 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "fc", &builtinFc },
     .{ "times", &builtinTimes },
     .{ "ulimit", &builtinUlimit },
+    .{ "history", &builtinHistory },
+    .{ "typeset", &builtinDeclare },
+    .{ "declare", &builtinDeclare },
+    .{ "local", &builtinDeclare },
+    .{ "chdir", &builtinCd },
+    .{ "let", &builtinLet },
+    .{ "shopt", &builtinShopt },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
@@ -65,7 +72,21 @@ fn builtinFalse(_: []const []const u8, _: *Environment) u8 {
 fn builtinExit(args: []const []const u8, env: *Environment) u8 {
     var code: u8 = env.last_exit_status;
     if (args.len > 1) {
-        code = std.fmt.parseInt(u8, args[1], 10) catch env.last_exit_status;
+        if (std.fmt.parseInt(i64, args[1], 10)) |n| {
+            code = @truncate(@as(u64, @bitCast(n)));
+        } else |_| {
+            posix.writeAll(2, "exit: ");
+            posix.writeAll(2, args[1]);
+            posix.writeAll(2, ": numeric argument required\n");
+            code = 2;
+            env.should_exit = true;
+            env.exit_value = code;
+            return code;
+        }
+        if (args.len > 2) {
+            posix.writeAll(2, "exit: too many arguments\n");
+            return 2;
+        }
     }
     env.should_exit = true;
     env.exit_value = code;
@@ -83,6 +104,9 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         } else if (std.mem.eql(u8, args[arg_start], "-P")) {
             physical = true;
             arg_start += 1;
+        } else if (std.mem.eql(u8, args[arg_start], "--")) {
+            arg_start += 1;
+            break;
         } else {
             break;
         }
@@ -148,7 +172,7 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
     }
 
     if (old_pwd) |pwd| {
-        env.set("OLDPWD", pwd, false) catch {};
+        env.set("OLDPWD", pwd, true) catch {};
     }
 
     if (physical) {
@@ -156,21 +180,21 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         const cwd = posix.getcwd(&new_buf) catch null;
         if (cwd) |cwd_str| {
             const cwd_z = std.posix.toPosixPath(cwd_str) catch {
-                env.set("PWD", cwd_str, false) catch {};
+                env.set("PWD", cwd_str, true) catch {};
                 return 0;
             };
             var real_buf: [4096]u8 = undefined;
             if (posix.realpath(&cwd_z, &real_buf)) |resolved| {
-                env.set("PWD", resolved, false) catch {};
+                env.set("PWD", resolved, true) catch {};
             } else {
-                env.set("PWD", cwd_str, false) catch {};
+                env.set("PWD", cwd_str, true) catch {};
             }
         }
     } else {
         var new_buf: [4096]u8 = undefined;
         const new_pwd = posix.getcwd(&new_buf) catch null;
         if (new_pwd) |pwd| {
-            env.set("PWD", pwd, false) catch {};
+            env.set("PWD", pwd, true) catch {};
             if (cdpath_hit and is_relative) {
                 posix.writeAll(1, pwd);
                 posix.writeAll(1, "\n");
@@ -253,14 +277,102 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
             break;
         }
     }
+    var status: u8 = 0;
     for (args[start..]) |name| {
         if (unset_func) {
             _ = env.unsetFunction(name);
         } else {
-            env.unset(name);
+            if (!isValidVarName(name)) {
+                posix.writeAll(2, "zigsh: unset: `");
+                posix.writeAll(2, name);
+                posix.writeAll(2, "': not a valid identifier\n");
+                status = 2;
+                continue;
+            }
+            if (env.vars.get(name) != null) {
+                if (env.unset(name) == .readonly) {
+                    posix.writeAll(2, "zigsh: unset: ");
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": readonly variable\n");
+                    status = 1;
+                }
+            } else {
+                _ = env.unsetFunction(name);
+            }
         }
     }
-    return 0;
+    return status;
+}
+
+fn isValidVarName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] != '_' and !std.ascii.isAlphabetic(name[0])) return false;
+    for (name[1..]) |ch| {
+        if (ch != '_' and !std.ascii.isAlphanumeric(ch)) return false;
+    }
+    return true;
+}
+
+fn setWriteValue(value: []const u8) void {
+    var needs_quoting = false;
+    var has_special = false;
+    for (value) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '/', '.', '-', '+', ':', ',', '@', '%', '^' => {},
+            '\n', '\r', '\t', 0x01...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0xff => {
+                has_special = true;
+                needs_quoting = true;
+            },
+            else => {
+                needs_quoting = true;
+            },
+        }
+    }
+    if (!needs_quoting) {
+        posix.writeAll(1, value);
+        return;
+    }
+    if (has_special) {
+        posix.writeAll(1, "$'");
+        for (value) |ch| {
+            switch (ch) {
+                '\'' => posix.writeAll(1, "\\'"),
+                '\\' => posix.writeAll(1, "\\\\"),
+                '\n' => posix.writeAll(1, "\\n"),
+                '\r' => posix.writeAll(1, "\\r"),
+                '\t' => posix.writeAll(1, "\\t"),
+                0x07 => posix.writeAll(1, "\\a"),
+                0x08 => posix.writeAll(1, "\\b"),
+                0x1b => posix.writeAll(1, "\\E"),
+                else => {
+                    if (ch < 0x20 or ch == 0x7f) {
+                        var hex_buf: [8]u8 = undefined;
+                        const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch return;
+                        posix.writeAll(1, hex);
+                    } else if (ch >= 0x80) {
+                        var hex_buf: [8]u8 = undefined;
+                        const hex = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{ch}) catch return;
+                        posix.writeAll(1, hex);
+                    } else {
+                        const buf = [1]u8{ch};
+                        posix.writeAll(1, &buf);
+                    }
+                },
+            }
+        }
+        posix.writeAll(1, "'");
+    } else {
+        posix.writeAll(1, "'");
+        for (value) |ch| {
+            if (ch == '\'') {
+                posix.writeAll(1, "'\\''");
+            } else {
+                const buf = [1]u8{ch};
+                posix.writeAll(1, &buf);
+            }
+        }
+        posix.writeAll(1, "'");
+    }
 }
 
 fn builtinSet(args: []const []const u8, env: *Environment) u8 {
@@ -269,7 +381,7 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
         while (it.next()) |entry| {
             posix.writeAll(1, entry.key_ptr.*);
             posix.writeAll(1, "=");
-            posix.writeAll(1, entry.value_ptr.value);
+            setWriteValue(entry.value_ptr.value);
             posix.writeAll(1, "\n");
         }
         return 0;
@@ -281,7 +393,23 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
         if (std.mem.eql(u8, arg, "--")) {
             i += 1;
             env.positional_params = args[i..];
+            env.set("OPTIND", "1", false) catch {};
+            env.set("OPTPOS", "0", false) catch {};
             return 0;
+        }
+        if (std.mem.eql(u8, arg, "-")) {
+            env.options.xtrace = false;
+            env.options.verbose = false;
+            i += 1;
+            if (i <= args.len) {
+                env.positional_params = args[i..];
+                env.set("OPTIND", "1", false) catch {};
+                env.set("OPTPOS", "0", false) catch {};
+            }
+            return 0;
+        }
+        if (std.mem.eql(u8, arg, "+")) {
+            continue;
         }
         if (arg.len < 2 or (arg[0] != '-' and arg[0] != '+')) break;
         const enable = arg[0] == '-';
@@ -319,6 +447,8 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
 
     if (i < args.len) {
         env.positional_params = args[i..];
+        env.set("OPTIND", "1", false) catch {};
+        env.set("OPTPOS", "0", false) catch {};
     }
     return 0;
 }
@@ -333,6 +463,7 @@ fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable:
     else if (std.mem.eql(u8, name, "monitor")) { options.monitor = enable; }
     else if (std.mem.eql(u8, name, "noclobber")) { options.noclobber = enable; }
     else if (std.mem.eql(u8, name, "verbose")) { options.verbose = enable; }
+    else if (std.mem.eql(u8, name, "pipefail")) { options.pipefail = enable; }
     else {
         posix.writeAll(2, "set: unknown option: ");
         posix.writeAll(2, name);
@@ -349,6 +480,7 @@ fn printOptions(options: *const Environment.ShellOptions) void {
         .{ .name = "noexec", .value = options.noexec },
         .{ .name = "noglob", .value = options.noglob },
         .{ .name = "nounset", .value = options.nounset },
+        .{ .name = "pipefail", .value = options.pipefail },
         .{ .name = "verbose", .value = options.verbose },
         .{ .name = "xtrace", .value = options.xtrace },
     };
@@ -369,6 +501,7 @@ fn printOptionsReinput(options: *const Environment.ShellOptions) void {
         .{ .name = "noexec", .value = options.noexec },
         .{ .name = "noglob", .value = options.noglob },
         .{ .name = "nounset", .value = options.nounset },
+        .{ .name = "pipefail", .value = options.pipefail },
         .{ .name = "verbose", .value = options.verbose },
         .{ .name = "xtrace", .value = options.xtrace },
     };
@@ -381,9 +514,18 @@ fn printOptionsReinput(options: *const Environment.ShellOptions) void {
 }
 
 fn builtinShift(args: []const []const u8, env: *Environment) u8 {
+    if (args.len > 2) {
+        posix.writeAll(2, "shift: too many arguments\n");
+        return 2;
+    }
     var n: usize = 1;
     if (args.len > 1) {
-        n = std.fmt.parseInt(usize, args[1], 10) catch return 1;
+        n = std.fmt.parseInt(usize, args[1], 10) catch {
+            posix.writeAll(2, "shift: ");
+            posix.writeAll(2, args[1]);
+            posix.writeAll(2, ": numeric argument required\n");
+            return 2;
+        };
     }
     if (n > env.positional_params.len) return 1;
     env.positional_params = env.positional_params[n..];
@@ -393,7 +535,11 @@ fn builtinShift(args: []const []const u8, env: *Environment) u8 {
 fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
     var val: u8 = env.last_exit_status;
     if (args.len > 1) {
-        val = std.fmt.parseInt(u8, args[1], 10) catch env.last_exit_status;
+        if (std.fmt.parseInt(i64, args[1], 10)) |n| {
+            val = @truncate(@as(u64, @bitCast(n)));
+        } else |_| {
+            val = env.last_exit_status;
+        }
     }
     env.should_return = true;
     env.return_value = val;
@@ -401,21 +547,47 @@ fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
+    if (args.len > 2) {
+        posix.writeAll(2, "break: too many arguments\n");
+        return 1;
+    }
     var n: u32 = 1;
     if (args.len > 1) {
-        n = std.fmt.parseInt(u32, args[1], 10) catch 1;
+        n = std.fmt.parseInt(u32, args[1], 10) catch {
+            posix.writeAll(2, "break: ");
+            posix.writeAll(2, args[1]);
+            posix.writeAll(2, ": numeric argument required\n");
+            return 1;
+        };
+        if (n == 0) {
+            posix.writeAll(2, "break: loop count must be > 0\n");
+            return 1;
+        }
     }
-    if (n == 0) n = 1;
+    if (env.loop_depth == 0) return if (env.in_subshell) @as(u8, 1) else 0;
     env.break_count = n;
     return 0;
 }
 
 fn builtinContinue(args: []const []const u8, env: *Environment) u8 {
+    if (args.len > 2) {
+        posix.writeAll(2, "continue: too many arguments\n");
+        return 2;
+    }
     var n: u32 = 1;
     if (args.len > 1) {
-        n = std.fmt.parseInt(u32, args[1], 10) catch 1;
+        n = std.fmt.parseInt(u32, args[1], 10) catch {
+            posix.writeAll(2, "continue: ");
+            posix.writeAll(2, args[1]);
+            posix.writeAll(2, ": numeric argument required\n");
+            return 1;
+        };
+        if (n == 0) {
+            posix.writeAll(2, "continue: loop count must be > 0\n");
+            return 1;
+        }
     }
-    if (n == 0) n = 1;
+    if (env.loop_depth == 0) return if (env.in_subshell) @as(u8, 1) else 0;
     env.continue_count = n;
     return 0;
 }
@@ -423,21 +595,134 @@ fn builtinContinue(args: []const []const u8, env: *Environment) u8 {
 fn builtinEcho(args: []const []const u8, _: *Environment) u8 {
     var i: usize = 1;
     var no_newline = false;
+    var interpret_escapes = false;
 
-    if (i < args.len and std.mem.eql(u8, args[i], "-n")) {
-        no_newline = true;
+    while (i < args.len) {
+        const arg = args[i];
+        if (arg.len < 2 or arg[0] != '-') break;
+        var valid = true;
+        var has_n = false;
+        var has_e = false;
+        var has_big_e = false;
+        for (arg[1..]) |ch| {
+            switch (ch) {
+                'n' => has_n = true,
+                'e' => has_e = true,
+                'E' => has_big_e = true,
+                else => {
+                    valid = false;
+                    break;
+                },
+            }
+        }
+        if (!valid) break;
+        if (has_n) no_newline = true;
+        if (has_e) interpret_escapes = true;
+        if (has_big_e) interpret_escapes = false;
         i += 1;
     }
 
+    const first_arg = i;
     while (i < args.len) : (i += 1) {
-        if (i > 1 and (if (no_newline) i > 2 else i > 1)) posix.writeAll(1, " ");
-        posix.writeAll(1, args[i]);
+        if (i > first_arg) posix.writeAll(1, " ");
+        if (interpret_escapes) {
+            echoEscape(args[i]);
+        } else {
+            posix.writeAll(1, args[i]);
+        }
     }
     if (!no_newline) posix.writeAll(1, "\n");
     return 0;
 }
 
-fn builtinTest(args: []const []const u8, _: *Environment) u8 {
+fn echoEscape(s: []const u8) void {
+    var j: usize = 0;
+    while (j < s.len) {
+        if (s[j] == '\\' and j + 1 < s.len) {
+            switch (s[j + 1]) {
+                'a' => {
+                    posix.writeAll(1, "\x07");
+                    j += 2;
+                },
+                'b' => {
+                    posix.writeAll(1, "\x08");
+                    j += 2;
+                },
+                'c' => return,
+                'e', 'E' => {
+                    posix.writeAll(1, "\x1b");
+                    j += 2;
+                },
+                'f' => {
+                    posix.writeAll(1, "\x0c");
+                    j += 2;
+                },
+                'n' => {
+                    posix.writeAll(1, "\n");
+                    j += 2;
+                },
+                'r' => {
+                    posix.writeAll(1, "\r");
+                    j += 2;
+                },
+                't' => {
+                    posix.writeAll(1, "\t");
+                    j += 2;
+                },
+                'v' => {
+                    posix.writeAll(1, "\x0b");
+                    j += 2;
+                },
+                '\\' => {
+                    posix.writeAll(1, "\\");
+                    j += 2;
+                },
+                '0' => {
+                    j += 2;
+                    var val: u8 = 0;
+                    var count: u8 = 0;
+                    while (count < 3 and j < s.len and s[j] >= '0' and s[j] <= '7') {
+                        val = val *% 8 +% (s[j] - '0');
+                        j += 1;
+                        count += 1;
+                    }
+                    const buf = [1]u8{val};
+                    posix.writeAll(1, &buf);
+                },
+                'x' => {
+                    j += 2;
+                    var val: u8 = 0;
+                    var count: u8 = 0;
+                    while (count < 2 and j < s.len) {
+                        const d = s[j];
+                        if (d >= '0' and d <= '9') {
+                            val = val *% 16 +% (d - '0');
+                        } else if (d >= 'a' and d <= 'f') {
+                            val = val *% 16 +% (d - 'a' + 10);
+                        } else if (d >= 'A' and d <= 'F') {
+                            val = val *% 16 +% (d - 'A' + 10);
+                        } else break;
+                        j += 1;
+                        count += 1;
+                    }
+                    const buf = [1]u8{val};
+                    posix.writeAll(1, &buf);
+                },
+                else => {
+                    posix.writeAll(1, s[j .. j + 2]);
+                    j += 2;
+                },
+            }
+        } else {
+            const start = j;
+            j += 1;
+            while (j < s.len and s[j] != '\\') j += 1;
+            posix.writeAll(1, s[start..j]);
+        }
+    }
+}
+
+fn builtinTest(args: []const []const u8, test_env: *Environment) u8 {
     const effective_args = if (args.len > 0 and std.mem.eql(u8, args[0], "[")) blk: {
         if (args.len < 2 or !std.mem.eql(u8, args[args.len - 1], "]")) {
             posix.writeAll(2, "[: missing ]\n");
@@ -446,10 +731,10 @@ fn builtinTest(args: []const []const u8, _: *Environment) u8 {
         break :blk args[1 .. args.len - 1];
     } else args[1..];
 
-    return testEvaluate(effective_args);
+    return testEvaluate(effective_args, test_env);
 }
 
-fn testEvaluate(targs: []const []const u8) u8 {
+fn testEvaluate(targs: []const []const u8, test_env: *Environment) u8 {
     if (targs.len == 0) return 1;
 
     if (targs.len == 1) {
@@ -458,60 +743,70 @@ fn testEvaluate(targs: []const []const u8) u8 {
 
     if (targs.len == 2) {
         if (std.mem.eql(u8, targs[0], "!")) {
-            return if (testEvaluate(targs[1..]) == 0) 1 else 0;
+            return if (testEvaluate(targs[1..], test_env) == 0) 1 else 0;
         }
-        return testUnary(targs[0], targs[1]);
+        return testUnary(targs[0], targs[1], test_env);
     }
 
     if (targs.len == 3) {
         if (std.mem.eql(u8, targs[0], "!")) {
-            return if (testEvaluate(targs[1..]) == 0) 1 else 0;
+            return if (testEvaluate(targs[1..], test_env) == 0) 1 else 0;
         }
         if (std.mem.eql(u8, targs[0], "(") and std.mem.eql(u8, targs[2], ")")) {
-            return testEvaluate(targs[1..2]);
+            return testEvaluate(targs[1..2], test_env);
+        }
+        if (std.mem.eql(u8, targs[1], "-a")) {
+            const l: u8 = if (targs[0].len > 0) 0 else 1;
+            const r: u8 = if (targs[2].len > 0) 0 else 1;
+            return if (l == 0 and r == 0) 0 else 1;
+        }
+        if (std.mem.eql(u8, targs[1], "-o")) {
+            const l: u8 = if (targs[0].len > 0) 0 else 1;
+            const r: u8 = if (targs[2].len > 0) 0 else 1;
+            return if (l == 0 or r == 0) 0 else 1;
         }
         return testBinary(targs[0], targs[1], targs[2]);
     }
 
     if (targs.len == 4 and std.mem.eql(u8, targs[0], "!")) {
-        return if (testEvaluate(targs[1..]) == 0) 1 else 0;
+        return if (testEvaluate(targs[1..], test_env) == 0) 1 else 0;
     }
 
     var pos: usize = 0;
-    return testParseOr(targs, &pos);
+    return testParseOr(targs, &pos, test_env);
 }
 
-fn testParseOr(targs: []const []const u8, pos: *usize) u8 {
-    var result = testParseAnd(targs, pos);
+fn testParseOr(targs: []const []const u8, pos: *usize, test_env: *Environment) u8 {
+    var result = testParseAnd(targs, pos, test_env);
     while (pos.* < targs.len and std.mem.eql(u8, targs[pos.*], "-o")) {
         pos.* += 1;
-        const right = testParseAnd(targs, pos);
+        const right = testParseAnd(targs, pos, test_env);
         result = if (result == 0 or right == 0) 0 else 1;
     }
     return result;
 }
 
-fn testParseAnd(targs: []const []const u8, pos: *usize) u8 {
-    var result = testParsePrimary(targs, pos);
+fn testParseAnd(targs: []const []const u8, pos: *usize, test_env: *Environment) u8 {
+    var result = testParsePrimary(targs, pos, test_env);
     while (pos.* < targs.len and std.mem.eql(u8, targs[pos.*], "-a")) {
         pos.* += 1;
-        const right = testParsePrimary(targs, pos);
+        const right = testParsePrimary(targs, pos, test_env);
         result = if (result == 0 and right == 0) 0 else 1;
     }
     return result;
 }
 
-fn testParsePrimary(targs: []const []const u8, pos: *usize) u8 {
+fn testParsePrimary(targs: []const []const u8, pos: *usize, test_env: *Environment) u8 {
     if (pos.* >= targs.len) return 1;
 
     if (std.mem.eql(u8, targs[pos.*], "!")) {
         pos.* += 1;
-        return if (testParsePrimary(targs, pos) == 0) 1 else 0;
+        return if (testParsePrimary(targs, pos, test_env) == 0) 1 else 0;
     }
 
     if (std.mem.eql(u8, targs[pos.*], "(")) {
         pos.* += 1;
-        const result = testParseOr(targs, pos);
+        const result = testParseOr(targs, pos, test_env);
         if (pos.* < targs.len and std.mem.eql(u8, targs[pos.*], ")")) {
             pos.* += 1;
         }
@@ -523,7 +818,7 @@ fn testParsePrimary(targs: []const []const u8, pos: *usize) u8 {
         pos.* += 1;
         const operand = targs[pos.*];
         pos.* += 1;
-        return testUnary(op, operand);
+        return testUnary(op, operand, test_env);
     }
 
     if (pos.* + 2 < targs.len and isTestBinaryOp(targs[pos.* + 1])) {
@@ -541,8 +836,9 @@ fn testParsePrimary(targs: []const []const u8, pos: *usize) u8 {
 
 fn isTestUnaryOp(op: []const u8) bool {
     const ops = [_][]const u8{
-        "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-L", "-n", "-p",
+        "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-n", "-p",
         "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-z",
+        "-G", "-O", "-v", "-o",
     };
     for (ops) |o| {
         if (std.mem.eql(u8, op, o)) return true;
@@ -552,7 +848,7 @@ fn isTestUnaryOp(op: []const u8) bool {
 
 fn isTestBinaryOp(op: []const u8) bool {
     const ops = [_][]const u8{
-        "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+        "=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
         "-nt", "-ot", "-ef",
     };
     for (ops) |o| {
@@ -561,18 +857,34 @@ fn isTestBinaryOp(op: []const u8) bool {
     return false;
 }
 
-fn testUnary(op: []const u8, operand: []const u8) u8 {
+fn testUnary(op: []const u8, operand: []const u8, test_env: *Environment) u8 {
     if (std.mem.eql(u8, op, "-n")) return if (operand.len > 0) 0 else 1;
     if (std.mem.eql(u8, op, "-z")) return if (operand.len == 0) 0 else 1;
 
+    if (std.mem.eql(u8, op, "-v")) {
+        return if (test_env.get(operand) != null) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-o")) {
+        if (std.mem.eql(u8, operand, "errexit")) return if (test_env.options.errexit) 0 else 1;
+        if (std.mem.eql(u8, operand, "nounset")) return if (test_env.options.nounset) 0 else 1;
+        if (std.mem.eql(u8, operand, "xtrace")) return if (test_env.options.xtrace) 0 else 1;
+        if (std.mem.eql(u8, operand, "verbose")) return if (test_env.options.verbose) 0 else 1;
+        if (std.mem.eql(u8, operand, "noclobber")) return if (test_env.options.noclobber) 0 else 1;
+        if (std.mem.eql(u8, operand, "noexec")) return if (test_env.options.noexec) 0 else 1;
+        if (std.mem.eql(u8, operand, "noglob")) return if (test_env.options.noglob) 0 else 1;
+        if (std.mem.eql(u8, operand, "allexport")) return if (test_env.options.allexport) 0 else 1;
+        if (std.mem.eql(u8, operand, "monitor")) return if (test_env.options.monitor) 0 else 1;
+        return 1;
+    }
+
     if (std.mem.eql(u8, op, "-t")) {
-        const fd_num = std.fmt.parseInt(posix.fd_t, operand, 10) catch return 1;
+        const fd_num = std.fmt.parseInt(posix.fd_t, operand, 10) catch return 2;
         return if (posix.isatty(fd_num)) 0 else 1;
     }
 
     const path_z = std.posix.toPosixPath(operand) catch return 1;
 
-    if (std.mem.eql(u8, op, "-e")) {
+    if (std.mem.eql(u8, op, "-a") or std.mem.eql(u8, op, "-e")) {
         _ = posix.stat(&path_z) catch return 1;
         return 0;
     }
@@ -625,6 +937,18 @@ fn testUnary(op: []const u8, operand: []const u8) u8 {
         const st = posix.stat(&path_z) catch return 1;
         return if (st.size > 0) 0 else 1;
     }
+    if (std.mem.eql(u8, op, "-k")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.mode & posix.S_ISVTX != 0) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-G")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.gid == posix.getegid()) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "-O")) {
+        const st = posix.stat(&path_z) catch return 1;
+        return if (st.uid == posix.geteuid()) 0 else 1;
+    }
     return 2;
 }
 
@@ -634,6 +958,12 @@ fn testBinary(left: []const u8, op: []const u8, right: []const u8) u8 {
     }
     if (std.mem.eql(u8, op, "!=")) {
         return if (!std.mem.eql(u8, left, right)) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, "<")) {
+        return if (std.mem.order(u8, left, right) == .lt) 0 else 1;
+    }
+    if (std.mem.eql(u8, op, ">")) {
+        return if (std.mem.order(u8, left, right) == .gt) 0 else 1;
     }
 
     if (std.mem.eql(u8, op, "-nt") or std.mem.eql(u8, op, "-ot") or std.mem.eql(u8, op, "-ef")) {
@@ -717,6 +1047,37 @@ fn builtinJobs(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinWait(args: []const []const u8, env: *Environment) u8 {
+    if (args.len > 1 and std.mem.eql(u8, args[1], "-n")) {
+        if (args.len == 2) {
+            const result = posix.waitpid(-1, 0);
+            if (result.pid <= 0) return 127;
+            return posix.statusFromWait(result.status);
+        }
+        var has_error = false;
+        var pids: [64]posix.pid_t = undefined;
+        var npids: usize = 0;
+        for (args[2..]) |arg| {
+            const pid = std.fmt.parseInt(posix.pid_t, arg, 10) catch {
+                posix.writeAll(2, "wait: `");
+                posix.writeAll(2, arg);
+                posix.writeAll(2, "': not a pid or valid job spec\n");
+                has_error = true;
+                continue;
+            };
+            if (npids < 64) {
+                pids[npids] = pid;
+                npids += 1;
+            }
+        }
+        if (has_error) return 127;
+        for (pids[0..npids]) |pid| {
+            const result = posix.waitpid(pid, posix.WNOHANG);
+            if (result.pid > 0) return posix.statusFromWait(result.status);
+        }
+        const result = posix.waitpid(pids[0], 0);
+        if (result.pid <= 0) return 127;
+        return posix.statusFromWait(result.status);
+    }
     if (args.len > 1) {
         var status: u8 = 0;
         for (args[1..]) |arg| {
@@ -741,10 +1102,10 @@ fn builtinWait(args: []const []const u8, env: *Environment) u8 {
                 }
             } else {
                 const pid = std.fmt.parseInt(posix.pid_t, arg, 10) catch {
-                    posix.writeAll(2, "wait: invalid pid: ");
+                    posix.writeAll(2, "zigsh: wait: `");
                     posix.writeAll(2, arg);
-                    posix.writeAll(2, "\n");
-                    status = 127;
+                    posix.writeAll(2, "': not a pid or valid job spec\n");
+                    status = 2;
                     continue;
                 };
                 const result = posix.waitpid(pid, 0);
@@ -773,33 +1134,71 @@ fn builtinKill(args: []const []const u8, env: *Environment) u8 {
     var sig: u6 = signals.SIGTERM;
     var start: usize = 1;
 
-    if (std.mem.eql(u8, args[1], "-l")) {
+    if (std.mem.eql(u8, args[1], "-l") or std.mem.eql(u8, args[1], "-L")) {
         if (args.len > 2) {
+            var status: u8 = 0;
             for (args[2..]) |arg| {
-                var exit_num = std.fmt.parseInt(u32, arg, 10) catch {
-                    posix.writeAll(2, "kill: invalid signal number: ");
-                    posix.writeAll(2, arg);
-                    posix.writeAll(2, "\n");
-                    return 1;
-                };
-                if (exit_num > 128) exit_num -= 128;
-                if (signals.sigNameFromNum(@intCast(exit_num & 0x3f))) |name| {
-                    posix.writeAll(1, name);
-                    posix.writeAll(1, "\n");
-                } else {
-                    posix.writeAll(2, "kill: unknown signal: ");
-                    posix.writeAll(2, arg);
-                    posix.writeAll(2, "\n");
-                    return 1;
+                if (std.fmt.parseInt(u32, arg, 10)) |num| {
+                    var exit_num = num;
+                    if (exit_num == 128 or exit_num > 256) {
+                        posix.writeAll(2, "kill: invalid signal number: ");
+                        posix.writeAll(2, arg);
+                        posix.writeAll(2, "\n");
+                        status = 1;
+                        continue;
+                    }
+                    if (exit_num > 128) exit_num -= 128;
+                    if (signals.sigNameFromNum(@intCast(exit_num & 0x3f))) |name| {
+                        posix.writeAll(1, name);
+                        posix.writeAll(1, "\n");
+                    } else {
+                        posix.writeAll(2, "kill: invalid signal number: ");
+                        posix.writeAll(2, arg);
+                        posix.writeAll(2, "\n");
+                        status = 1;
+                    }
+                } else |_| {
+                    if (sigFromName(arg)) |n| {
+                        var buf: [8]u8 = undefined;
+                        const s = std.fmt.bufPrint(&buf, "{d}\n", .{n}) catch continue;
+                        posix.writeAll(1, s);
+                    } else {
+                        posix.writeAll(2, "kill: invalid signal: ");
+                        posix.writeAll(2, arg);
+                        posix.writeAll(2, "\n");
+                        status = 1;
+                    }
                 }
             }
-            return 0;
+            return status;
         }
-        posix.writeAll(1, "HUP INT QUIT ABRT KILL USR1 USR2 PIPE ALRM TERM CHLD CONT STOP TSTP TTIN TTOU\n");
+        var i: u6 = 1;
+        while (i < 32) : (i += 1) {
+            if (signals.sigNameFromNum(i)) |name| {
+                var buf: [8]u8 = undefined;
+                const num_s = std.fmt.bufPrint(&buf, "{d:>2}) ", .{i}) catch continue;
+                posix.writeAll(1, num_s);
+                posix.writeAll(1, "SIG");
+                posix.writeAll(1, name);
+                posix.writeAll(1, "\n");
+            }
+        }
         return 0;
     }
 
-    if (std.mem.eql(u8, args[1], "-s")) {
+    if (std.mem.eql(u8, args[1], "-n")) {
+        if (args.len < 3) {
+            posix.writeAll(2, "kill: -n requires a signal number\n");
+            return 2;
+        }
+        sig = std.fmt.parseInt(u6, args[2], 10) catch {
+            posix.writeAll(2, "kill: invalid signal number: ");
+            posix.writeAll(2, args[2]);
+            posix.writeAll(2, "\n");
+            return 1;
+        };
+        start = 3;
+    } else if (std.mem.eql(u8, args[1], "-s")) {
         if (args.len < 3) {
             posix.writeAll(2, "kill: -s requires a signal name\n");
             return 2;
@@ -843,54 +1242,174 @@ fn builtinKill(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
-    if (args.len == 2 and std.mem.eql(u8, args[1], "-l")) {
+    var operand_start: usize = 1;
+    var print_mode = false;
+    var list_mode = false;
+
+    while (operand_start < args.len) {
+        const arg = args[operand_start];
+        if (arg.len == 0 or arg[0] != '-' or arg.len == 1) break;
+        if (std.mem.eql(u8, arg, "--")) {
+            operand_start += 1;
+            break;
+        }
+        if (std.mem.eql(u8, arg, "-p")) {
+            print_mode = true;
+            operand_start += 1;
+        } else if (std.mem.eql(u8, arg, "-l")) {
+            list_mode = true;
+            operand_start += 1;
+        } else {
+            posix.writeAll(2, "trap: invalid option: ");
+            posix.writeAll(2, arg);
+            posix.writeAll(2, "\n");
+            return 2;
+        }
+    }
+
+    if (list_mode) {
         posix.writeAll(1, "EXIT HUP INT QUIT TERM USR1 USR2 ERR\n");
         return 0;
     }
-    if (args.len == 1 or (args.len == 2 and std.mem.eql(u8, args[1], "-p"))) {
+
+    const operands = args[operand_start..];
+
+    if (print_mode) {
+        if (operands.len == 0) {
+            printTraps();
+        } else {
+            for (operands) |sig_name| {
+                printSpecificTrap(sig_name);
+            }
+        }
+        return 0;
+    }
+
+    if (operands.len == 0) {
         printTraps();
         return 0;
     }
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "-p")) {
-        for (args[2..]) |sig_name| {
-            printSpecificTrap(sig_name);
+
+    if (operands.len == 1) {
+        if (!trapResetSignal(operands[0], env)) {
+            posix.writeAll(2, "trap: invalid signal: ");
+            posix.writeAll(2, operands[0]);
+            posix.writeAll(2, "\n");
+            return 1;
         }
         return 0;
     }
-    if (args.len < 3) {
-        return 0;
+
+    if (isUnsignedInt(operands[0])) {
+        var status: u8 = 0;
+        for (operands) |sig_name| {
+            if (!trapResetSignal(sig_name, env)) {
+                posix.writeAll(2, "trap: invalid signal: ");
+                posix.writeAll(2, sig_name);
+                posix.writeAll(2, "\n");
+                status = 1;
+            }
+        }
+        return status;
     }
 
-    const action_src = args[1];
-    const reset = std.mem.eql(u8, action_src, "-") or std.mem.eql(u8, action_src, "");
-    const action = if (!reset) (env.alloc.dupe(u8, action_src) catch return 1) else @as(?[]const u8, null);
+    const action_src = operands[0];
+    const conditions = operands[1..];
 
-    for (args[2..]) |sig_name| {
-        if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
-            if (signals.getExitTrap()) |old| env.alloc.free(old);
-            signals.setExitTrap(action);
-            continue;
+    if (std.mem.eql(u8, action_src, "-")) {
+        var status: u8 = 0;
+        for (conditions) |sig_name| {
+            if (!trapResetSignal(sig_name, env)) {
+                posix.writeAll(2, "trap: invalid signal: ");
+                posix.writeAll(2, sig_name);
+                posix.writeAll(2, "\n");
+                status = 1;
+            }
         }
-        if (std.mem.eql(u8, sig_name, "ERR")) {
-            if (signals.getErrTrap()) |old| env.alloc.free(old);
-            signals.setErrTrap(action);
-            continue;
+        return status;
+    }
+
+    const action = env.alloc.dupe(u8, action_src) catch return 1;
+    var status: u8 = 0;
+
+    if (action.len > 0) {
+        var arena = std.heap.ArenaAllocator.init(env.alloc);
+        defer arena.deinit();
+        var test_lexer = @import("lexer.zig").Lexer.init(action);
+        var test_parser = @import("parser.zig").Parser.init(arena.allocator(), &test_lexer) catch {
+            status = 1;
+            env.alloc.free(action);
+            return status;
+        };
+        _ = test_parser.parseProgram() catch {
+            posix.writeAll(2, "trap: invalid code: ");
+            posix.writeAll(2, action);
+            posix.writeAll(2, "\n");
+            status = 1;
+        };
+        if (status != 0) {
+            env.alloc.free(action);
+            return status;
         }
-        const sig = sigFromName(sig_name) orelse {
+    }
+
+    var any_set = false;
+    for (conditions) |sig_name| {
+        if (!trapSetAction(sig_name, action, env)) {
             posix.writeAll(2, "trap: invalid signal: ");
             posix.writeAll(2, sig_name);
             posix.writeAll(2, "\n");
-            continue;
-        };
-        if (reset) {
-            if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
-            signals.setTrap(sig, null);
+            status = 1;
         } else {
-            if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
-            signals.setTrap(sig, action);
+            any_set = true;
         }
     }
-    return 0;
+    if (!any_set) {
+        env.alloc.free(action);
+    }
+    return status;
+}
+
+fn isUnsignedInt(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    return true;
+}
+
+fn trapResetSignal(sig_name: []const u8, env: *Environment) bool {
+    if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
+        if (signals.getExitTrap()) |old| env.alloc.free(old);
+        signals.setExitTrap(null);
+        return true;
+    }
+    if (std.mem.eql(u8, sig_name, "ERR")) {
+        if (signals.getErrTrap()) |old| env.alloc.free(old);
+        signals.setErrTrap(null);
+        return true;
+    }
+    const sig = sigFromName(sig_name) orelse return false;
+    if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
+    signals.setTrap(sig, null);
+    return true;
+}
+
+fn trapSetAction(sig_name: []const u8, action: ?[]const u8, env: *Environment) bool {
+    if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
+        if (signals.getExitTrap()) |old| env.alloc.free(old);
+        signals.setExitTrap(action);
+        return true;
+    }
+    if (std.mem.eql(u8, sig_name, "ERR")) {
+        if (signals.getErrTrap()) |old| env.alloc.free(old);
+        signals.setErrTrap(action);
+        return true;
+    }
+    const sig = sigFromName(sig_name) orelse return false;
+    if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
+    signals.setTrap(sig, action);
+    return true;
 }
 
 fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
@@ -946,6 +1465,10 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     var raw = false;
     var prompt: ?[]const u8 = null;
     var delim: u8 = '\n';
+    var use_nul_delim = false;
+    var nchars: ?usize = null;
+    var nchars_exact = false;
+    var read_fd: types.Fd = types.STDIN;
     var arg_start: usize = 1;
 
     while (arg_start < args.len) {
@@ -959,6 +1482,7 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
         while (j < arg.len) : (j += 1) {
             switch (arg[j]) {
                 'r' => raw = true,
+                's' => {},
                 'p' => {
                     if (j + 1 < arg.len) {
                         prompt = arg[j + 1 ..];
@@ -973,7 +1497,70 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
                         delim = arg[j + 1];
                     } else if (arg_start + 1 < args.len) {
                         arg_start += 1;
-                        if (args[arg_start].len > 0) delim = args[arg_start][0];
+                        if (args[arg_start].len > 0) {
+                            delim = args[arg_start][0];
+                        } else {
+                            delim = 0;
+                            use_nul_delim = true;
+                        }
+                    }
+                    break;
+                },
+                'n', 'N' => {
+                    nchars_exact = arg[j] == 'N';
+                    if (j + 1 < arg.len) {
+                        nchars = std.fmt.parseInt(usize, arg[j + 1 ..], 10) catch {
+                            posix.writeAll(2, "read: invalid count\n");
+                            return 2;
+                        };
+                    } else if (arg_start + 1 < args.len) {
+                        arg_start += 1;
+                        nchars = std.fmt.parseInt(usize, args[arg_start], 10) catch {
+                            posix.writeAll(2, "read: invalid count\n");
+                            return 2;
+                        };
+                    }
+                    break;
+                },
+                't' => {
+                    var timeout_str: ?[]const u8 = null;
+                    if (j + 1 < arg.len) {
+                        timeout_str = arg[j + 1 ..];
+                    } else if (arg_start + 1 < args.len) {
+                        arg_start += 1;
+                        timeout_str = args[arg_start];
+                    }
+                    if (timeout_str) |ts| {
+                        const tval = std.fmt.parseFloat(f64, ts) catch 0;
+                        if (tval < 0) return 2;
+                        if (tval == 0) {
+                            var poll_fds = [_]std.posix.pollfd{.{
+                                .fd = read_fd,
+                                .events = 1,
+                                .revents = 0,
+                            }};
+                            const poll_result = std.posix.poll(&poll_fds, 0) catch return 1;
+                            if (poll_result == 0) return 1;
+                        }
+                    }
+                    break;
+                },
+                'u' => {
+                    if (j + 1 < arg.len) {
+                        read_fd = std.fmt.parseInt(types.Fd, arg[j + 1 ..], 10) catch {
+                            posix.writeAll(2, "read: invalid fd\n");
+                            return 2;
+                        };
+                    } else if (arg_start + 1 < args.len) {
+                        arg_start += 1;
+                        read_fd = std.fmt.parseInt(types.Fd, args[arg_start], 10) catch {
+                            posix.writeAll(2, "read: invalid fd\n");
+                            return 2;
+                        };
+                    }
+                    if (read_fd < 0) {
+                        posix.writeAll(2, "read: invalid fd\n");
+                        return 2;
                     }
                     break;
                 },
@@ -995,9 +1582,10 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     var total: usize = 0;
     var hit_eof = false;
 
-    if (raw) {
-        while (total < buf.len) {
-            const n = posix.read(0, buf[total .. total + 1]) catch {
+    const max_chars = nchars orelse buf.len;
+    if (raw or nchars != null) {
+        while (total < buf.len and total < max_chars) {
+            const n = posix.read(read_fd, buf[total .. total + 1]) catch {
                 hit_eof = true;
                 break;
             };
@@ -1005,13 +1593,13 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
                 hit_eof = true;
                 break;
             }
-            if (buf[total] == delim) break;
+            if (!nchars_exact and ((use_nul_delim and buf[total] == 0) or (!use_nul_delim and buf[total] == delim))) break;
             total += 1;
         }
     } else {
         while (total < buf.len) {
             var byte_buf: [1]u8 = undefined;
-            const n = posix.read(0, &byte_buf) catch {
+            const n = posix.read(read_fd, &byte_buf) catch {
                 hit_eof = true;
                 break;
             };
@@ -1020,9 +1608,9 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
                 break;
             }
             const ch = byte_buf[0];
-            if (ch == delim) break;
+            if ((use_nul_delim and ch == 0) or (!use_nul_delim and ch == delim)) break;
             if (ch == '\\') {
-                const n2 = posix.read(0, &byte_buf) catch {
+                const n2 = posix.read(read_fd, &byte_buf) catch {
                     hit_eof = true;
                     break;
                 };
@@ -1044,11 +1632,15 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     const ifs = env.ifs;
 
     if (effective_names.len == 1) {
-        var start: usize = 0;
-        while (start < line.len and isIfsWhitespace(line[start], ifs)) : (start += 1) {}
-        var end: usize = line.len;
-        while (end > start and isIfsWhitespace(line[end - 1], ifs)) : (end -= 1) {}
-        env.set(effective_names[0], line[start..end], false) catch return 1;
+        if (nchars_exact or var_names.len == 0) {
+            env.set(effective_names[0], line, false) catch return 1;
+        } else {
+            var start: usize = 0;
+            while (start < line.len and isIfsWhitespace(line[start], ifs)) : (start += 1) {}
+            var end: usize = line.len;
+            while (end > start and isIfsWhitespace(line[end - 1], ifs)) : (end -= 1) {}
+            env.set(effective_names[0], line[start..end], false) catch return 1;
+        }
         return if (hit_eof) 1 else 0;
     }
 
@@ -1108,9 +1700,9 @@ fn printfProcessEscape(fmt: []const u8) struct { byte: u8, advance: usize } {
         'r' => return .{ .byte = '\r', .advance = 2 },
         't' => return .{ .byte = '\t', .advance = 2 },
         'v' => return .{ .byte = 0x0b, .advance = 2 },
-        '0' => {
-            var val: u8 = 0;
-            var count: usize = 0;
+        '0'...'7' => {
+            var val: u8 = fmt[1] - '0';
+            var count: usize = 1;
             var i: usize = 2;
             while (i < fmt.len and count < 3 and fmt[i] >= '0' and fmt[i] <= '7') : (i += 1) {
                 val = val *% 8 +% (fmt[i] - '0');
@@ -1129,7 +1721,77 @@ fn printfProcessEscape(fmt: []const u8) struct { byte: u8, advance: usize } {
             }
             return .{ .byte = val, .advance = i };
         },
-        else => return .{ .byte = fmt[1], .advance = 2 },
+        else => return .{ .byte = '\\', .advance = 1 },
+    }
+}
+
+fn printfWriteUtf8(codepoint: u21) void {
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(codepoint, &buf) catch {
+        posix.writeAll(1, "\xef\xbf\xbd");
+        return;
+    };
+    posix.writeAll(1, buf[0..len]);
+}
+
+fn printfProcessBEscape(fmt: []const u8) struct { byte: u8, advance: usize, is_unicode: bool, codepoint: u21 } {
+    if (fmt.len < 2 or fmt[0] != '\\') return .{ .byte = fmt[0], .advance = 1, .is_unicode = false, .codepoint = 0 };
+    switch (fmt[1]) {
+        '\\' => return .{ .byte = '\\', .advance = 2, .is_unicode = false, .codepoint = 0 },
+        'a' => return .{ .byte = 0x07, .advance = 2, .is_unicode = false, .codepoint = 0 },
+        'b' => return .{ .byte = 0x08, .advance = 2, .is_unicode = false, .codepoint = 0 },
+        'f' => return .{ .byte = 0x0c, .advance = 2, .is_unicode = false, .codepoint = 0 },
+        'n' => return .{ .byte = '\n', .advance = 2, .is_unicode = false, .codepoint = 0 },
+        'r' => return .{ .byte = '\r', .advance = 2, .is_unicode = false, .codepoint = 0 },
+        't' => return .{ .byte = '\t', .advance = 2, .is_unicode = false, .codepoint = 0 },
+        'v' => return .{ .byte = 0x0b, .advance = 2, .is_unicode = false, .codepoint = 0 },
+        '0' => {
+            var val: u8 = 0;
+            var count: usize = 0;
+            var i: usize = 2;
+            while (i < fmt.len and count < 3 and fmt[i] >= '0' and fmt[i] <= '7') : (i += 1) {
+                val = val *% 8 +% (fmt[i] - '0');
+                count += 1;
+            }
+            return .{ .byte = val, .advance = i, .is_unicode = false, .codepoint = 0 };
+        },
+        '1'...'7' => {
+            var val: u8 = fmt[1] - '0';
+            var count: usize = 1;
+            var i: usize = 2;
+            while (i < fmt.len and count < 3 and fmt[i] >= '0' and fmt[i] <= '7') : (i += 1) {
+                val = val *% 8 +% (fmt[i] - '0');
+                count += 1;
+            }
+            return .{ .byte = val, .advance = i, .is_unicode = false, .codepoint = 0 };
+        },
+        'x' => {
+            var val: u8 = 0;
+            var count: usize = 0;
+            var i: usize = 2;
+            while (i < fmt.len and count < 2) : (i += 1) {
+                const d = hexDigit(fmt[i]) orelse break;
+                val = val *% 16 +% d;
+                count += 1;
+            }
+            return .{ .byte = val, .advance = i, .is_unicode = false, .codepoint = 0 };
+        },
+        'u', 'U' => {
+            const max_digits: usize = if (fmt[1] == 'u') 4 else 8;
+            var codepoint: u21 = 0;
+            var j: usize = 2;
+            var count: usize = 0;
+            while (j < fmt.len and count < max_digits) : (j += 1) {
+                const d = hexDigit(fmt[j]) orelse break;
+                codepoint = codepoint * 16 + @as(u21, d);
+                count += 1;
+            }
+            if (count > 0) {
+                return .{ .byte = 0, .advance = j, .is_unicode = true, .codepoint = codepoint };
+            }
+            return .{ .byte = '\\', .advance = 1, .is_unicode = false, .codepoint = 0 };
+        },
+        else => return .{ .byte = '\\', .advance = 1, .is_unicode = false, .codepoint = 0 },
     }
 }
 
@@ -1200,29 +1862,149 @@ fn printfGetNextArg(arg_args: []const []const u8, arg_idx: *usize) []const u8 {
 
 fn printfParseNumericArg(arg: []const u8, had_error: *bool) i64 {
     if (arg.len == 0) return 0;
-    if (arg.len >= 2 and arg[0] == '\'') {
-        return @intCast(arg[1]);
-    }
-    if (arg.len >= 2 and arg[0] == '"') {
-        return @intCast(arg[1]);
-    }
+
     var s = arg;
+    while (s.len > 0 and s[0] == ' ') s = s[1..];
+    if (s.len == 0) return 0;
+
+    if (s.len >= 2 and (s[0] == '\'' or s[0] == '"')) {
+        const bytes = s[1..];
+        if (bytes.len == 0) return 0;
+        const b0 = bytes[0];
+        if (b0 < 0x80) return @intCast(b0);
+        if (b0 & 0xE0 == 0xC0 and bytes.len >= 2) return @as(i64, b0 & 0x1F) << 6 | @as(i64, bytes[1] & 0x3F);
+        if (b0 & 0xF0 == 0xE0 and bytes.len >= 3) return @as(i64, b0 & 0x0F) << 12 | @as(i64, bytes[1] & 0x3F) << 6 | @as(i64, bytes[2] & 0x3F);
+        if (b0 & 0xF8 == 0xF0 and bytes.len >= 4) return @as(i64, b0 & 0x07) << 18 | @as(i64, bytes[1] & 0x3F) << 12 | @as(i64, bytes[2] & 0x3F) << 6 | @as(i64, bytes[3] & 0x3F);
+        return @intCast(b0);
+    }
+
+    var end = s.len;
+    while (end > 0 and s[end - 1] == ' ') end -= 1;
+    const has_trailing_space = end < s.len;
+    s = s[0..end];
+    if (s.len == 0) return 0;
+
+    if (std.mem.indexOfScalar(u8, s, '#') != null) {
+        had_error.* = true;
+        printfNumericError(arg);
+        return 0;
+    }
+
     var negative = false;
-    if (s.len > 0 and s[0] == '-') {
+    var sign_len: usize = 0;
+    if (s[0] == '-') {
         negative = true;
-        s = s[1..];
-    } else if (s.len > 0 and s[0] == '+') {
-        s = s[1..];
+        sign_len = 1;
+    } else if (s[0] == '+') {
+        sign_len = 1;
     }
-    if (s.len >= 2 and s[0] == '0' and s[1] != 'x' and s[1] != 'X') {
-        if (std.fmt.parseInt(i64, s, 8)) |v| return if (negative) -v else v else |_| {}
+
+    const num_part = s[sign_len..];
+    if (num_part.len == 0) {
+        had_error.* = true;
+        printfNumericError(arg);
+        return 0;
     }
-    if (std.fmt.parseInt(i64, arg, 0)) |v| return v else |_| {}
+
+    if (has_trailing_space) {
+        had_error.* = true;
+        printfNumericError(arg);
+    }
+
+    if (num_part.len >= 2 and num_part[0] == '0' and num_part[1] != 'x' and num_part[1] != 'X') {
+        if (std.fmt.parseInt(i64, num_part, 8)) |v| {
+            return if (negative) -v else v;
+        } else |_| {}
+    }
+
+    if (std.fmt.parseInt(i64, s, 0)) |v| return v else |_| {}
+
     had_error.* = true;
+    if (!has_trailing_space) printfNumericError(arg);
+
+    var base: u8 = 10;
+    var prefix_start = sign_len;
+    if (num_part.len >= 2 and num_part[0] == '0' and (num_part[1] == 'x' or num_part[1] == 'X')) {
+        base = 16;
+        prefix_start = sign_len + 2;
+    } else if (num_part.len >= 1 and num_part[0] == '0') {
+        base = 8;
+    }
+
+    var valid_end = prefix_start;
+    while (valid_end < s.len) {
+        const ch = s[valid_end];
+        const is_valid = switch (base) {
+            16 => std.ascii.isDigit(ch) or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F'),
+            8 => ch >= '0' and ch <= '7',
+            else => std.ascii.isDigit(ch),
+        };
+        if (!is_valid) break;
+        valid_end += 1;
+    }
+
+    if (valid_end > prefix_start) {
+        if (std.fmt.parseInt(i64, s[0..valid_end], 0)) |v| return v else |_| {}
+        const abs_part = s[sign_len..valid_end];
+        if (std.fmt.parseInt(i64, abs_part, base)) |v| return if (negative) -v else v else |_| {}
+    }
+
+    return 0;
+}
+
+fn printfParseFloatArg(arg: []const u8, had_error: *bool) f64 {
+    if (arg.len == 0) return 0.0;
+    var s = arg;
+    while (s.len > 0 and s[0] == ' ') s = s[1..];
+    if (s.len == 0) return 0.0;
+    if (s.len >= 2 and (s[0] == '\'' or s[0] == '"')) {
+        return @floatFromInt(@as(i64, s[1]));
+    }
+    return std.fmt.parseFloat(f64, s) catch {
+        had_error.* = true;
+        posix.writeAll(2, "printf: '");
+        posix.writeAll(2, arg);
+        posix.writeAll(2, "': not a valid number\n");
+        return 0.0;
+    };
+}
+
+fn printfFormatFloat(value: f64, spec: PrintfSpec) void {
+    var c_fmt: [64]u8 = undefined;
+    var fi: usize = 0;
+    c_fmt[fi] = '%';
+    fi += 1;
+    if (spec.flag_minus) { c_fmt[fi] = '-'; fi += 1; }
+    if (spec.flag_plus) { c_fmt[fi] = '+'; fi += 1; }
+    if (spec.flag_space) { c_fmt[fi] = ' '; fi += 1; }
+    if (spec.flag_zero) { c_fmt[fi] = '0'; fi += 1; }
+    if (spec.flag_hash) { c_fmt[fi] = '#'; fi += 1; }
+    if (spec.width > 0) {
+        const w = std.fmt.bufPrint(c_fmt[fi..], "{d}", .{spec.width}) catch return;
+        fi += w.len;
+    }
+    if (spec.precision) |p| {
+        c_fmt[fi] = '.';
+        fi += 1;
+        const ps = std.fmt.bufPrint(c_fmt[fi..], "{d}", .{p}) catch return;
+        fi += ps.len;
+    }
+    c_fmt[fi] = spec.conversion;
+    fi += 1;
+    c_fmt[fi] = 0;
+
+    var out_buf: [256]u8 = undefined;
+    const c_snprintf = @extern(*const fn ([*]u8, usize, [*:0]const u8, ...) callconv(.c) c_int, .{ .name = "snprintf" });
+    const n = c_snprintf(&out_buf, out_buf.len, @ptrCast(&c_fmt), value);
+    if (n > 0) {
+        posix.writeAll(1, out_buf[0..@intCast(n)]);
+    }
+}
+
+fn printfNumericError(arg: []const u8) void {
     posix.writeAll(2, "printf: '");
     posix.writeAll(2, arg);
     posix.writeAll(2, "': not a valid number\n");
-    return 0;
 }
 
 fn printfWritePadding(ch: u8, count: usize) void {
@@ -1256,15 +2038,31 @@ fn printfFormatBString(arg: []const u8, spec: PrintfSpec, early_exit: *bool) voi
     var out_buf: [4096]u8 = undefined;
     var out_len: usize = 0;
     var i: usize = 0;
-    while (i < arg.len and out_len < out_buf.len) {
+    while (i < arg.len and out_len + 4 < out_buf.len) {
         if (arg[i] == '\\') {
             if (i + 1 < arg.len and arg[i + 1] == 'c') {
                 early_exit.* = true;
                 break;
             }
-            const esc = printfProcessEscape(arg[i..]);
-            out_buf[out_len] = esc.byte;
-            out_len += 1;
+            const esc = printfProcessBEscape(arg[i..]);
+            if (esc.is_unicode) {
+                var utf8_buf: [4]u8 = undefined;
+                const utf8_len = std.unicode.utf8Encode(esc.codepoint, &utf8_buf) catch blk: {
+                    utf8_buf[0] = 0xef;
+                    utf8_buf[1] = 0xbf;
+                    utf8_buf[2] = 0xbd;
+                    break :blk @as(u3, 3);
+                };
+                for (utf8_buf[0..utf8_len]) |b| {
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = b;
+                        out_len += 1;
+                    }
+                }
+            } else {
+                out_buf[out_len] = esc.byte;
+                out_len += 1;
+            }
             i += esc.advance;
         } else {
             out_buf[out_len] = arg[i];
@@ -1377,6 +2175,141 @@ fn printfFormatInt(value: i64, spec: PrintfSpec) void {
     }
 }
 
+fn printfFormatQString(arg: []const u8, spec: PrintfSpec) void {
+    if (arg.len == 0) {
+        const quoted = "''";
+        if (spec.width > quoted.len) {
+            if (spec.flag_minus) {
+                posix.writeAll(1, quoted);
+                printfWritePadding(' ', spec.width - quoted.len);
+            } else {
+                printfWritePadding(' ', spec.width - quoted.len);
+                posix.writeAll(1, quoted);
+            }
+        } else {
+            posix.writeAll(1, quoted);
+        }
+        return;
+    }
+
+    var needs_quoting = false;
+    var has_special = false;
+    for (arg) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '/', '.', '-', '+', ':', ',', '@', '%', '^' => {},
+            '\n', '\r', '\t', 0x01...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0xff => {
+                has_special = true;
+                needs_quoting = true;
+            },
+            else => {
+                needs_quoting = true;
+            },
+        }
+    }
+
+    if (!needs_quoting) {
+        printfFormatString(arg, spec);
+        return;
+    }
+
+    var buf: [8192]u8 = undefined;
+    var len: usize = 0;
+
+    if (has_special) {
+        buf[len] = '$';
+        len += 1;
+        buf[len] = '\'';
+        len += 1;
+        for (arg) |ch| {
+            if (len + 10 >= buf.len) break;
+            switch (ch) {
+                '\'' => {
+                    buf[len] = '\\';
+                    buf[len + 1] = '\'';
+                    len += 2;
+                },
+                '\\' => {
+                    buf[len] = '\\';
+                    buf[len + 1] = '\\';
+                    len += 2;
+                },
+                '\n' => {
+                    buf[len] = '\\';
+                    buf[len + 1] = 'n';
+                    len += 2;
+                },
+                '\r' => {
+                    buf[len] = '\\';
+                    buf[len + 1] = 'r';
+                    len += 2;
+                },
+                '\t' => {
+                    buf[len] = '\\';
+                    buf[len + 1] = 't';
+                    len += 2;
+                },
+                0x07 => {
+                    buf[len] = '\\';
+                    buf[len + 1] = 'a';
+                    len += 2;
+                },
+                0x08 => {
+                    buf[len] = '\\';
+                    buf[len + 1] = 'b';
+                    len += 2;
+                },
+                else => {
+                    if (ch < 0x20 or ch >= 0x7f) {
+                        const hex = std.fmt.bufPrint(buf[len..], "\\u{x:0>4}", .{ch}) catch break;
+                        len += hex.len;
+                    } else {
+                        buf[len] = ch;
+                        len += 1;
+                    }
+                },
+            }
+        }
+        if (len + 1 < buf.len) {
+            buf[len] = '\'';
+            len += 1;
+        }
+    } else {
+        buf[len] = '\'';
+        len += 1;
+        for (arg) |ch| {
+            if (ch == '\'') {
+                if (len + 4 >= buf.len) break;
+                buf[len] = '\'';
+                buf[len + 1] = '\\';
+                buf[len + 2] = '\'';
+                buf[len + 3] = '\'';
+                len += 4;
+            } else {
+                if (len + 1 >= buf.len) break;
+                buf[len] = ch;
+                len += 1;
+            }
+        }
+        if (len + 1 < buf.len) {
+            buf[len] = '\'';
+            len += 1;
+        }
+    }
+
+    const result = buf[0..len];
+    if (spec.width > result.len) {
+        if (spec.flag_minus) {
+            posix.writeAll(1, result);
+            printfWritePadding(' ', spec.width - result.len);
+        } else {
+            printfWritePadding(' ', spec.width - result.len);
+            posix.writeAll(1, result);
+        }
+    } else {
+        posix.writeAll(1, result);
+    }
+}
+
 fn printfFormatChar(arg: []const u8, spec: PrintfSpec) void {
     const ch: [1]u8 = .{if (arg.len > 0) arg[0] else 0};
     if (spec.width > 1) {
@@ -1398,10 +2331,29 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
 
     while (i < fmt.len) {
         if (fmt[i] == '\\') {
-            const esc = printfProcessEscape(fmt[i..]);
-            const byte_arr: [1]u8 = .{esc.byte};
-            posix.writeAll(1, &byte_arr);
-            i += esc.advance;
+            if (i + 1 < fmt.len and (fmt[i + 1] == 'u' or fmt[i + 1] == 'U')) {
+                const max_digits: usize = if (fmt[i + 1] == 'u') 4 else 8;
+                var codepoint: u21 = 0;
+                var j: usize = i + 2;
+                var count: usize = 0;
+                while (j < fmt.len and count < max_digits) : (j += 1) {
+                    const d = hexDigit(fmt[j]) orelse break;
+                    codepoint = codepoint * 16 + d;
+                    count += 1;
+                }
+                if (count > 0) {
+                    printfWriteUtf8(codepoint);
+                    i = j;
+                } else {
+                    posix.writeAll(1, "\\");
+                    i += 1;
+                }
+            } else {
+                const esc = printfProcessEscape(fmt[i..]);
+                const byte_arr: [1]u8 = .{esc.byte};
+                posix.writeAll(1, &byte_arr);
+                i += esc.advance;
+            }
         } else if (fmt[i] == '%') {
             if (i + 1 < fmt.len and fmt[i + 1] == '%') {
                 posix.writeAll(1, "%");
@@ -1454,9 +2406,20 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
                     if (had_error) status = 1;
                     printfFormatInt(val, spec);
                 },
+                'q' => {
+                    const arg = printfGetNextArg(printf_args, arg_idx);
+                    printfFormatQString(arg, spec);
+                },
                 'c' => {
                     const arg = printfGetNextArg(printf_args, arg_idx);
                     printfFormatChar(arg, spec);
+                },
+                'f', 'F', 'e', 'E', 'g', 'G' => {
+                    const arg = printfGetNextArg(printf_args, arg_idx);
+                    var had_error = false;
+                    const val = printfParseFloatArg(arg, &had_error);
+                    if (had_error) status = 1;
+                    printfFormatFloat(val, spec);
                 },
                 0 => {
                     posix.writeAll(2, "printf: missing format character\n");
@@ -1481,27 +2444,87 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
     return .{ .status = status, .early_exit = false };
 }
 
-fn builtinPrintf(args: []const []const u8, _: *Environment) u8 {
+fn builtinPrintf(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
         posix.writeAll(2, "printf: usage: printf format [arguments]\n");
-        return 1;
+        return 2;
     }
 
-    const fmt = args[1];
-    const printf_args = if (args.len > 2) args[2..] else &[_][]const u8{};
+    var fmt_idx: usize = 1;
+    if (std.mem.eql(u8, args[1], "--")) {
+        fmt_idx = 2;
+        if (fmt_idx >= args.len) {
+            posix.writeAll(2, "printf: usage: printf format [arguments]\n");
+            return 2;
+        }
+    }
+
+    var var_name: ?[]const u8 = null;
+    if (fmt_idx < args.len and std.mem.eql(u8, args[fmt_idx], "-v")) {
+        fmt_idx += 1;
+        if (fmt_idx >= args.len) {
+            posix.writeAll(2, "printf: -v: option requires an argument\n");
+            return 2;
+        }
+        var_name = args[fmt_idx];
+        fmt_idx += 1;
+        if (fmt_idx >= args.len) {
+            posix.writeAll(2, "printf: usage: printf format [arguments]\n");
+            return 2;
+        }
+    }
+
+    const fmt = args[fmt_idx];
+    const printf_args = if (args.len > fmt_idx + 1) args[fmt_idx + 1 ..] else &[_][]const u8{};
     var arg_idx: usize = 0;
     var status: u8 = 0;
 
+    var saved_stdout: i32 = -1;
+    var pipe_fds: [2]i32 = .{ -1, -1 };
+    if (var_name != null) {
+        pipe_fds = posix.pipe() catch return 1;
+        saved_stdout = posix.dup(1) catch {
+            posix.close(pipe_fds[0]);
+            posix.close(pipe_fds[1]);
+            return 1;
+        };
+        posix.dup2(pipe_fds[1], 1) catch {
+            posix.close(saved_stdout);
+            posix.close(pipe_fds[0]);
+            posix.close(pipe_fds[1]);
+            return 1;
+        };
+        posix.close(pipe_fds[1]);
+    }
+
     const result = printfProcessFormat(fmt, printf_args, &arg_idx);
     if (result.status != 0) status = result.status;
-    if (result.early_exit) return status;
+    if (!result.early_exit and arg_idx > 0) {
+        while (arg_idx < printf_args.len) {
+            const prev_idx = arg_idx;
+            const loop_result = printfProcessFormat(fmt, printf_args, &arg_idx);
+            if (loop_result.status != 0) status = loop_result.status;
+            if (loop_result.early_exit) break;
+            if (arg_idx == prev_idx) break;
+        }
+    }
 
-    while (arg_idx < printf_args.len) {
-        const prev_idx = arg_idx;
-        const loop_result = printfProcessFormat(fmt, printf_args, &arg_idx);
-        if (loop_result.status != 0) status = loop_result.status;
-        if (loop_result.early_exit) return status;
-        if (arg_idx == prev_idx) break;
+    if (var_name) |vn| {
+        posix.dup2(saved_stdout, 1) catch {};
+        posix.close(saved_stdout);
+
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = posix.read(pipe_fds[0], &buf) catch break;
+            if (n == 0) break;
+            output.appendSlice(env.alloc, buf[0..n]) catch break;
+        }
+        posix.close(pipe_fds[0]);
+
+        const val = output.toOwnedSlice(env.alloc) catch return 1;
+        env.set(vn, val, false) catch {};
+        env.alloc.free(val);
     }
 
     return status;
@@ -1518,29 +2541,41 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
     }
 
     var symbolic_display = false;
+    var print_reusable = false;
     var arg_start: usize = 1;
-    if (std.mem.eql(u8, args[1], "-S")) {
-        symbolic_display = true;
-        arg_start = 2;
+    while (arg_start < args.len) {
+        if (std.mem.eql(u8, args[arg_start], "-S")) {
+            symbolic_display = true;
+            arg_start += 1;
+        } else if (std.mem.eql(u8, args[arg_start], "-p")) {
+            print_reusable = true;
+            arg_start += 1;
+        } else break;
     }
 
-    if (symbolic_display and arg_start >= args.len) {
+    if (arg_start >= args.len and (symbolic_display or print_reusable)) {
         const current = libc.umask(0);
         _ = libc.umask(current);
-        const perm: c_uint = ~current & 0o777;
-        var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "u={s}{s}{s},g={s}{s}{s},o={s}{s}{s}\n", .{
-            @as([]const u8, if (perm & 0o400 != 0) "r" else ""),
-            @as([]const u8, if (perm & 0o200 != 0) "w" else ""),
-            @as([]const u8, if (perm & 0o100 != 0) "x" else ""),
-            @as([]const u8, if (perm & 0o040 != 0) "r" else ""),
-            @as([]const u8, if (perm & 0o020 != 0) "w" else ""),
-            @as([]const u8, if (perm & 0o010 != 0) "x" else ""),
-            @as([]const u8, if (perm & 0o004 != 0) "r" else ""),
-            @as([]const u8, if (perm & 0o002 != 0) "w" else ""),
-            @as([]const u8, if (perm & 0o001 != 0) "x" else ""),
-        }) catch return 1;
-        posix.writeAll(1, s);
+        if (symbolic_display) {
+            const perm: c_uint = ~current & 0o777;
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "u={s}{s}{s},g={s}{s}{s},o={s}{s}{s}\n", .{
+                @as([]const u8, if (perm & 0o400 != 0) "r" else ""),
+                @as([]const u8, if (perm & 0o200 != 0) "w" else ""),
+                @as([]const u8, if (perm & 0o100 != 0) "x" else ""),
+                @as([]const u8, if (perm & 0o040 != 0) "r" else ""),
+                @as([]const u8, if (perm & 0o020 != 0) "w" else ""),
+                @as([]const u8, if (perm & 0o010 != 0) "x" else ""),
+                @as([]const u8, if (perm & 0o004 != 0) "r" else ""),
+                @as([]const u8, if (perm & 0o002 != 0) "w" else ""),
+                @as([]const u8, if (perm & 0o001 != 0) "x" else ""),
+            }) catch return 1;
+            posix.writeAll(1, s);
+        } else {
+            var buf: [16]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "umask {o:0>4}\n", .{current}) catch return 1;
+            posix.writeAll(1, s);
+        }
         return 0;
     }
 
@@ -1627,14 +2662,21 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) return 0;
     var status: u8 = 0;
     for (args[1..]) |name| {
-        if (env.getAlias(name)) |val| {
+        if (isShellKeyword(name)) {
+            posix.writeAll(1, name);
+            posix.writeAll(1, " is a shell keyword\n");
+        } else if (env.getAlias(name)) |val| {
             posix.writeAll(1, name);
             posix.writeAll(1, " is aliased to '");
             posix.writeAll(1, val);
             posix.writeAll(1, "'\n");
-        } else if (builtins.get(name) != null) {
+        } else if (builtins.get(name) != null or isExecutorBuiltin(name)) {
             posix.writeAll(1, name);
-            posix.writeAll(1, " is a shell builtin\n");
+            if (isSpecialBuiltin(name)) {
+                posix.writeAll(1, " is a special shell builtin\n");
+            } else {
+                posix.writeAll(1, " is a shell builtin\n");
+            }
         } else if (env.functions.get(name) != null) {
             posix.writeAll(1, name);
             posix.writeAll(1, " is a shell function\n");
@@ -1650,6 +2692,39 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
         }
     }
     return status;
+}
+
+fn isExecutorBuiltin(name: []const u8) bool {
+    const executor_builtins = [_][]const u8{
+        ".", "source", "eval", "exec", "command",
+    };
+    for (executor_builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+fn isShellKeyword(name: []const u8) bool {
+    const keywords = [_][]const u8{
+        "if", "then", "else", "elif", "fi", "do", "done",
+        "case", "esac", "while", "until", "for", "in",
+        "{", "}", "!", "[[", "]]",
+    };
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, name, kw)) return true;
+    }
+    return false;
+}
+
+fn isSpecialBuiltin(name: []const u8) bool {
+    const specials = [_][]const u8{
+        ":", ".", "break", "continue", "eval", "exec", "exit",
+        "export", "readonly", "set", "shift", "unset", "return", "trap", "times",
+    };
+    for (specials) |s| {
+        if (std.mem.eql(u8, name, s)) return true;
+    }
+    return false;
 }
 
 fn findInPath(name: []const u8, env: *const Environment) bool {
@@ -1693,6 +2768,20 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     }
     const raw_optstring = args[1];
     const varname = args[2];
+    if (varname.len == 0 or (varname[0] != '_' and !std.ascii.isAlphabetic(varname[0]))) {
+        posix.writeAll(2, "getopts: ");
+        posix.writeAll(2, varname);
+        posix.writeAll(2, ": invalid variable name\n");
+        return 2;
+    }
+    for (varname[1..]) |vc| {
+        if (vc != '_' and !std.ascii.isAlphanumeric(vc)) {
+            posix.writeAll(2, "getopts: ");
+            posix.writeAll(2, varname);
+            posix.writeAll(2, ": invalid variable name\n");
+            return 2;
+        }
+    }
     const params = if (args.len > 3) args[3..] else env.positional_params;
 
     const silent = raw_optstring.len > 0 and raw_optstring[0] == ':';
@@ -1709,13 +2798,22 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
 
     if (optind > params.len) {
         env.set(varname, "?", false) catch {};
+        _ = env.unset("OPTARG");
         return 1;
     }
 
     const current_arg = params[optind - 1];
 
     if (optpos_val == 0) {
-        if (current_arg.len < 2 or current_arg[0] != '-' or std.mem.eql(u8, current_arg, "--")) {
+        if (current_arg.len < 2 or current_arg[0] != '-') {
+            env.set(varname, "?", false) catch {};
+            return 1;
+        }
+        if (std.mem.eql(u8, current_arg, "--")) {
+            optind += 1;
+            var ind_buf2: [16]u8 = undefined;
+            const ind_str2 = std.fmt.bufPrint(&ind_buf2, "{d}", .{optind}) catch return 1;
+            env.set("OPTIND", ind_str2, false) catch {};
             env.set(varname, "?", false) catch {};
             return 1;
         }
@@ -1746,6 +2844,7 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
             env.set("OPTARG", val, false) catch {};
         } else {
             env.set(varname, "?", false) catch {};
+            _ = env.unset("OPTARG");
             posix.writeAll(2, "getopts: illegal option -- ");
             posix.writeAll(2, val);
             posix.writeAll(2, "\n");
@@ -1758,7 +2857,7 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     } else {
         env.set(varname, val, false) catch {};
         if (!expects_arg) {
-            env.unset("OPTARG");
+            env.set("OPTARG", "", false) catch {};
         }
         if (expects_arg) {
             if (optpos_val + 1 < current_arg.len) {
@@ -1784,7 +2883,7 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
                 var pos_buf: [16]u8 = undefined;
                 const pos_str = std.fmt.bufPrint(&pos_buf, "{d}", .{optpos_val}) catch return 1;
                 env.set("OPTPOS", pos_str, false) catch {};
-                return if (silent) 0 else 1;
+                return 0;
             }
             optind += 1;
             optpos_val = 0;
@@ -2152,36 +3251,39 @@ pub fn fcGetReexecCommand(extra_args: []const []const u8, history: *const LineEd
     return entry;
 }
 
+fn printTrapEntry(action: []const u8, name: []const u8) void {
+    posix.writeAll(1, "trap -- '");
+    posix.writeAll(1, action);
+    posix.writeAll(1, "' ");
+    posix.writeAll(1, name);
+    posix.writeAll(1, "\n");
+}
+
+const trap_sig_entries = [_]struct { num: u6, name: []const u8 }{
+    .{ .num = signals.SIGHUP, .name = "SIGHUP" },
+    .{ .num = signals.SIGINT, .name = "SIGINT" },
+    .{ .num = signals.SIGQUIT, .name = "SIGQUIT" },
+    .{ .num = signals.SIGABRT, .name = "SIGABRT" },
+    .{ .num = signals.SIGALRM, .name = "SIGALRM" },
+    .{ .num = signals.SIGTERM, .name = "SIGTERM" },
+    .{ .num = signals.SIGTSTP, .name = "SIGTSTP" },
+    .{ .num = signals.SIGCONT, .name = "SIGCONT" },
+    .{ .num = signals.SIGCHLD, .name = "SIGCHLD" },
+    .{ .num = signals.SIGUSR1, .name = "SIGUSR1" },
+    .{ .num = signals.SIGUSR2, .name = "SIGUSR2" },
+    .{ .num = signals.SIGPIPE, .name = "SIGPIPE" },
+};
+
 fn printTraps() void {
     if (signals.getExitTrap()) |action| {
-        posix.writeAll(1, "trap -- '");
-        posix.writeAll(1, action);
-        posix.writeAll(1, "' EXIT\n");
+        printTrapEntry(action, "EXIT");
     }
     if (signals.getErrTrap()) |action| {
-        posix.writeAll(1, "trap -- '");
-        posix.writeAll(1, action);
-        posix.writeAll(1, "' ERR\n");
+        printTrapEntry(action, "ERR");
     }
-    const sig_names = [_]struct { num: u6, name: []const u8 }{
-        .{ .num = signals.SIGHUP, .name = "HUP" },
-        .{ .num = signals.SIGINT, .name = "INT" },
-        .{ .num = signals.SIGQUIT, .name = "QUIT" },
-        .{ .num = signals.SIGTERM, .name = "TERM" },
-        .{ .num = signals.SIGTSTP, .name = "TSTP" },
-        .{ .num = signals.SIGCONT, .name = "CONT" },
-        .{ .num = signals.SIGCHLD, .name = "CHLD" },
-        .{ .num = signals.SIGUSR1, .name = "USR1" },
-        .{ .num = signals.SIGUSR2, .name = "USR2" },
-        .{ .num = signals.SIGPIPE, .name = "PIPE" },
-    };
-    for (sig_names) |entry| {
+    for (trap_sig_entries) |entry| {
         if (signals.trap_handlers[@intCast(entry.num)]) |action| {
-            posix.writeAll(1, "trap -- '");
-            posix.writeAll(1, action);
-            posix.writeAll(1, "' ");
-            posix.writeAll(1, entry.name);
-            posix.writeAll(1, "\n");
+            printTrapEntry(action, entry.name);
         }
     }
 }
@@ -2189,27 +3291,20 @@ fn printTraps() void {
 fn printSpecificTrap(sig_name: []const u8) void {
     if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
         if (signals.getExitTrap()) |action| {
-            posix.writeAll(1, "trap -- '");
-            posix.writeAll(1, action);
-            posix.writeAll(1, "' EXIT\n");
+            printTrapEntry(action, "EXIT");
         }
         return;
     }
     if (std.mem.eql(u8, sig_name, "ERR")) {
         if (signals.getErrTrap()) |action| {
-            posix.writeAll(1, "trap -- '");
-            posix.writeAll(1, action);
-            posix.writeAll(1, "' ERR\n");
+            printTrapEntry(action, "ERR");
         }
         return;
     }
     if (sigFromName(sig_name)) |sig| {
         if (signals.trap_handlers[@intCast(sig)]) |action| {
-            posix.writeAll(1, "trap -- '");
-            posix.writeAll(1, action);
-            posix.writeAll(1, "' ");
-            posix.writeAll(1, sig_name);
-            posix.writeAll(1, "\n");
+            const full_name = signals.sigFullName(sig) orelse sig_name;
+            printTrapEntry(action, full_name);
         }
     }
 }
@@ -2385,26 +3480,473 @@ fn builtinUlimit(args: []const []const u8, _: *Environment) u8 {
     return 0;
 }
 
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        const la = if (ca >= 'a' and ca <= 'z') ca - 32 else ca;
+        const lb = if (cb >= 'a' and cb <= 'z') cb - 32 else cb;
+        if (la != lb) return false;
+    }
+    return true;
+}
+
 fn sigFromName(name: []const u8) ?u6 {
-    if (std.fmt.parseInt(u6, name, 10)) |n| return n else |_| {}
-    const stripped = if (name.len > 3 and std.mem.eql(u8, name[0..3], "SIG")) name[3..] else name;
-    if (std.mem.eql(u8, stripped, "HUP")) return signals.SIGHUP;
-    if (std.mem.eql(u8, stripped, "INT")) return signals.SIGINT;
-    if (std.mem.eql(u8, stripped, "QUIT")) return signals.SIGQUIT;
-    if (std.mem.eql(u8, stripped, "ABRT")) return signals.SIGABRT;
-    if (std.mem.eql(u8, stripped, "KILL")) return signals.SIGKILL;
-    if (std.mem.eql(u8, stripped, "ALRM")) return signals.SIGALRM;
-    if (std.mem.eql(u8, stripped, "TERM")) return signals.SIGTERM;
-    if (std.mem.eql(u8, stripped, "TSTP")) return signals.SIGTSTP;
-    if (std.mem.eql(u8, stripped, "STOP")) return signals.SIGSTOP;
-    if (std.mem.eql(u8, stripped, "CONT")) return signals.SIGCONT;
-    if (std.mem.eql(u8, stripped, "CHLD")) return signals.SIGCHLD;
-    if (std.mem.eql(u8, stripped, "USR1")) return signals.SIGUSR1;
-    if (std.mem.eql(u8, stripped, "USR2")) return signals.SIGUSR2;
-    if (std.mem.eql(u8, stripped, "PIPE")) return signals.SIGPIPE;
-    if (std.mem.eql(u8, stripped, "TTIN")) return signals.SIGTTIN;
-    if (std.mem.eql(u8, stripped, "TTOU")) return signals.SIGTTOU;
+    const trimmed = std.mem.trim(u8, name, " \t");
+    if (std.fmt.parseInt(u6, trimmed, 10)) |n| {
+        if (n >= 32) return null;
+        return n;
+    } else |_| {}
+    const stripped = if (trimmed.len > 3 and eqlIgnoreCase(trimmed[0..3], "SIG")) trimmed[3..] else trimmed;
+    if (eqlIgnoreCase(stripped, "EXIT")) return 0;
+    if (eqlIgnoreCase(stripped, "HUP")) return 1;
+    if (eqlIgnoreCase(stripped, "INT")) return 2;
+    if (eqlIgnoreCase(stripped, "QUIT")) return 3;
+    if (eqlIgnoreCase(stripped, "ILL")) return 4;
+    if (eqlIgnoreCase(stripped, "TRAP")) return 5;
+    if (eqlIgnoreCase(stripped, "ABRT")) return 6;
+    if (eqlIgnoreCase(stripped, "BUS")) return 7;
+    if (eqlIgnoreCase(stripped, "FPE")) return 8;
+    if (eqlIgnoreCase(stripped, "KILL")) return 9;
+    if (eqlIgnoreCase(stripped, "USR1")) return 10;
+    if (eqlIgnoreCase(stripped, "SEGV")) return 11;
+    if (eqlIgnoreCase(stripped, "USR2")) return 12;
+    if (eqlIgnoreCase(stripped, "PIPE")) return 13;
+    if (eqlIgnoreCase(stripped, "ALRM")) return 14;
+    if (eqlIgnoreCase(stripped, "TERM")) return 15;
+    if (eqlIgnoreCase(stripped, "CHLD")) return 17;
+    if (eqlIgnoreCase(stripped, "CONT")) return 18;
+    if (eqlIgnoreCase(stripped, "STOP")) return 19;
+    if (eqlIgnoreCase(stripped, "TSTP")) return 20;
+    if (eqlIgnoreCase(stripped, "TTIN")) return 21;
+    if (eqlIgnoreCase(stripped, "TTOU")) return 22;
+    if (eqlIgnoreCase(stripped, "URG")) return 23;
+    if (eqlIgnoreCase(stripped, "XCPU")) return 24;
+    if (eqlIgnoreCase(stripped, "XFSZ")) return 25;
+    if (eqlIgnoreCase(stripped, "VTALRM")) return 26;
+    if (eqlIgnoreCase(stripped, "PROF")) return 27;
+    if (eqlIgnoreCase(stripped, "WINCH")) return 28;
+    if (eqlIgnoreCase(stripped, "IO")) return 29;
+    if (eqlIgnoreCase(stripped, "PWR")) return 30;
+    if (eqlIgnoreCase(stripped, "SYS")) return 31;
     return null;
+}
+
+fn builtinHistory(args: []const []const u8, _: *Environment) u8 {
+    if (args.len <= 1) return 0;
+    if (args.len == 2) {
+        const arg = args[1];
+        if (arg.len > 0 and arg[0] == '-') {
+            posix.writeAll(2, "history: ");
+            posix.writeAll(2, arg);
+            posix.writeAll(2, ": invalid option\n");
+            return 2;
+        }
+        if (std.fmt.parseInt(i64, arg, 10)) |_| {
+            return 0;
+        } else |_| {
+            posix.writeAll(2, "history: ");
+            posix.writeAll(2, arg);
+            posix.writeAll(2, ": numeric argument required\n");
+            return 2;
+        }
+    }
+    posix.writeAll(2, "history: too many arguments\n");
+    return 2;
+}
+
+fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
+    if (args.len < 2) return 0;
+    var flags_export = false;
+    var flags_readonly = false;
+    var flags_integer = false;
+    var flags_print = false;
+    var flags_unset_attrs = false;
+    var flags_func = false;
+    var flags_func_names = false;
+    var has_export = false;
+    var has_readonly = false;
+    var has_integer = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len < 2 or (arg[0] != '-' and arg[0] != '+')) break;
+        if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            break;
+        }
+        const removing = arg[0] == '+';
+        if (removing) flags_unset_attrs = true;
+        for (arg[1..]) |ch| {
+            switch (ch) {
+                'x' => {
+                    has_export = true;
+                    flags_export = !removing;
+                },
+                'r' => {
+                    has_readonly = true;
+                    flags_readonly = !removing;
+                },
+                'i' => {
+                    has_integer = true;
+                    flags_integer = !removing;
+                },
+                'p' => flags_print = true,
+                'f' => flags_func = true,
+                'F' => flags_func_names = true,
+                'a', 'A', 'n', 'g', 'l', 'u', 't' => {},
+                else => {},
+            }
+        }
+    }
+
+    if (flags_func_names or (flags_func and flags_print)) {
+        if (i >= args.len) {
+            var fit = env.functions.iterator();
+            while (fit.next()) |entry| {
+                posix.writeAll(1, "declare -f ");
+                posix.writeAll(1, entry.key_ptr.*);
+                posix.writeAll(1, "\n");
+            }
+            return 0;
+        }
+        var status: u8 = 0;
+        while (i < args.len) : (i += 1) {
+            if (env.functions.get(args[i])) |_| {
+                posix.writeAll(1, "declare -f ");
+                posix.writeAll(1, args[i]);
+                posix.writeAll(1, "\n");
+            } else {
+                status = 1;
+            }
+        }
+        return status;
+    }
+    if (flags_func and i < args.len) {
+        var status: u8 = 0;
+        while (i < args.len) : (i += 1) {
+            if (env.functions.get(args[i])) |fdef| {
+                posix.writeAll(1, args[i]);
+                posix.writeAll(1, " () {\n  ");
+                posix.writeAll(1, fdef.source);
+                posix.writeAll(1, "\n}\n");
+            } else {
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    if (flags_print and i >= args.len) {
+        var it = env.vars.iterator();
+        while (it.next()) |entry| {
+            posix.writeAll(1, "declare ");
+            if (entry.value_ptr.exported) posix.writeAll(1, "-x ");
+            if (entry.value_ptr.readonly) posix.writeAll(1, "-r ");
+            if (entry.value_ptr.integer) posix.writeAll(1, "-i ");
+            posix.writeAll(1, "-- ");
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "=");
+            setWriteValue(entry.value_ptr.value);
+            posix.writeAll(1, "\n");
+        }
+        return 0;
+    }
+    if (flags_print) {
+        var status: u8 = 0;
+        while (i < args.len) : (i += 1) {
+            const name = args[i];
+            if (env.get(name)) |val| {
+                posix.writeAll(1, "declare ");
+                if (env.vars.get(name)) |v| {
+                    if (v.exported) posix.writeAll(1, "-x ");
+                    if (v.readonly) posix.writeAll(1, "-r ");
+                    if (v.integer) posix.writeAll(1, "-i ");
+                }
+                posix.writeAll(1, "-- ");
+                posix.writeAll(1, name);
+                posix.writeAll(1, "=");
+                setWriteValue(val);
+                posix.writeAll(1, "\n");
+            } else {
+                posix.writeAll(2, "declare: ");
+                posix.writeAll(2, name);
+                posix.writeAll(2, ": not found\n");
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.indexOf(u8, arg, "=")) |eq| {
+            const name = arg[0..eq];
+            var val = arg[eq + 1 ..];
+            if (flags_integer) {
+                val = declareEvalInt(val, env);
+            }
+            env.set(name, val, flags_export) catch {};
+            if (flags_integer) {
+                if (env.vars.getPtr(name)) |v| v.integer = true;
+            }
+            if (flags_readonly) {
+                if (env.vars.getPtr(name)) |v| v.readonly = true;
+            }
+        } else {
+            if (flags_unset_attrs) {
+                if (env.vars.getPtr(arg)) |v| {
+                    if (has_integer) v.integer = false;
+                    if (has_export) v.exported = false;
+                    if (has_readonly) v.readonly = false;
+                }
+            } else {
+                if (env.vars.getPtr(arg)) |v| {
+                    if (flags_export) v.exported = true;
+                    if (flags_readonly) v.readonly = true;
+                    if (flags_integer) v.integer = true;
+                } else {
+                    env.set(arg, "", flags_export) catch {};
+                    if (flags_integer) {
+                        if (env.vars.getPtr(arg)) |v| v.integer = true;
+                    }
+                    if (flags_readonly) {
+                        if (env.vars.getPtr(arg)) |v| v.readonly = true;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn declareEvalInt(val: []const u8, env: *Environment) []const u8 {
+    if (val.len == 0) return "0";
+    const Arithmetic = @import("arithmetic.zig").Arithmetic;
+    const lookup_fn = struct {
+        var e: *Environment = undefined;
+        fn f(name: []const u8) ?[]const u8 {
+            return e.get(name);
+        }
+        fn setter(name: []const u8, v: i64) void {
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+            e.set(name, s, false) catch {};
+        }
+    };
+    lookup_fn.e = env;
+    const result = Arithmetic.evaluateWithSetter(val, &lookup_fn.f, &lookup_fn.setter) catch return val;
+    var buf: [32]u8 = undefined;
+    return std.fmt.bufPrint(&buf, "{d}", .{result}) catch val;
+}
+
+fn builtinLet(args: []const []const u8, env: *Environment) u8 {
+    if (args.len < 2) return 1;
+    const lookup_env = struct {
+        var e: *Environment = undefined;
+        fn f(name: []const u8) ?[]const u8 {
+            return e.get(name);
+        }
+        fn setter(name: []const u8, val: i64) void {
+            var buf: [32]u8 = undefined;
+            const val_str = std.fmt.bufPrint(&buf, "{d}", .{val}) catch return;
+            e.set(name, val_str, false) catch {};
+        }
+    };
+    lookup_env.e = env;
+    var result: i64 = 0;
+    for (args[1..]) |expr| {
+        result = @import("arithmetic.zig").Arithmetic.evaluateWithSetter(expr, &lookup_env.f, &lookup_env.setter) catch return 1;
+    }
+    return if (result != 0) 0 else 1;
+}
+
+const ShoptMode = enum { none, set, unset, query, print };
+
+fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
+    const Env = @import("env.zig").Environment;
+    var set_mode: ShoptMode = .none;
+    var use_set_o = false;
+    var arg_start: usize = 1;
+
+    while (arg_start < args.len) {
+        const a = args[arg_start];
+        if (a.len >= 2 and a[0] == '-') {
+            for (a[1..]) |ch| {
+                switch (ch) {
+                    's' => set_mode = .set,
+                    'u' => set_mode = .unset,
+                    'q' => set_mode = .query,
+                    'p' => set_mode = .print,
+                    'o' => use_set_o = true,
+                    else => {
+                        posix.writeAll(2, "shopt: invalid option: -");
+                        const arr: [1]u8 = .{ch};
+                        posix.writeAll(2, &arr);
+                        posix.writeAll(2, "\n");
+                        return 2;
+                    },
+                }
+            }
+            arg_start += 1;
+        } else break;
+    }
+
+    const opt_names = args[arg_start..];
+
+    if (use_set_o) {
+        return shoptSetO(opt_names, set_mode, env);
+    }
+
+    if (opt_names.len == 0) {
+        const pm = if (set_mode == .print) set_mode else .print;
+        _ = pm;
+        const fields = [_]struct { name: []const u8, val: *bool }{
+            .{ .name = "autocd", .val = &env.shopt.autocd },
+            .{ .name = "cdable_vars", .val = &env.shopt.cdable_vars },
+            .{ .name = "checkwinsize", .val = &env.shopt.checkwinsize },
+            .{ .name = "dotglob", .val = &env.shopt.dotglob },
+            .{ .name = "expand_aliases", .val = &env.shopt.expand_aliases },
+            .{ .name = "extglob", .val = &env.shopt.extglob },
+            .{ .name = "failglob", .val = &env.shopt.failglob },
+            .{ .name = "globstar", .val = &env.shopt.globstar },
+            .{ .name = "inherit_errexit", .val = &env.shopt.inherit_errexit },
+            .{ .name = "lastpipe", .val = &env.shopt.lastpipe },
+            .{ .name = "nocaseglob", .val = &env.shopt.nocaseglob },
+            .{ .name = "nocasematch", .val = &env.shopt.nocasematch },
+            .{ .name = "nullglob", .val = &env.shopt.nullglob },
+        };
+        var any_off = false;
+        for (fields) |f| {
+            if (set_mode == .set and !f.val.*) continue;
+            if (set_mode == .unset and f.val.*) continue;
+            if (set_mode != .query) {
+                posix.writeAll(1, "shopt ");
+                posix.writeAll(1, if (f.val.*) "-s " else "-u ");
+                posix.writeAll(1, f.name);
+                posix.writeAll(1, "\n");
+            }
+            if (!f.val.*) any_off = true;
+        }
+        if (set_mode == .query) return if (any_off) 1 else 0;
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (opt_names) |name| {
+        if (shoptGetField(&env.shopt, name)) |ptr| {
+            switch (set_mode) {
+                .set => ptr.* = true,
+                .unset => ptr.* = false,
+                .query => {
+                    if (!ptr.*) status = 1;
+                },
+                .print, .none => {
+                    posix.writeAll(1, "shopt ");
+                    posix.writeAll(1, if (ptr.*) "-s " else "-u ");
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "\n");
+                },
+            }
+        } else {
+            if (env.shopt.ignore_shopt_not_impl) {
+                continue;
+            }
+            if (set_mode == .query) {
+                status = 2;
+            } else {
+                posix.writeAll(2, "shopt: ");
+                posix.writeAll(2, name);
+                posix.writeAll(2, ": invalid shell option name\n");
+                status = if (set_mode == .set or set_mode == .unset) 1 else 2;
+            }
+        }
+    }
+    _ = Env;
+    return status;
+}
+
+fn shoptGetField(shopt: *@import("env.zig").Environment.ShoptOptions, name: []const u8) ?*bool {
+    const fields = .{
+        .{ "nullglob", &shopt.nullglob },
+        .{ "failglob", &shopt.failglob },
+        .{ "extglob", &shopt.extglob },
+        .{ "dotglob", &shopt.dotglob },
+        .{ "globstar", &shopt.globstar },
+        .{ "lastpipe", &shopt.lastpipe },
+        .{ "expand_aliases", &shopt.expand_aliases },
+        .{ "nocaseglob", &shopt.nocaseglob },
+        .{ "nocasematch", &shopt.nocasematch },
+        .{ "inherit_errexit", &shopt.inherit_errexit },
+        .{ "autocd", &shopt.autocd },
+        .{ "cdable_vars", &shopt.cdable_vars },
+        .{ "checkwinsize", &shopt.checkwinsize },
+        .{ "ignore_shopt_not_impl", &shopt.ignore_shopt_not_impl },
+    };
+    inline for (fields) |f| {
+        if (std.mem.eql(u8, name, f[0])) return f[1];
+    }
+    return null;
+}
+
+fn shoptSetO(opt_names: []const []const u8, mode: ShoptMode, env: *Environment) u8 {
+    if (opt_names.len == 0) {
+        const fields = [_]struct { name: []const u8, val: bool }{
+            .{ .name = "allexport", .val = env.options.allexport },
+            .{ .name = "errexit", .val = env.options.errexit },
+            .{ .name = "monitor", .val = env.options.monitor },
+            .{ .name = "noclobber", .val = env.options.noclobber },
+            .{ .name = "noexec", .val = env.options.noexec },
+            .{ .name = "noglob", .val = env.options.noglob },
+            .{ .name = "nounset", .val = env.options.nounset },
+            .{ .name = "verbose", .val = env.options.verbose },
+            .{ .name = "xtrace", .val = env.options.xtrace },
+        };
+        for (fields) |f| {
+            if (mode == .set and !f.val) continue;
+            if (mode == .unset and f.val) continue;
+            posix.writeAll(1, "set ");
+            posix.writeAll(1, if (f.val) "-o " else "+o ");
+            posix.writeAll(1, f.name);
+            posix.writeAll(1, "\n");
+        }
+        return 0;
+    }
+
+    var status: u8 = 0;
+    for (opt_names) |name| {
+        const ptr: ?*bool = if (std.mem.eql(u8, name, "allexport")) &env.options.allexport
+            else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit
+            else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor
+            else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber
+            else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec
+            else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob
+            else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset
+            else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose
+            else if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace
+            else null;
+
+        if (ptr) |p| {
+            switch (mode) {
+                .set => p.* = true,
+                .unset => p.* = false,
+                .query => {
+                    if (!p.*) status = 1;
+                },
+                .print, .none => {
+                    posix.writeAll(1, "set ");
+                    posix.writeAll(1, if (p.*) "-o " else "+o ");
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "\n");
+                },
+            }
+        } else {
+            posix.writeAll(2, "shopt: ");
+            posix.writeAll(2, name);
+            posix.writeAll(2, ": invalid option name\n");
+            status = 1;
+        }
+    }
+    return status;
 }
 
 test "printfProcessEscape basic sequences" {
@@ -2420,12 +3962,24 @@ test "printfProcessEscape basic sequences" {
 
 test "printfProcessEscape octal" {
     const testing = std.testing;
-    const result = printfProcessEscape("\\0101");
+    const result = printfProcessEscape("\\101");
     try testing.expectEqual(@as(u8, 'A'), result.byte);
-    try testing.expectEqual(@as(usize, 5), result.advance);
+    try testing.expectEqual(@as(usize, 4), result.advance);
 
     const r2 = printfProcessEscape("\\0");
     try testing.expectEqual(@as(u8, 0), r2.byte);
+
+    const r3 = printfProcessEscape("\\044");
+    try testing.expectEqual(@as(u8, '$'), r3.byte);
+    try testing.expectEqual(@as(usize, 4), r3.advance);
+
+    const r4 = printfProcessEscape("\\0377");
+    try testing.expectEqual(@as(u8, 31), r4.byte);
+    try testing.expectEqual(@as(usize, 4), r4.advance);
+
+    const r5 = printfProcessEscape("\\377");
+    try testing.expectEqual(@as(u8, 255), r5.byte);
+    try testing.expectEqual(@as(usize, 4), r5.advance);
 }
 
 test "printfProcessEscape hex" {
