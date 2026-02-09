@@ -1,0 +1,1 @@
+json write (_hay().children[0], type_errors=false)

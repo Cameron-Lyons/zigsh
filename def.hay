@@ -1,0 +1,9 @@
+
+Package cpython {
+  version = "3.12"
+  url = "https://python.org/release/$version/"
+  proc build {
+    echo "version = $version, url = $url"
+  }
+}
+

@@ -1,0 +1,4 @@
+
+proc my-proc { echo "my-proc" }
+func myFunc() { return ("myFunc") }
+
