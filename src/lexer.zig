@@ -415,11 +415,17 @@ pub const Lexer = struct {
     }
 
     fn skipUntilCloseBrace(self: *Lexer) void {
-        while (self.pos < self.source.len) {
+        var depth: u32 = 1;
+        while (self.pos < self.source.len and depth > 0) {
             switch (self.source[self.pos]) {
                 '}' => {
+                    depth -= 1;
                     self.pos += 1;
-                    return;
+                    if (depth == 0) return;
+                },
+                '{' => {
+                    depth += 1;
+                    self.pos += 1;
                 },
                 '\\' => {
                     self.pos += 1;
@@ -431,6 +437,10 @@ pub const Lexer = struct {
                 '"' => {
                     self.skipDoubleQuote() catch return;
                 },
+                '$' => self.skipDollar(),
+                '`' => {
+                    self.skipBackquote() catch return;
+                },
                 else => self.pos += 1,
             }
         }
@@ -439,12 +449,13 @@ pub const Lexer = struct {
     fn isIoNumber(self: *Lexer, start: u32) bool {
         if (self.pos >= self.source.len) return false;
 
-        const c = self.source[self.pos];
-        if (c != '<' and c != '>') return false;
+        const ch = self.source[self.pos];
+        if (ch != '<' and ch != '>') return false;
 
-        if (self.pos - start != 1) return false;
-        const ch = self.source[start];
-        return ch >= '0' and ch <= '9';
+        for (self.source[start..self.pos]) |d| {
+            if (d < '0' or d > '9') return false;
+        }
+        return self.pos > start;
     }
 
     fn isAssignmentWord(self: *Lexer, start: u32) bool {

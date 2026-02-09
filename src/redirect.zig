@@ -68,9 +68,13 @@ pub const RedirectOp = enum {
 
 pub fn applyFileRedirect(fd: types.Fd, path: [*:0]const u8, op: RedirectOp, state: *RedirectState, noclobber: bool) ApplyError!void {
     try state.save(fd);
+    const use_noclobber = if (noclobber and op == .output) blk: {
+        const st = posix.stat(path) catch break :blk true;
+        break :blk (st.mode & posix.S_IFMT == posix.S_IFREG);
+    } else false;
     const flags: posix.OpenFlags = switch (op) {
         .input, .heredoc, .heredoc_strip, .here_string => posix.oRdonly(),
-        .output => if (noclobber) posix.oWronlyCreatExcl() else posix.oWronlyCreatTrunc(),
+        .output => if (use_noclobber) posix.oWronlyCreatExcl() else posix.oWronlyCreatTrunc(),
         .clobber => posix.oWronlyCreatTrunc(),
         .append => posix.oWronlyCreatAppend(),
         .read_write => posix.oRdwrCreat(),

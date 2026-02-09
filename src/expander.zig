@@ -142,6 +142,18 @@ pub const Expander = struct {
             if (self.env.positional_params.len == 0) return null;
             return "";
         }
+        if (std.mem.eql(u8, name, "#")) {
+            const count = std.fmt.allocPrint(self.alloc, "{d}", .{self.env.positional_params.len}) catch return null;
+            return count;
+        }
+        if (std.mem.eql(u8, name, "?")) {
+            const val = std.fmt.allocPrint(self.alloc, "{d}", .{self.env.last_exit_status}) catch return null;
+            return val;
+        }
+        if (std.mem.eql(u8, name, "$")) {
+            const val = std.fmt.allocPrint(self.alloc, "{d}", .{self.env.shell_pid}) catch return null;
+            return val;
+        }
         return null;
     }
 
@@ -249,7 +261,7 @@ pub const Expander = struct {
                     self.alloc.free(msg);
                     if (!self.env.options.interactive) {
                         self.env.should_exit = true;
-                        self.env.exit_value = 1;
+                        self.env.exit_value = 2;
                     }
                     return error.UnsetVariable;
                 }
@@ -1120,7 +1132,7 @@ pub const Expander = struct {
                     posix.writeAll(2, name);
                     posix.writeAll(2, ": unbound variable\n");
                     env.should_exit = true;
-                    env.exit_value = 1;
+                    env.exit_value = 2;
                 }
                 return null;
             }
@@ -1142,26 +1154,159 @@ pub const Expander = struct {
         globbable: []const bool,
     };
 
+    fn makeSplitInfoUniform(self: *Expander, expanded: []const u8, is_splittable: bool, is_globbable: bool) ExpandError!SplitInfo {
+        const s = try self.alloc.alloc(bool, expanded.len);
+        const g = try self.alloc.alloc(bool, expanded.len);
+        @memset(s, is_splittable);
+        @memset(g, is_globbable);
+        return .{ .text = expanded, .splittable = s, .globbable = g };
+    }
+
+    fn expandPartWithSplitInfo(self: *Expander, part: ast.WordPart) ExpandError!SplitInfo {
+        switch (part) {
+            .parameter => |param| return try self.expandParameterWithSplitInfo(param),
+            .command_sub, .arith_sub, .backtick_sub => {
+                const expanded = try self.expandPart(part);
+                return self.makeSplitInfoUniform(expanded, true, true);
+            },
+            .literal => {
+                const expanded = try self.expandPart(part);
+                return self.makeSplitInfoUniform(expanded, false, true);
+            },
+            .single_quoted, .ansi_c_quoted => {
+                const expanded = try self.expandPart(part);
+                return self.makeSplitInfoUniform(expanded, false, false);
+            },
+            .double_quoted => |parts| {
+                var text: std.ArrayListUnmanaged(u8) = .empty;
+                var splittable: std.ArrayListUnmanaged(bool) = .empty;
+                var globbable: std.ArrayListUnmanaged(bool) = .empty;
+                for (parts) |inner| {
+                    const info = try self.expandPartWithSplitInfo(inner);
+                    try text.appendSlice(self.alloc, info.text);
+                    for (info.splittable) |_| {
+                        try splittable.append(self.alloc, false);
+                    }
+                    for (info.globbable) |_| {
+                        try globbable.append(self.alloc, false);
+                    }
+                }
+                return .{
+                    .text = try text.toOwnedSlice(self.alloc),
+                    .splittable = try splittable.toOwnedSlice(self.alloc),
+                    .globbable = try globbable.toOwnedSlice(self.alloc),
+                };
+            },
+            .tilde => {
+                const expanded = try self.expandPart(part);
+                return self.makeSplitInfoUniform(expanded, false, false);
+            },
+        }
+    }
+
+    fn expandParameterWithSplitInfo(self: *Expander, param: ast.ParameterExp) ExpandError!SplitInfo {
+        switch (param) {
+            .default => |op| {
+                const val = self.getParamValue(op.name);
+                if (val == null or (op.colon and val.?.len == 0)) {
+                    return try self.expandWordWithSplitInfoParamContext(op.word);
+                }
+                const v = try self.alloc.dupe(u8, val.?);
+                return self.makeSplitInfoUniform(v, true, true);
+            },
+            .assign => |op| {
+                const val = self.getParamValue(op.name);
+                if (val == null or (op.colon and val.?.len == 0)) {
+                    const info = try self.expandWordWithSplitInfoParamContext(op.word);
+                    self.env.set(op.name, info.text, false) catch {};
+                    return info;
+                }
+                const v = try self.alloc.dupe(u8, val.?);
+                return self.makeSplitInfoUniform(v, true, true);
+            },
+            .alternative => |op| {
+                const val = self.getParamValue(op.name);
+                if (val != null and (!op.colon or val.?.len > 0)) {
+                    return try self.expandWordWithSplitInfoParamContext(op.word);
+                }
+                const v = try self.alloc.dupe(u8, "");
+                return self.makeSplitInfoUniform(v, false, false);
+            },
+            else => {
+                const expanded = try self.expandParameter(param);
+                return self.makeSplitInfoUniform(expanded, true, true);
+            },
+        }
+    }
+
+    fn expandPartWithSplitInfoParamContext(self: *Expander, part: ast.WordPart) ExpandError!SplitInfo {
+        switch (part) {
+            .literal => {
+                const expanded = try self.expandPart(part);
+                return self.makeSplitInfoUniform(expanded, true, true);
+            },
+            .double_quoted => |parts| {
+                var text: std.ArrayListUnmanaged(u8) = .empty;
+                var sp: std.ArrayListUnmanaged(bool) = .empty;
+                var gl: std.ArrayListUnmanaged(bool) = .empty;
+                for (parts) |inner| {
+                    const expanded = try self.expandPart(inner);
+                    try text.appendSlice(self.alloc, expanded);
+                    const is_expansion = switch (inner) {
+                        .parameter => |p| switch (p) {
+                            .special => |ch| ch == '@' or ch == '*',
+                            else => false,
+                        },
+                        else => false,
+                    };
+                    for (0..expanded.len) |_| {
+                        try sp.append(self.alloc, is_expansion);
+                        try gl.append(self.alloc, false);
+                    }
+                }
+                return .{
+                    .text = try text.toOwnedSlice(self.alloc),
+                    .splittable = try sp.toOwnedSlice(self.alloc),
+                    .globbable = try gl.toOwnedSlice(self.alloc),
+                };
+            },
+            .single_quoted, .ansi_c_quoted => {
+                const expanded = try self.expandPart(part);
+                return self.makeSplitInfoUniform(expanded, false, false);
+            },
+            else => return try self.expandPartWithSplitInfo(part),
+        }
+    }
+
+    fn expandWordWithSplitInfoParamContext(self: *Expander, word: ast.Word) ExpandError!SplitInfo {
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        var splittable: std.ArrayListUnmanaged(bool) = .empty;
+        var globbable: std.ArrayListUnmanaged(bool) = .empty;
+
+        for (word.parts) |part| {
+            const info = try self.expandPartWithSplitInfoParamContext(part);
+            try text.appendSlice(self.alloc, info.text);
+            try splittable.appendSlice(self.alloc, info.splittable);
+            try globbable.appendSlice(self.alloc, info.globbable);
+        }
+
+        return .{
+            .text = try text.toOwnedSlice(self.alloc),
+            .splittable = try splittable.toOwnedSlice(self.alloc),
+            .globbable = try globbable.toOwnedSlice(self.alloc),
+        };
+    }
+
     fn expandWordWithSplitInfo(self: *Expander, word: ast.Word) ExpandError!SplitInfo {
         var text: std.ArrayListUnmanaged(u8) = .empty;
         var splittable: std.ArrayListUnmanaged(bool) = .empty;
         var globbable: std.ArrayListUnmanaged(bool) = .empty;
 
         for (word.parts) |part| {
-            const expanded = try self.expandPart(part);
-            const is_splittable = switch (part) {
-                .parameter, .command_sub, .arith_sub, .backtick_sub => true,
-                .literal, .single_quoted, .double_quoted, .tilde, .ansi_c_quoted => false,
-            };
-            const is_globbable = switch (part) {
-                .literal, .parameter, .command_sub, .arith_sub, .backtick_sub => true,
-                .single_quoted, .double_quoted, .tilde, .ansi_c_quoted => false,
-            };
-            try text.appendSlice(self.alloc, expanded);
-            for (0..expanded.len) |_| {
-                try splittable.append(self.alloc, is_splittable);
-                try globbable.append(self.alloc, is_globbable);
-            }
+            const info = try self.expandPartWithSplitInfo(part);
+            try text.appendSlice(self.alloc, info.text);
+            try splittable.appendSlice(self.alloc, info.splittable);
+            try globbable.appendSlice(self.alloc, info.globbable);
         }
 
         return .{
