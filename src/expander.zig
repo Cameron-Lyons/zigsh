@@ -63,21 +63,21 @@ pub const Expander = struct {
     }
 
     pub fn expandWordsToFields(self: *Expander, words: []const ast.Word) ExpandError![]const []const u8 {
-        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        var raw_fields: std.ArrayListUnmanaged([]const u8) = .empty;
         const expanded_words = braceExpandWords(self.alloc, words) catch words;
         for (expanded_words) |word| {
             if (findQuotedAt(word)) |at_info| {
-                try self.expandQuotedAtWord(word, at_info, &fields);
+                try self.expandQuotedAtWord(word, at_info, &raw_fields);
                 continue;
             }
             if (findUnquotedAtOrStar(word)) |unquoted_info| {
-                try self.expandUnquotedAtWord(word, unquoted_info, &fields);
+                try self.expandUnquotedAtWord(word, unquoted_info, &raw_fields);
                 continue;
             }
             const ew = try self.expandWordWithSplitInfo(word);
             if (ew.text.len == 0) {
                 if (hasQuotedParts(word)) {
-                    try fields.append(self.alloc, ew.text);
+                    try raw_fields.append(self.alloc, ew.text);
                 }
                 continue;
             }
@@ -85,25 +85,55 @@ pub const Expander = struct {
             if (!self.env.options.noglob) {
                 for (split_result.fields, split_result.globbable, split_result.field_char_globbable) |field, can_glob, char_flags| {
                     if (!can_glob) {
-                        try fields.append(self.alloc, field);
+                        try raw_fields.append(self.alloc, field);
                         continue;
                     }
                     const pattern = try self.buildGlobPattern(field, char_flags);
                     const globbed = glob.expand(self.alloc, pattern) catch {
-                        if (!self.env.shopt.nullglob) try fields.append(self.alloc, field);
+                        if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
                         continue;
                     };
                     if (globbed.len == 1 and std.mem.eql(u8, globbed[0], pattern)) {
-                        if (!self.env.shopt.nullglob) try fields.append(self.alloc, field);
+                        if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
                     } else {
-                        try fields.appendSlice(self.alloc, globbed);
+                        try raw_fields.appendSlice(self.alloc, globbed);
                     }
                 }
             } else {
-                try fields.appendSlice(self.alloc, split_result.fields);
+                try raw_fields.appendSlice(self.alloc, split_result.fields);
+            }
+        }
+        var fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        var prev_sentinel = false;
+        for (raw_fields.items) |field| {
+            if (isSentinelOnly(field)) {
+                if (!prev_sentinel) {
+                    try fields.append(self.alloc, try self.alloc.dupe(u8, ""));
+                }
+                prev_sentinel = true;
+            } else {
+                prev_sentinel = false;
+                try fields.append(self.alloc, try stripSentinels(self.alloc, field));
             }
         }
         return fields.toOwnedSlice(self.alloc);
+    }
+
+    fn isSentinelOnly(field: []const u8) bool {
+        if (field.len == 0) return false;
+        for (field) |b| {
+            if (b != 0x00) return false;
+        }
+        return true;
+    }
+
+    fn stripSentinels(alloc: std.mem.Allocator, field: []const u8) ExpandError![]const u8 {
+        if (std.mem.indexOfScalar(u8, field, 0x00) == null) return field;
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        for (field) |b| {
+            if (b != 0x00) try result.append(alloc, b);
+        }
+        return result.toOwnedSlice(alloc);
     }
 
     fn expandPart(self: *Expander, part: ast.WordPart) ExpandError![]const u8 {
@@ -1304,9 +1334,15 @@ pub const Expander = struct {
 
         for (word.parts) |part| {
             const info = try self.expandPartWithSplitInfo(part);
-            try text.appendSlice(self.alloc, info.text);
-            try splittable.appendSlice(self.alloc, info.splittable);
-            try globbable.appendSlice(self.alloc, info.globbable);
+            if (info.text.len == 0 and isQuotedPart(part)) {
+                try text.append(self.alloc, 0x00);
+                try splittable.append(self.alloc, false);
+                try globbable.append(self.alloc, false);
+            } else {
+                try text.appendSlice(self.alloc, info.text);
+                try splittable.appendSlice(self.alloc, info.splittable);
+                try globbable.appendSlice(self.alloc, info.globbable);
+            }
         }
 
         return .{
@@ -1378,10 +1414,27 @@ pub const Expander = struct {
         for (field, 0..) |ch, idx| {
             if (idx < char_flags.len and !char_flags[idx] and isGlobSpecial(ch)) {
                 try pattern.append(self.alloc, '\\');
+            } else if (ch == '[' and idx < char_flags.len and char_flags[idx]) {
+                if (!isBracketExprFullyGlobbable(field, char_flags, idx)) {
+                    try pattern.append(self.alloc, '\\');
+                }
             }
             try pattern.append(self.alloc, ch);
         }
         return pattern.toOwnedSlice(self.alloc);
+    }
+
+    fn isBracketExprFullyGlobbable(field: []const u8, char_flags: []const bool, open: usize) bool {
+        var j = open + 1;
+        if (j < field.len and field[j] == '!' or (j < field.len and field[j] == ']')) j += 1;
+        while (j < field.len) : (j += 1) {
+            if (field[j] == ']' and j > open + 1) {
+                if (j < char_flags.len and char_flags[j]) return true;
+                return false;
+            }
+            if (j < char_flags.len and !char_flags[j]) return false;
+        }
+        return true;
     }
 
     fn isGlobSpecial(ch: u8) bool {
@@ -1552,12 +1605,16 @@ pub const Expander = struct {
 
     fn hasQuotedParts(word: ast.Word) bool {
         for (word.parts) |part| {
-            switch (part) {
-                .single_quoted, .double_quoted, .ansi_c_quoted => return true,
-                else => {},
-            }
+            if (isQuotedPart(part)) return true;
         }
         return false;
+    }
+
+    fn isQuotedPart(part: ast.WordPart) bool {
+        return switch (part) {
+            .single_quoted, .double_quoted, .ansi_c_quoted => true,
+            else => false,
+        };
     }
     fn countUtf8Codepoints(s: []const u8) usize {
         var count: usize = 0;

@@ -1,0 +1,1 @@
+echo hi; exit 99; echo bye
