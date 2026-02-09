@@ -12,6 +12,7 @@ const redirect = @import("redirect.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
 const glob = @import("glob.zig");
+const token = @import("token.zig");
 const signals = @import("signals.zig");
 const Arithmetic = @import("arithmetic.zig").Arithmetic;
 
@@ -288,8 +289,8 @@ pub const Executor = struct {
             const value = expander.expandWord(assign.value) catch |err| {
                 if (err == error.UnsetVariable and self.env.options.nounset and !self.env.options.interactive) {
                     self.env.should_exit = true;
-                    self.env.exit_value = 1;
-                    return 1;
+                    self.env.exit_value = 2;
+                    return 2;
                 }
                 continue;
             };
@@ -315,7 +316,7 @@ pub const Executor = struct {
                 for (simple.redirects) |redir| {
                     self.applyAstRedirect(redir, &redir_state, &expander) catch {
                         redir_state.restore();
-                        return 1;
+                        return 2;
                     };
                 }
                 redir_state.restore();
@@ -347,14 +348,16 @@ pub const Executor = struct {
                 if (err == error.UnsetVariable) {
                     if (self.env.options.nounset and !self.env.options.interactive) {
                         self.env.should_exit = true;
-                        self.env.exit_value = 1;
+                        self.env.exit_value = 2;
                     }
+                    return 2;
                 } else if (err == error.ArithmeticError) {
                     posix.writeAll(2, "zigsh: arithmetic syntax error\n");
                     if (!self.env.options.interactive) {
                         self.env.should_exit = true;
-                        self.env.exit_value = 1;
+                        self.env.exit_value = 2;
                     }
+                    return 2;
                 } else {
                     posix.writeAll(2, "zigsh: expansion error\n");
                 }
@@ -394,7 +397,7 @@ pub const Executor = struct {
         for (simple.redirects) |redir| {
             self.applyAstRedirect(redir, &redir_state, &expander) catch {
                 redir_state.restore();
-                return 1;
+                return 2;
             };
         }
 
@@ -533,7 +536,7 @@ pub const Executor = struct {
         for (cp.redirects) |redir| {
             self.applyAstRedirect(redir, &redir_state, &expander) catch {
                 redir_state.restore();
-                return 1;
+                return 2;
             };
         }
 
@@ -1172,7 +1175,8 @@ pub const Executor = struct {
             const argv = self.buildArgv(fields) catch posix.exit(1);
 
             posix.execve(path, argv, envp) catch {};
-            posix.exit(126);
+            const exit_code: u8 = if (posix.stat(path)) |_| 126 else |_| 127;
+            posix.exit(exit_code);
         }
 
         const result = posix.waitpid(pid, 0);
@@ -1195,7 +1199,7 @@ pub const Executor = struct {
         while (iter.next()) |dir| {
             const full_path = std.fmt.allocPrintSentinel(self.alloc, "{s}/{s}", .{ dir, name }, 0) catch continue;
             const st = posix.stat(full_path.ptr) catch continue;
-            if (st.mode & posix.S_IFMT == posix.S_IFREG) {
+            if (st.mode & posix.S_IFMT == posix.S_IFREG and posix.access(full_path.ptr, posix.X_OK)) {
                 self.env.cacheCommand(name, std.mem.sliceTo(full_path, 0)) catch {};
                 return full_path.ptr;
             }
@@ -1466,15 +1470,27 @@ pub const Executor = struct {
                     posix.writeAll(1, "='");
                     posix.writeAll(1, alias_val);
                     posix.writeAll(1, "'\n");
+                } else if (token.reserved_words.get(name) != null) {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, "\n");
                 } else if (self.env.functions.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, "\n");
-                } else if (builtins.lookup(name) != null) {
+                } else if (builtins.lookup(name) != null or isSpecialBuiltin(name)) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, "\n");
                 } else if (self.findExecutable(name)) |path| {
-                    posix.writeAll(1, std.mem.sliceTo(path, 0));
-                    posix.writeAll(1, "\n");
+                    const p = std.mem.sliceTo(path, 0);
+                    const st = posix.stat(path) catch {
+                        status = 1;
+                        continue;
+                    };
+                    if (st.mode & posix.S_IFMT == posix.S_IFREG and posix.access(path, posix.X_OK)) {
+                        posix.writeAll(1, p);
+                        posix.writeAll(1, "\n");
+                    } else {
+                        status = 1;
+                    }
                 } else {
                     status = 1;
                 }
@@ -1487,13 +1503,16 @@ pub const Executor = struct {
             for (fields[start..]) |name| {
                 if (self.env.getAlias(name)) |alias_val| {
                     posix.writeAll(1, name);
-                    posix.writeAll(1, " is an alias for ");
+                    posix.writeAll(1, " is an alias for \"");
                     posix.writeAll(1, alias_val);
-                    posix.writeAll(1, "\n");
+                    posix.writeAll(1, "\"\n");
+                } else if (token.reserved_words.get(name) != null) {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is a shell keyword\n");
                 } else if (self.env.functions.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a function\n");
-                } else if (builtins.lookup(name) != null) {
+                } else if (builtins.lookup(name) != null or isSpecialBuiltin(name)) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a shell builtin\n");
                 } else if (self.findExecutable(name)) |path| {

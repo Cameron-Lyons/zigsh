@@ -330,14 +330,14 @@ pub const Parser = struct {
     }
 
     pub fn buildWord(self: *Parser, text: []const u8) ParseError!ast.Word {
-        return self.buildWordImpl(text, false);
+        return self.buildWordImpl(text, false, false);
     }
 
-    fn buildWordParamExp(self: *Parser, text: []const u8) ParseError!ast.Word {
-        return self.buildWordImpl(text, true);
+    fn buildWordParamExp(self: *Parser, text: []const u8, in_dquote: bool) ParseError!ast.Word {
+        return self.buildWordImpl(text, true, in_dquote);
     }
 
-    fn buildWordImpl(self: *Parser, text: []const u8, in_param_exp: bool) ParseError!ast.Word {
+    fn buildWordImpl(self: *Parser, text: []const u8, in_param_exp: bool, in_dquote: bool) ParseError!ast.Word {
         var parts: List(ast.WordPart) = .empty;
         var i: usize = 0;
         var literal_start: usize = 0;
@@ -345,6 +345,10 @@ pub const Parser = struct {
         while (i < text.len) {
             switch (text[i]) {
                 '\'' => {
+                    if (in_dquote) {
+                        i += 1;
+                        continue;
+                    }
                     if (i > literal_start) {
                         try parts.append(self.alloc, .{ .literal = text[literal_start..i] });
                     }
@@ -376,7 +380,7 @@ pub const Parser = struct {
                     }
                     if (i + 1 < text.len) {
                         const next = text[i + 1];
-                        if (in_param_exp and next != '$' and next != '`' and next != '"' and next != '\\') {
+                        if (in_dquote and next != '$' and next != '`' and next != '"' and next != '\\' and !(in_param_exp and next == '}')) {
                             i += 1;
                             continue;
                         }
@@ -395,7 +399,7 @@ pub const Parser = struct {
                     if (i > literal_start) {
                         try parts.append(self.alloc, .{ .literal = text[literal_start..i] });
                     }
-                    const part = try self.parseDollarExpansion(text, &i);
+                    const part = try self.parseDollarExpansion(text, &i, in_dquote);
                     try parts.append(self.alloc, part);
                     literal_start = i;
                 },
@@ -480,7 +484,7 @@ pub const Parser = struct {
                     if (i.* > literal_start) {
                         try parts.append(self.alloc, .{ .literal = text[literal_start..i.*] });
                     }
-                    const part = try self.parseDollarExpansion(text, i);
+                    const part = try self.parseDollarExpansion(text, i, true);
                     try parts.append(self.alloc, part);
                     literal_start = i.*;
                 },
@@ -509,12 +513,12 @@ pub const Parser = struct {
         return parts.toOwnedSlice(self.alloc);
     }
 
-    fn parseDollarExpansion(self: *Parser, text: []const u8, i: *usize) ParseError!ast.WordPart {
+    fn parseDollarExpansion(self: *Parser, text: []const u8, i: *usize, in_dquote: bool) ParseError!ast.WordPart {
         i.* += 1;
         if (i.* >= text.len) return .{ .literal = "$" };
 
         switch (text[i.*]) {
-            '{' => return try self.parseBraceParam(text, i),
+            '{' => return try self.parseBraceParam(text, i, in_dquote),
             '(' => {
                 if (i.* + 1 < text.len and text[i.* + 1] == '(') {
                     i.* += 2;
@@ -735,17 +739,35 @@ pub const Parser = struct {
         return .{ .ansi_c_quoted = buf.toOwnedSlice(self.alloc) catch "" };
     }
 
-    fn parseBraceParam(self: *Parser, text: []const u8, i: *usize) ParseError!ast.WordPart {
+    fn parseBraceParam(self: *Parser, text: []const u8, i: *usize, in_dquote: bool) ParseError!ast.WordPart {
         i.* += 1;
         if (i.* >= text.len) return .{ .literal = "${" };
 
         if (text[i.*] == '#') {
-            i.* += 1;
-            const start = i.*;
-            while (i.* < text.len and text[i.*] != '}') : (i.* += 1) {}
-            const name = text[start..i.*];
-            if (i.* < text.len) i.* += 1;
-            return .{ .parameter = .{ .length = name } };
+            const after_hash = i.* + 1;
+            if (after_hash >= text.len) {
+                i.* += 1;
+                return .{ .parameter = .{ .length = "" } };
+            }
+            if (text[after_hash] == '}') {
+                // ${#} → special param $#
+            } else if (text[after_hash] == '#') {
+                const after_two = after_hash + 1;
+                if (after_two < text.len and text[after_two] == '}') {
+                    i.* = after_two + 1;
+                    return .{ .parameter = .{ .length = "#" } };
+                }
+            } else if (text[after_hash] == '%' or text[after_hash] == ':') {
+                // ${#%...} or ${#:...} → $# with operator, handled below
+            } else {
+                // ${#name} → length of name
+                i.* += 1;
+                const start = i.*;
+                while (i.* < text.len and text[i.*] != '}') : (i.* += 1) {}
+                const name = text[start..i.*];
+                if (i.* < text.len) i.* += 1;
+                return .{ .parameter = .{ .length = name } };
+            }
         }
 
         if (i.* < text.len and text[i.*] == '!') {
@@ -790,11 +812,11 @@ pub const Parser = struct {
         }
 
         if (text[i.*] == '^' or text[i.*] == ',') {
-            return try self.parseCaseConv(text, i, name);
+            return try self.parseCaseConv(text, i, name, in_dquote);
         }
 
         if (text[i.*] == '/') {
-            return try self.parsePatternSub(text, i, name);
+            return try self.parsePatternSub(text, i, name, in_dquote);
         }
 
         const colon = text[i.*] == ':';
@@ -812,43 +834,88 @@ pub const Parser = struct {
         const word_start = i.*;
         var depth: u32 = 1;
         while (i.* < text.len and depth > 0) {
-            if (text[i.*] == '{') depth += 1;
-            if (text[i.*] == '}') {
-                depth -= 1;
-                if (depth == 0) break;
+            switch (text[i.*]) {
+                '}' => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                    i.* += 1;
+                },
+                '{' => {
+                    depth += 1;
+                    i.* += 1;
+                },
+                '\\' => {
+                    i.* += 1;
+                    if (i.* < text.len) i.* += 1;
+                },
+                '\'' => {
+                    if (!in_dquote or op_char == '#' or op_char == '%') {
+                        i.* += 1;
+                        while (i.* < text.len and text[i.*] != '\'') : (i.* += 1) {}
+                        if (i.* < text.len) i.* += 1;
+                    } else {
+                        i.* += 1;
+                    }
+                },
+                '"' => {
+                    i.* += 1;
+                    while (i.* < text.len and text[i.*] != '"') {
+                        if (text[i.*] == '\\' and i.* + 1 < text.len) i.* += 1;
+                        i.* += 1;
+                    }
+                    if (i.* < text.len) i.* += 1;
+                },
+                '$' => {
+                    i.* += 1;
+                    if (i.* < text.len and text[i.*] == '{') {
+                        depth += 1;
+                        i.* += 1;
+                    }
+                },
+                else => i.* += 1,
             }
-            if (text[i.*] == '\\' and i.* + 1 < text.len) i.* += 1;
-            i.* += 1;
         }
         const word_text = text[word_start..i.*];
         if (i.* < text.len) i.* += 1;
 
-        const word = try self.buildWordParamExp(word_text);
-
         return switch (op_char) {
-            '-' => .{ .parameter = .{ .default = .{ .name = name, .colon = colon, .word = word } } },
-            '=' => .{ .parameter = .{ .assign = .{ .name = name, .colon = colon, .word = word } } },
-            '?' => .{ .parameter = .{ .error_msg = .{ .name = name, .colon = colon, .word = word } } },
-            '+' => .{ .parameter = .{ .alternative = .{ .name = name, .colon = colon, .word = word } } },
+            '-' => blk: {
+                const word = try self.buildWordParamExp(word_text, in_dquote);
+                break :blk .{ .parameter = .{ .default = .{ .name = name, .colon = colon, .word = word } } };
+            },
+            '=' => blk: {
+                const word = try self.buildWordParamExp(word_text, in_dquote);
+                break :blk .{ .parameter = .{ .assign = .{ .name = name, .colon = colon, .word = word } } };
+            },
+            '?' => blk: {
+                const word = try self.buildWordParamExp(word_text, in_dquote);
+                break :blk .{ .parameter = .{ .error_msg = .{ .name = name, .colon = colon, .word = word } } };
+            },
+            '+' => blk: {
+                const word = try self.buildWordParamExp(word_text, in_dquote);
+                break :blk .{ .parameter = .{ .alternative = .{ .name = name, .colon = colon, .word = word } } };
+            },
             '#' => {
+                const pat_word = try self.buildWordParamExp(word_text, false);
                 if (word_text.len > 0 and word_text[0] == '#') {
-                    const inner_word = try self.buildWord(word_text[1..]);
+                    const inner_word = try self.buildWordParamExp(word_text[1..], false);
                     return .{ .parameter = .{ .prefix_strip_long = .{ .name = name, .pattern = inner_word } } };
                 }
-                return .{ .parameter = .{ .prefix_strip = .{ .name = name, .pattern = word } } };
+                return .{ .parameter = .{ .prefix_strip = .{ .name = name, .pattern = pat_word } } };
             },
             '%' => {
+                const pat_word = try self.buildWordParamExp(word_text, false);
                 if (word_text.len > 0 and word_text[0] == '%') {
-                    const inner_word = try self.buildWord(word_text[1..]);
+                    const inner_word = try self.buildWordParamExp(word_text[1..], false);
                     return .{ .parameter = .{ .suffix_strip_long = .{ .name = name, .pattern = inner_word } } };
                 }
-                return .{ .parameter = .{ .suffix_strip = .{ .name = name, .pattern = word } } };
+                return .{ .parameter = .{ .suffix_strip = .{ .name = name, .pattern = pat_word } } };
             },
             else => .{ .parameter = .{ .simple = name } },
         };
     }
 
-    fn parsePatternSub(self: *Parser, text: []const u8, i: *usize, name: []const u8) ParseError!ast.WordPart {
+    fn parsePatternSub(self: *Parser, text: []const u8, i: *usize, name: []const u8, _: bool) ParseError!ast.WordPart {
         i.* += 1;
         var mode: ast.PatSubMode = .first;
         if (i.* < text.len) {
@@ -932,8 +999,8 @@ pub const Parser = struct {
 
         if (i.* < text.len and text[i.*] == '}') i.* += 1;
 
-        const pattern = try self.buildWordParamExp(pat_text);
-        const replacement = try self.buildWordParamExp(rep_text);
+        const pattern = try self.buildWordParamExp(pat_text, false);
+        const replacement = try self.buildWordParamExp(rep_text, false);
 
         return .{ .parameter = .{ .pattern_sub = .{
             .name = name,
@@ -1126,7 +1193,7 @@ pub const Parser = struct {
         return false;
     }
 
-    fn parseCaseConv(self: *Parser, text: []const u8, i: *usize, name: []const u8) ParseError!ast.WordPart {
+    fn parseCaseConv(self: *Parser, text: []const u8, i: *usize, name: []const u8, _: bool) ParseError!ast.WordPart {
         const first_char = text[i.*];
         i.* += 1;
         var mode: ast.CaseConvMode = undefined;
@@ -1158,7 +1225,7 @@ pub const Parser = struct {
                 }
                 i.* += 1;
             }
-            pattern = try self.buildWordParamExp(text[pat_start..i.*]);
+            pattern = try self.buildWordParamExp(text[pat_start..i.*], false);
         }
         if (i.* < text.len and text[i.*] == '}') i.* += 1;
         return .{ .parameter = .{ .case_conv = .{
@@ -1550,11 +1617,13 @@ pub const Parser = struct {
         const saved_rwc = self.lexer.reserved_word_context;
 
         const name = self.tokenText(self.current);
+
         try self.advance();
 
         if (self.current.tag == .lparen) {
             try self.advance();
             if (self.current.tag == .rparen) {
+                if (!isValidFunctionName(name)) return error.UnexpectedToken;
                 try self.advance();
                 try self.skipNewlines();
                 const body_start = self.current.start;
@@ -1573,6 +1642,15 @@ pub const Parser = struct {
         self.current = saved_current;
         self.lexer.reserved_word_context = saved_rwc;
         return null;
+    }
+
+    fn isValidFunctionName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        if (name[0] != '_' and !std.ascii.isAlphabetic(name[0])) return false;
+        for (name[1..]) |ch| {
+            if (ch != '_' and !std.ascii.isAlphanumeric(ch)) return false;
+        }
+        return true;
     }
 
     fn parseCompoundList(self: *Parser) ParseError![]const ast.CompleteCommand {

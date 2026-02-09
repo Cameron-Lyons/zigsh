@@ -377,12 +377,23 @@ fn setWriteValue(value: []const u8) void {
 
 fn builtinSet(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
         var it = env.vars.iterator();
         while (it.next()) |entry| {
-            posix.writeAll(1, entry.key_ptr.*);
-            posix.writeAll(1, "=");
-            setWriteValue(entry.value_ptr.value);
-            posix.writeAll(1, "\n");
+            keys.append(env.alloc, entry.key_ptr.*) catch continue;
+        }
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        for (keys.items) |key| {
+            if (env.vars.get(key)) |entry| {
+                posix.writeAll(1, key);
+                posix.writeAll(1, "=");
+                setWriteValue(entry.value);
+                posix.writeAll(1, "\n");
+            }
         }
         return 0;
     }
@@ -549,7 +560,7 @@ fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
 fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
     if (args.len > 2) {
         posix.writeAll(2, "break: too many arguments\n");
-        return 1;
+        return 2;
     }
     var n: u32 = 1;
     if (args.len > 1) {
@@ -557,11 +568,11 @@ fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(2, "break: ");
             posix.writeAll(2, args[1]);
             posix.writeAll(2, ": numeric argument required\n");
-            return 1;
+            return 2;
         };
         if (n == 0) {
             posix.writeAll(2, "break: loop count must be > 0\n");
-            return 1;
+            return 2;
         }
     }
     if (env.loop_depth == 0) return if (env.in_subshell) @as(u8, 1) else 0;
@@ -572,6 +583,10 @@ fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
 fn builtinContinue(args: []const []const u8, env: *Environment) u8 {
     if (args.len > 2) {
         posix.writeAll(2, "continue: too many arguments\n");
+        if (!env.options.interactive) {
+            env.should_exit = true;
+            env.exit_value = 2;
+        }
         return 2;
     }
     var n: u32 = 1;
@@ -3036,8 +3051,6 @@ fn builtinHash(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
         var it = env.command_hash.iterator();
         while (it.next()) |entry| {
-            posix.writeAll(1, entry.key_ptr.*);
-            posix.writeAll(1, "\t");
             posix.writeAll(1, entry.value_ptr.*);
             posix.writeAll(1, "\n");
         }
