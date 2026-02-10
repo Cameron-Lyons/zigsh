@@ -42,8 +42,12 @@ pub fn fork() !pid_t {
     return rc;
 }
 
-pub fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed} {
+pub const ExecError = error{ ExecFailed, NoExec };
+
+pub fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) ExecError!void {
     _ = c.execve(path, argv, envp);
+    const err = std.c._errno().*;
+    if (err == 8) return error.NoExec;
     return error.ExecFailed;
 }
 

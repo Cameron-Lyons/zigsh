@@ -3,6 +3,7 @@ const Lexer = @import("lexer.zig").Lexer;
 const Token = @import("token.zig").Token;
 const Tag = @import("token.zig").Tag;
 const ast = @import("ast.zig");
+const posix = @import("posix.zig");
 
 const List = std.ArrayListUnmanaged;
 
@@ -315,12 +316,13 @@ pub const Parser = struct {
     fn parseAssignment(self: *Parser) ParseError!ast.Assignment {
         const text = self.tokenText(self.current);
         const eq_idx = std.mem.indexOfScalar(u8, text, '=').?;
-        const name = text[0..eq_idx];
+        const is_append = eq_idx > 0 and text[eq_idx - 1] == '+';
+        const name = if (is_append) text[0 .. eq_idx - 1] else text[0..eq_idx];
         const value_text = text[eq_idx + 1 ..];
         try self.advance();
 
-        const value = try self.buildWord(value_text);
-        return .{ .name = name, .value = value };
+        const value = try self.buildWordAssign(value_text);
+        return .{ .name = name, .value = value, .append = is_append };
     }
 
     fn parseWordToken(self: *Parser) ParseError!ast.Word {
@@ -338,6 +340,14 @@ pub const Parser = struct {
     }
 
     fn buildWordImpl(self: *Parser, text: []const u8, in_param_exp: bool, in_dquote: bool) ParseError!ast.Word {
+        return self.buildWordImplFull(text, in_param_exp, in_dquote, false);
+    }
+
+    fn buildWordAssign(self: *Parser, text: []const u8) ParseError!ast.Word {
+        return self.buildWordImplFull(text, false, false, true);
+    }
+
+    fn buildWordImplFull(self: *Parser, text: []const u8, in_param_exp: bool, in_dquote: bool, in_assignment: bool) ParseError!ast.Word {
         var parts: List(ast.WordPart) = .empty;
         var i: usize = 0;
         var literal_start: usize = 0;
@@ -418,7 +428,9 @@ pub const Parser = struct {
                     literal_start = i;
                 },
                 '~' => {
-                    if (i == 0 or (i > 0 and text[i - 1] == ':')) {
+                    const at_start = i == 0;
+                    const after_colon = i > 0 and text[i - 1] == ':';
+                    if (!in_dquote and (at_start or (after_colon and (in_assignment or in_param_exp)))) {
                         if (i > literal_start) {
                             try parts.append(self.alloc, .{ .literal = text[literal_start..i] });
                         }
@@ -515,6 +527,9 @@ pub const Parser = struct {
 
     fn parseDollarExpansion(self: *Parser, text: []const u8, i: *usize, in_dquote: bool) ParseError!ast.WordPart {
         i.* += 1;
+        while (i.* + 1 < text.len and text[i.*] == '\\' and text[i.* + 1] == '\n') {
+            i.* += 2;
+        }
         if (i.* >= text.len) return .{ .literal = "$" };
 
         switch (text[i.*]) {
@@ -920,7 +935,13 @@ pub const Parser = struct {
                 }
                 return .{ .parameter = .{ .suffix_strip = .{ .name = name, .pattern = pat_word } } };
             },
-            else => .{ .parameter = .{ .simple = name } },
+            else => {
+                if (!std.ascii.isAlphanumeric(op_char) and op_char != '_') {
+                    posix.writeAll(2, "zigsh: bad substitution\n");
+                    return error.UnexpectedToken;
+                }
+                return .{ .parameter = .{ .simple = name } };
+            },
         };
     }
 
@@ -1347,6 +1368,7 @@ pub const Parser = struct {
         const condition = try self.parseCompoundList();
         _ = try self.expect(.kw_then);
         const then_body = try self.parseCompoundList();
+        if (then_body.len == 0) return error.UnexpectedToken;
 
         var elifs: List(ast.ElifClause) = .empty;
         while (self.current.tag == .kw_elif) {
@@ -1377,6 +1399,7 @@ pub const Parser = struct {
         const condition = try self.parseCompoundList();
         _ = try self.expect(.kw_do);
         const body = try self.parseCompoundList();
+        if (body.len == 0) return error.UnexpectedToken;
         _ = try self.expect(.kw_done);
         return .{ .condition = condition, .body = body };
     }
@@ -1386,6 +1409,7 @@ pub const Parser = struct {
         const condition = try self.parseCompoundList();
         _ = try self.expect(.kw_do);
         const body = try self.parseCompoundList();
+        if (body.len == 0) return error.UnexpectedToken;
         _ = try self.expect(.kw_done);
         return .{ .condition = condition, .body = body };
     }
@@ -1644,6 +1668,10 @@ pub const Parser = struct {
                     else => return error.UnexpectedToken,
                 };
                 return .{ .name = name, .body = compound, .source = self.lexer.source[body_start..body_end] };
+            }
+            if (isValidFunctionName(name)) {
+                posix.writeAll(2, "zigsh: syntax error near unexpected token\n");
+                return error.UnexpectedToken;
             }
         }
 

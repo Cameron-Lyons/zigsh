@@ -27,6 +27,7 @@ pub const Environment = struct {
     should_return: bool,
     return_value: u8,
     should_exit: bool,
+    abort_line: ?u32,
     exit_value: u8,
     in_subshell: bool,
     shell_name: []const u8,
@@ -39,6 +40,8 @@ pub const Environment = struct {
         exported: bool,
         readonly: bool,
         integer: bool = false,
+        lowercase: bool = false,
+        uppercase: bool = false,
     };
 
     pub const FunctionDef = struct {
@@ -159,6 +162,7 @@ pub const Environment = struct {
             .should_return = false,
             .return_value = 0,
             .should_exit = false,
+            .abort_line = null,
             .exit_value = 0,
             .in_subshell = false,
             .shell_name = "zigsh",
@@ -235,6 +239,11 @@ pub const Environment = struct {
         const owned_value = try self.alloc.dupe(u8, value);
 
         if (self.vars.getPtr(name)) |existing| {
+            if (existing.lowercase) {
+                for (owned_value) |*b| b.* = std.ascii.toLower(b.*);
+            } else if (existing.uppercase) {
+                for (owned_value) |*b| b.* = std.ascii.toUpper(b.*);
+            }
             self.alloc.free(existing.value);
             existing.value = owned_value;
             if (exported or self.options.allexport or existing.exported) existing.exported = true;

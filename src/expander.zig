@@ -66,10 +66,16 @@ pub const Expander = struct {
         const info = try self.expandWordWithSplitInfo(word);
         var result: std.ArrayListUnmanaged(u8) = .empty;
         for (info.text, 0..) |ch, idx| {
+            if (ch == 0x00) continue;
             if (!info.globbable[idx] and (ch == '[' or ch == '*' or ch == '?' or ch == '\\')) {
-                try result.append(self.alloc, '[');
-                try result.append(self.alloc, ch);
-                try result.append(self.alloc, ']');
+                if (ch == '\\') {
+                    try result.append(self.alloc, '\\');
+                    try result.append(self.alloc, '\\');
+                } else {
+                    try result.append(self.alloc, '[');
+                    try result.append(self.alloc, ch);
+                    try result.append(self.alloc, ']');
+                }
             } else {
                 try result.append(self.alloc, ch);
             }
@@ -89,7 +95,15 @@ pub const Expander = struct {
     pub fn expandWordsToFields(self: *Expander, words: []const ast.Word) ExpandError![]const []const u8 {
         var raw_fields: std.ArrayListUnmanaged([]const u8) = .empty;
         var word_boundaries: std.ArrayListUnmanaged(usize) = .empty;
-        const expanded_words = braceExpandWords(self.alloc, words) catch words;
+        const expanded_words = braceExpandWords(self.alloc, words) catch |err| blk: {
+            if (err == error.InvalidRange) {
+                posix.writeAll(2, "zigsh: brace expansion: bad range\n");
+                self.env.should_exit = true;
+                self.env.exit_value = 2;
+                return error.BadSubstitution;
+            }
+            break :blk words;
+        };
         for (expanded_words) |word| {
             try word_boundaries.append(self.alloc, raw_fields.items.len);
             if (findQuotedAt(word)) |at_info| {
@@ -356,7 +370,14 @@ pub const Expander = struct {
     const StripMode = enum { prefix_short, prefix_long, suffix_short, suffix_long };
 
     fn stripPattern(self: *Expander, name: []const u8, pattern: ast.Word, mode: StripMode) ExpandError![]const u8 {
-        const val = self.getParamValue(name) orelse return try self.alloc.dupe(u8, "");
+        const val = self.getParamValue(name) orelse {
+            if (self.env.options.nounset) {
+                posix.writeAll(2, name);
+                posix.writeAll(2, ": parameter not set\n");
+                return error.UnsetVariable;
+            }
+            return try self.alloc.dupe(u8, "");
+        };
         const pat = try self.expandPattern(pattern);
         defer self.alloc.free(pat);
 
@@ -421,7 +442,14 @@ pub const Expander = struct {
     }
 
     fn patternSub(self: *Expander, op: ast.PatternSubOp) ExpandError![]const u8 {
-        const val = self.getParamValue(op.name) orelse "";
+        const val = self.getParamValue(op.name) orelse blk: {
+            if (self.env.options.nounset) {
+                posix.writeAll(2, op.name);
+                posix.writeAll(2, ": parameter not set\n");
+                return error.UnsetVariable;
+            }
+            break :blk "";
+        };
         if (val.len == 0) return try self.alloc.dupe(u8, "");
         const pat = try self.expandPattern(op.pattern);
         defer self.alloc.free(pat);
@@ -728,16 +756,49 @@ pub const Expander = struct {
                 return self.expandPromptWithShellExpansion(val);
             },
             'Q' => {
-                var result: std.ArrayListUnmanaged(u8) = .empty;
-                try result.append(self.alloc, '\'');
+                var needs_ansi = false;
                 for (val) |ch| {
-                    if (ch == '\'') {
-                        try result.appendSlice(self.alloc, "'\\''");
-                    } else {
-                        try result.append(self.alloc, ch);
+                    if (ch < 0x20 or ch == 0x7f) {
+                        needs_ansi = true;
+                        break;
                     }
                 }
-                try result.append(self.alloc, '\'');
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                if (needs_ansi) {
+                    try result.appendSlice(self.alloc, "$'");
+                    for (val) |ch| {
+                        switch (ch) {
+                            '\n' => try result.appendSlice(self.alloc, "\\n"),
+                            '\t' => try result.appendSlice(self.alloc, "\\t"),
+                            '\r' => try result.appendSlice(self.alloc, "\\r"),
+                            0x07 => try result.appendSlice(self.alloc, "\\a"),
+                            0x08 => try result.appendSlice(self.alloc, "\\b"),
+                            0x1b => try result.appendSlice(self.alloc, "\\E"),
+                            '\\' => try result.appendSlice(self.alloc, "\\\\"),
+                            '\'' => try result.appendSlice(self.alloc, "\\'"),
+                            else => {
+                                if (ch < 0x20 or ch == 0x7f) {
+                                    var esc_buf: [6]u8 = undefined;
+                                    const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
+                                    try result.appendSlice(self.alloc, esc);
+                                } else {
+                                    try result.append(self.alloc, ch);
+                                }
+                            },
+                        }
+                    }
+                    try result.append(self.alloc, '\'');
+                } else {
+                    try result.append(self.alloc, '\'');
+                    for (val) |ch| {
+                        if (ch == '\'') {
+                            try result.appendSlice(self.alloc, "'\\''");
+                        } else {
+                            try result.append(self.alloc, ch);
+                        }
+                    }
+                    try result.append(self.alloc, '\'');
+                }
                 return result.toOwnedSlice(self.alloc);
             },
             'E' => {
@@ -1550,7 +1611,7 @@ pub const Expander = struct {
                     posix.writeAll(2, name);
                     posix.writeAll(2, ": unbound variable\n");
                     env.should_exit = true;
-                    env.exit_value = 2;
+                    env.exit_value = 1;
                 }
                 return null;
             }
@@ -1802,31 +1863,14 @@ pub const Expander = struct {
         for (field, 0..) |ch, idx| {
             if (idx < char_flags.len and !char_flags[idx] and isGlobSpecial(ch)) {
                 try pattern.append(self.alloc, '\\');
-            } else if (ch == '[' and idx < char_flags.len and char_flags[idx]) {
-                if (!isBracketExprFullyGlobbable(field, char_flags, idx)) {
-                    try pattern.append(self.alloc, '\\');
-                }
             }
             try pattern.append(self.alloc, ch);
         }
         return pattern.toOwnedSlice(self.alloc);
     }
 
-    fn isBracketExprFullyGlobbable(field: []const u8, char_flags: []const bool, open: usize) bool {
-        var j = open + 1;
-        if (j < field.len and field[j] == '!' or (j < field.len and field[j] == ']')) j += 1;
-        while (j < field.len) : (j += 1) {
-            if (field[j] == ']' and j > open + 1) {
-                if (j < char_flags.len and char_flags[j]) return true;
-                return false;
-            }
-            if (j < char_flags.len and !char_flags[j]) return false;
-        }
-        return true;
-    }
-
     fn isGlobSpecial(ch: u8) bool {
-        return ch == '*' or ch == '?' or ch == '[' or ch == ']' or ch == '\\' or ch == '-';
+        return ch == '*' or ch == '?' or ch == '[' or ch == ']' or ch == '\\' or ch == '-' or ch == ':';
     }
 
     fn isIfsWhitespace(ch: u8, ifs: []const u8) bool {
@@ -1982,11 +2026,29 @@ pub const Expander = struct {
                 continue;
             }
 
+            var split_fields: []const []const u8 = undefined;
             if (self.env.ifs.len == 0) {
-                try fields.append(self.alloc, field_text);
+                const single = try self.alloc.alloc([]const u8, 1);
+                single[0] = field_text;
+                split_fields = single;
             } else {
-                const split = try self.fieldSplit(field_text);
-                try fields.appendSlice(self.alloc, split);
+                split_fields = try self.fieldSplit(field_text);
+            }
+
+            if (!self.env.options.noglob) {
+                for (split_fields) |sf| {
+                    const globbed = glob.expand(self.alloc, sf) catch {
+                        try fields.append(self.alloc, sf);
+                        continue;
+                    };
+                    if (globbed.len == 1 and std.mem.eql(u8, globbed[0], sf)) {
+                        try fields.append(self.alloc, sf);
+                    } else {
+                        try fields.appendSlice(self.alloc, globbed);
+                    }
+                }
+            } else {
+                try fields.appendSlice(self.alloc, split_fields);
             }
         }
     }
@@ -2250,9 +2312,9 @@ fn expandRange(alloc: std.mem.Allocator, inner: []const FlatElem, prefix: []cons
     var step: i64 = if (start_num <= end_num) 1 else -1;
     if (step_str) |ss| {
         step = std.fmt.parseInt(i64, ss, 10) catch return null;
-        if (step == 0) return null;
-        if (start_num < end_num and step < 0) return null;
-        if (start_num > end_num and step > 0) return null;
+        if (step == 0) return error.InvalidRange;
+        if (start_num < end_num and step < 0) return error.InvalidRange;
+        if (start_num > end_num and step > 0) return error.InvalidRange;
     }
 
     const pad_width = blk: {
@@ -2285,14 +2347,14 @@ fn expandRange(alloc: std.mem.Allocator, inner: []const FlatElem, prefix: []cons
 fn expandCharRange(alloc: std.mem.Allocator, start: u8, end: u8, step_str: ?[]const u8, prefix: []const FlatElem, suffix: []const FlatElem) ![]const ast.Word {
     if (std.ascii.isUpper(start) != std.ascii.isUpper(end) and
         std.ascii.isLower(start) != std.ascii.isLower(end))
-        return error.OutOfMemory;
+        return error.InvalidRange;
 
     var step: i64 = if (start <= end) 1 else -1;
     if (step_str) |ss| {
-        step = std.fmt.parseInt(i64, ss, 10) catch return error.OutOfMemory;
-        if (step == 0) return error.OutOfMemory;
-        if (@as(i64, start) < @as(i64, end) and step < 0) return error.OutOfMemory;
-        if (@as(i64, start) > @as(i64, end) and step > 0) return error.OutOfMemory;
+        step = std.fmt.parseInt(i64, ss, 10) catch return error.InvalidRange;
+        if (step == 0) return error.InvalidRange;
+        if (@as(i64, start) < @as(i64, end) and step < 0) return error.InvalidRange;
+        if (@as(i64, start) > @as(i64, end) and step > 0) return error.InvalidRange;
     }
 
     var results: std.ArrayListUnmanaged(ast.Word) = .empty;

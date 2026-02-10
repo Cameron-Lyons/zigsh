@@ -22,6 +22,7 @@ pub const Executor = struct {
     alloc: std.mem.Allocator,
     in_err_trap: bool = false,
     bang_reached: bool = false,
+    current_line: u32 = 0,
 
     pub fn init(alloc: std.mem.Allocator, env: *Environment, jobs: *JobTable) Executor {
         return .{ .env = env, .jobs = jobs, .alloc = alloc };
@@ -30,6 +31,7 @@ pub const Executor = struct {
     pub fn executeProgram(self: *Executor, program: ast.Program) u8 {
         var status: u8 = 0;
         for (program.commands) |cmd| {
+            self.env.abort_line = null;
             status = self.executeCompleteCommand(cmd);
             if (self.env.should_exit) break;
             if (self.env.options.errexit and status != 0 and self.env.errexit_suppressed == 0 and !self.bang_reached) {
@@ -90,6 +92,10 @@ pub const Executor = struct {
         for (list.rest, 0..) |item, idx| {
             if (self.env.should_exit or self.env.should_return or
                 self.env.break_count > 0 or self.env.continue_count > 0) break;
+            if (self.env.abort_line) |abort_ln| {
+                if (item.and_or.line == 0 or item.and_or.line == abort_ln) continue;
+                self.env.abort_line = null;
+            }
             if (!self.env.in_subshell) self.env.command_number += 1;
             const next_bg = (idx + 1 < list.rest.len) and list.rest[idx + 1].op == .amp;
             if (next_bg) {
@@ -156,6 +162,7 @@ pub const Executor = struct {
     fn executeAndOr(self: *Executor, and_or: ast.AndOr) u8 {
         self.bang_reached = false;
         if (and_or.line > 0) {
+            self.current_line = and_or.line;
             var buf: [16]u8 = undefined;
             const line_str = std.fmt.bufPrint(&buf, "{d}", .{and_or.line}) catch "0";
             self.env.set("LINENO", line_str, false) catch {};
@@ -165,7 +172,7 @@ pub const Executor = struct {
         if (and_or.rest.len > 0) self.env.errexit_suppressed -= 1;
         var last_ran = and_or.rest.len == 0;
         for (and_or.rest, 0..) |item, idx| {
-            if (self.env.should_exit or self.env.should_return or
+            if (self.env.should_exit or self.env.should_return or self.env.abort_line != null or
                 self.env.break_count > 0 or self.env.continue_count > 0) break;
             const is_last = idx == and_or.rest.len - 1;
             if (!is_last) self.env.errexit_suppressed += 1;
@@ -308,15 +315,22 @@ pub const Executor = struct {
         const saved_exit = self.env.last_exit_status;
         for (simple.assigns) |assign| {
             const value = expander.expandWord(assign.value) catch |err| {
-                if (err == error.UnsetVariable and self.env.options.nounset and !self.env.options.interactive) {
-                    self.env.should_exit = true;
-                    self.env.exit_value = 2;
+                if (err == error.UnsetVariable and self.env.options.nounset) {
+                    self.env.abort_line = self.current_line;
+                    if (!self.env.options.interactive) {
+                        self.env.should_exit = true;
+                        self.env.exit_value = 2;
+                    }
                     return 2;
                 }
                 continue;
             };
             if (simple.words.len == 0) {
-                self.env.set(assign.name, value, false) catch |err| {
+                const final_value = if (assign.append) blk: {
+                    const existing = self.env.get(assign.name) orelse "";
+                    break :blk std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
+                } else value;
+                self.env.set(assign.name, final_value, false) catch |err| {
                     if (err == error.ReadonlyVariable) {
                         posix.writeAll(2, "zigsh: ");
                         posix.writeAll(2, assign.name);
@@ -367,9 +381,12 @@ pub const Executor = struct {
         else
             expander.expandWordsToFields(simple.words) catch |err| {
                 if (err == error.UnsetVariable) {
-                    if (self.env.options.nounset and !self.env.options.interactive) {
-                        self.env.should_exit = true;
-                        self.env.exit_value = 2;
+                    if (self.env.options.nounset) {
+                        self.env.abort_line = self.current_line;
+                        if (!self.env.options.interactive) {
+                            self.env.should_exit = true;
+                            self.env.exit_value = 2;
+                        }
                     }
                     return 2;
                 } else if (err == error.ArithmeticError) {
@@ -426,8 +443,16 @@ pub const Executor = struct {
         var status: u8 = 0;
 
         if (std.mem.eql(u8, cmd_name, ".") or std.mem.eql(u8, cmd_name, "source")) {
+            for (simple.assigns) |assign| {
+                const value = expander.expandWord(assign.value) catch "";
+                self.env.set(assign.name, value, false) catch {};
+            }
             status = self.executeSourceBuiltin(fields);
         } else if (std.mem.eql(u8, cmd_name, "eval")) {
+            for (simple.assigns) |assign| {
+                const value = expander.expandWord(assign.value) catch "";
+                self.env.set(assign.name, value, false) catch {};
+            }
             status = self.executeEvalBuiltin(fields);
         } else if (std.mem.eql(u8, cmd_name, "exec")) {
             var cmd_idx: usize = 1;
@@ -579,6 +604,21 @@ pub const Executor = struct {
     }
 
     fn executeFunctionDef(self: *Executor, fd: ast.FunctionDef) u8 {
+        const special_builtins = [_][]const u8{
+            "break", ":", "continue", ".", "eval", "exec", "exit",
+            "export", "readonly", "return", "set", "shift", "times",
+            "trap", "unset",
+        };
+        for (special_builtins) |sb| {
+            if (std.mem.eql(u8, fd.name, sb)) {
+                posix.writeAll(2, "zigsh: ");
+                posix.writeAll(2, fd.name);
+                posix.writeAll(2, ": is a special builtin\n");
+                self.env.should_exit = true;
+                self.env.exit_value = 2;
+                return 2;
+            }
+        }
         const source = self.env.alloc.dupe(u8, fd.source) catch return 1;
         const name = self.env.alloc.dupe(u8, fd.name) catch {
             self.env.alloc.free(source);
@@ -812,7 +852,15 @@ pub const Executor = struct {
         const lookup = struct {
             var env: *Environment = undefined;
             fn f(name: []const u8) ?[]const u8 {
-                return env.get(name);
+                if (env.get(name)) |v| return v;
+                if (env.options.nounset) {
+                    posix.writeAll(2, "zigsh: ");
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": unbound variable\n");
+                    env.should_exit = true;
+                    env.exit_value = 2;
+                }
+                return null;
             }
             fn setter(name: []const u8, val: i64) void {
                 var buf: [32]u8 = undefined;
@@ -823,8 +871,18 @@ pub const Executor = struct {
         lookup.env = env_ptr;
 
         var expander = Expander.init(self.alloc, self.env, self.jobs);
-        const expr = expander.expandArithmetic(raw_expr) catch raw_expr;
-        const result = Arithmetic.evaluateWithSetter(expr, &lookup.f, &lookup.setter) catch return 1;
+        const expr = expander.expandArithmetic(raw_expr) catch {
+            if (env_ptr.should_exit) {
+                env_ptr.exit_value = 2;
+                return 2;
+            }
+            return 1;
+        };
+        const result = Arithmetic.evaluateWithSetter(expr, &lookup.f, &lookup.setter) catch {
+            if (env_ptr.should_exit) return env_ptr.exit_value;
+            return 1;
+        };
+        if (env_ptr.should_exit) return env_ptr.exit_value;
         return if (result != 0) 0 else 1;
     }
 
@@ -1195,7 +1253,12 @@ pub const Executor = struct {
             const envp = self.env.buildEnvp() catch posix.exit(1);
             const argv = self.buildArgv(fields) catch posix.exit(1);
 
-            posix.execve(path, argv, envp) catch {};
+            posix.execve(path, argv, envp) catch |err| {
+                if (err == error.NoExec) {
+                    const sh_argv = self.buildShArgv(path, fields) catch posix.exit(126);
+                    posix.execve("/bin/sh", sh_argv, envp) catch {};
+                }
+            };
             const exit_code: u8 = if (posix.stat(path)) |_| 126 else |_| 127;
             posix.exit(exit_code);
         }
@@ -1233,6 +1296,19 @@ pub const Executor = struct {
         for (fields) |field| {
             const arg_z = try self.alloc.dupeZ(u8, field);
             try argv.append(self.alloc, arg_z.ptr);
+        }
+        return argv.toOwnedSliceSentinel(self.alloc, null);
+    }
+
+    fn buildShArgv(self: *Executor, path: [*:0]const u8, fields: []const []const u8) ![:null]const ?[*:0]const u8 {
+        var argv: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+        try argv.append(self.alloc, "/bin/sh");
+        try argv.append(self.alloc, path);
+        if (fields.len > 1) {
+            for (fields[1..]) |field| {
+                const arg_z = try self.alloc.dupeZ(u8, field);
+                try argv.append(self.alloc, arg_z.ptr);
+            }
         }
         return argv.toOwnedSliceSentinel(self.alloc, null);
     }
@@ -1366,9 +1442,9 @@ pub const Executor = struct {
         if (arg_start + 1 < fields.len) {
             self.env.pushPositionalParams(fields[arg_start + 1 ..]) catch return 1;
             defer self.env.popPositionalParams();
-            status = self.executeInline(content.items);
+            status = self.executeInlineSpecial(content.items);
         } else {
-            status = self.executeInline(content.items);
+            status = self.executeInlineSpecial(content.items);
         }
         if (self.env.should_return) {
             status = self.env.return_value;
@@ -1408,7 +1484,7 @@ pub const Executor = struct {
             eval_buf.appendSlice(self.alloc, f) catch return 1;
         }
 
-        return self.executeInline(eval_buf.items);
+        return self.executeInlineSpecial(eval_buf.items);
     }
 
     fn executeExecBuiltin(self: *Executor, fields: []const []const u8, assigns: []const ast.Assignment, expander: *Expander) u8 {
@@ -1465,8 +1541,10 @@ pub const Executor = struct {
     fn executeCommandBuiltin(self: *Executor, fields: []const []const u8, assigns: []const ast.Assignment, expander: *Expander) u8 {
         if (fields.len < 2) return 0;
 
+        const default_path = "/usr/bin:/bin:/usr/sbin:/sbin";
         var start: usize = 1;
         var mode: enum { execute, short, verbose } = .execute;
+        var use_default_path = false;
         while (start < fields.len) {
             if (std.mem.eql(u8, fields[start], "-v")) {
                 mode = .short;
@@ -1475,6 +1553,7 @@ pub const Executor = struct {
                 mode = .verbose;
                 start += 1;
             } else if (std.mem.eql(u8, fields[start], "-p")) {
+                use_default_path = true;
                 start += 1;
             } else {
                 break;
@@ -1513,7 +1592,7 @@ pub const Executor = struct {
                         status = 1;
                     }
                 } else {
-                    status = 1;
+                    status = 127;
                 }
             }
             return status;
@@ -1524,9 +1603,9 @@ pub const Executor = struct {
             for (fields[start..]) |name| {
                 if (self.env.getAlias(name)) |alias_val| {
                     posix.writeAll(1, name);
-                    posix.writeAll(1, " is an alias for \"");
+                    posix.writeAll(1, " is an alias for ");
                     posix.writeAll(1, alias_val);
-                    posix.writeAll(1, "\"\n");
+                    posix.writeAll(1, "\n");
                 } else if (token.reserved_words.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a shell keyword\n");
@@ -1542,13 +1621,23 @@ pub const Executor = struct {
                     posix.writeAll(1, std.mem.sliceTo(path, 0));
                     posix.writeAll(1, "\n");
                 } else {
-                    posix.writeAll(2, name);
-                    posix.writeAll(2, ": not found\n");
-                    status = 1;
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, ": not found\n");
+                    status = 127;
                 }
             }
             return status;
         }
+
+        const saved_path = if (use_default_path) self.env.get("PATH") else null;
+        if (use_default_path) self.env.set("PATH", default_path, true) catch {};
+        defer if (use_default_path) {
+            if (saved_path) |p| {
+                self.env.set("PATH", p, true) catch {};
+            } else {
+                _ = self.env.unset("PATH");
+            }
+        };
 
         const cmd_name = fields[start];
         if (std.mem.eql(u8, cmd_name, "builtin")) {
@@ -1568,6 +1657,8 @@ pub const Executor = struct {
                 posix.writeAll(2, ": not a shell builtin\n");
                 return 1;
             }
+        } else if (std.mem.eql(u8, cmd_name, "command")) {
+            return self.executeCommandBuiltin(fields[start..], assigns, expander);
         } else if (std.mem.eql(u8, cmd_name, ".") or std.mem.eql(u8, cmd_name, "source")) {
             return self.executeSourceBuiltin(fields[start..]);
         } else if (std.mem.eql(u8, cmd_name, "eval")) {
@@ -1691,6 +1782,25 @@ pub const Executor = struct {
         var lexer = Lexer.init(source);
         var parser = Parser.init(self.alloc, &lexer) catch return 2;
         const program = parser.parseProgram() catch return 2;
+        return self.executeProgram(program);
+    }
+
+    fn executeInlineSpecial(self: *Executor, source: []const u8) u8 {
+        var lexer = Lexer.init(source);
+        var parser = Parser.init(self.alloc, &lexer) catch {
+            if (!self.env.options.interactive) {
+                self.env.should_exit = true;
+                self.env.exit_value = 2;
+            }
+            return 2;
+        };
+        const program = parser.parseProgram() catch {
+            if (!self.env.options.interactive) {
+                self.env.should_exit = true;
+                self.env.exit_value = 2;
+            }
+            return 2;
+        };
         return self.executeProgram(program);
     }
 

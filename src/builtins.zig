@@ -250,13 +250,34 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
         return 0;
     }
 
-    const start: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
-    for (args[start..]) |arg| {
+    const start_idx: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
+    for (args[start_idx..]) |arg| {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
-            const name = arg[0..eq];
-            const value = arg[eq + 1 ..];
+            const is_append = eq > 0 and arg[eq - 1] == '+';
+            const name = if (is_append) arg[0 .. eq - 1] else arg[0..eq];
+            if (!isValidVarName(name)) {
+                posix.writeAll(2, "export: `");
+                posix.writeAll(2, arg);
+                posix.writeAll(2, "': not a valid identifier\n");
+                env.should_exit = true;
+                env.exit_value = 2;
+                return 2;
+            }
+            var value = arg[eq + 1 ..];
+            if (is_append) {
+                const existing = env.get(name) orelse "";
+                value = std.fmt.allocPrint(env.alloc, "{s}{s}", .{ existing, value }) catch value;
+            }
             env.set(name, value, true) catch return 1;
         } else {
+            if (!isValidVarName(arg)) {
+                posix.writeAll(2, "export: `");
+                posix.writeAll(2, arg);
+                posix.writeAll(2, "': not a valid identifier\n");
+                env.should_exit = true;
+                env.exit_value = 2;
+                return 2;
+            }
             env.markExported(arg);
         }
     }
@@ -294,7 +315,9 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
                     posix.writeAll(2, "zigsh: unset: ");
                     posix.writeAll(2, name);
                     posix.writeAll(2, ": readonly variable\n");
-                    status = 1;
+                    env.should_exit = true;
+                    env.exit_value = 2;
+                    return 2;
                 }
             } else {
                 _ = env.unsetFunction(name);
@@ -313,24 +336,23 @@ fn isValidVarName(name: []const u8) bool {
     return true;
 }
 
+fn isValidVarRef(name: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, name, '[')) |bracket| {
+        if (name.len == 0 or name[name.len - 1] != ']') return false;
+        return isValidVarName(name[0..bracket]);
+    }
+    return isValidVarName(name);
+}
+
 fn setWriteValue(value: []const u8) void {
-    var needs_quoting = false;
     var has_special = false;
     for (value) |ch| {
         switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '/', '.', '-', '+', ':', ',', '@', '%', '^' => {},
             '\n', '\r', '\t', 0x01...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0xff => {
                 has_special = true;
-                needs_quoting = true;
             },
-            else => {
-                needs_quoting = true;
-            },
+            else => {},
         }
-    }
-    if (!needs_quoting) {
-        posix.writeAll(1, value);
-        return;
     }
     if (has_special) {
         posix.writeAll(1, "$'");
@@ -428,7 +450,7 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "+o")) {
             if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-' and args[i + 1][0] != '+') {
                 i += 1;
-                setOptionByName(&env.options, args[i], enable);
+                if (!setOptionByName(&env.options, args[i], enable)) return 2;
             } else if (enable) {
                 printOptions(&env.options);
             } else {
@@ -464,7 +486,7 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
-fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable: bool) void {
+fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable: bool) bool {
     if (std.mem.eql(u8, name, "errexit")) { options.errexit = enable; }
     else if (std.mem.eql(u8, name, "nounset")) { options.nounset = enable; }
     else if (std.mem.eql(u8, name, "xtrace")) { options.xtrace = enable; }
@@ -476,11 +498,14 @@ fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable:
     else if (std.mem.eql(u8, name, "verbose")) { options.verbose = enable; }
     else if (std.mem.eql(u8, name, "pipefail")) { options.pipefail = enable; }
     else if (std.mem.eql(u8, name, "history")) { options.history = enable; }
+    else if (std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "interactive") or std.mem.eql(u8, name, "hashall") or std.mem.eql(u8, name, "braceexpand") or std.mem.eql(u8, name, "vi") or std.mem.eql(u8, name, "emacs")) {}
     else {
         posix.writeAll(2, "set: unknown option: ");
         posix.writeAll(2, name);
         posix.writeAll(2, "\n");
+        return false;
     }
+    return true;
 }
 
 fn printOptions(options: *const Environment.ShellOptions) void {
@@ -539,7 +564,7 @@ fn builtinShift(args: []const []const u8, env: *Environment) u8 {
             return 2;
         };
     }
-    if (n > env.positional_params.len) return 1;
+    if (n > env.positional_params.len) return 2;
     env.positional_params = env.positional_params[n..];
     return 0;
 }
@@ -550,7 +575,12 @@ fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
         if (std.fmt.parseInt(i64, args[1], 10)) |n| {
             val = @truncate(@as(u64, @bitCast(n)));
         } else |_| {
-            val = env.last_exit_status;
+            posix.writeAll(2, "return: ");
+            posix.writeAll(2, args[1]);
+            posix.writeAll(2, ": Illegal number\n");
+            env.should_exit = true;
+            env.exit_value = 2;
+            return 2;
         }
     }
     env.should_return = true;
@@ -642,7 +672,7 @@ fn builtinEcho(args: []const []const u8, _: *Environment) u8 {
     while (i < args.len) : (i += 1) {
         if (i > first_arg) posix.writeAll(1, " ");
         if (interpret_escapes) {
-            echoEscape(args[i]);
+            if (echoEscape(args[i])) return 0;
         } else {
             posix.writeAll(1, args[i]);
         }
@@ -651,7 +681,7 @@ fn builtinEcho(args: []const []const u8, _: *Environment) u8 {
     return 0;
 }
 
-fn echoEscape(s: []const u8) void {
+fn echoEscape(s: []const u8) bool {
     var j: usize = 0;
     while (j < s.len) {
         if (s[j] == '\\' and j + 1 < s.len) {
@@ -664,7 +694,7 @@ fn echoEscape(s: []const u8) void {
                     posix.writeAll(1, "\x08");
                     j += 2;
                 },
-                'c' => return,
+                'c' => return true,
                 'e', 'E' => {
                     posix.writeAll(1, "\x1b");
                     j += 2;
@@ -736,6 +766,7 @@ fn echoEscape(s: []const u8) void {
             posix.writeAll(1, s[start..j]);
         }
     }
+    return false;
 }
 
 fn builtinTest(args: []const []const u8, test_env: *Environment) u8 {
@@ -1100,14 +1131,14 @@ fn builtinWait(args: []const []const u8, env: *Environment) u8 {
             if (arg.len > 0 and arg[0] == '%') {
                 const jt = env.job_table orelse {
                     posix.writeAll(2, "wait: no job control\n");
-                    status = 127;
+                    status = 2;
                     continue;
                 };
                 const job = jt.parseJobSpec(arg) orelse {
                     posix.writeAll(2, "wait: no such job: ");
                     posix.writeAll(2, arg);
                     posix.writeAll(2, "\n");
-                    status = 127;
+                    status = 2;
                     continue;
                 };
                 const result = posix.waitpid(job.pid, 0);
@@ -1223,7 +1254,7 @@ fn builtinKill(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(2, "kill: invalid signal: ");
             posix.writeAll(2, args[2]);
             posix.writeAll(2, "\n");
-            return 1;
+            return 2;
         };
         start = 3;
     } else if (args[1].len > 1 and args[1][0] == '-') {
@@ -1442,14 +1473,27 @@ fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
         return 0;
     }
 
-    const start: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
-    for (args[start..]) |arg| {
+    const start_ro: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
+    for (args[start_ro..]) |arg| {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
-            const name = arg[0..eq];
-            const value = arg[eq + 1 ..];
+            const is_append = eq > 0 and arg[eq - 1] == '+';
+            const name = if (is_append) arg[0 .. eq - 1] else arg[0..eq];
+            var value = arg[eq + 1 ..];
+            if (is_append) {
+                const existing = env.get(name) orelse "";
+                value = std.fmt.allocPrint(env.alloc, "{s}{s}", .{ existing, value }) catch value;
+            }
             env.set(name, value, false) catch return 1;
             env.markReadonly(name);
         } else {
+            if (!isValidVarName(arg)) {
+                posix.writeAll(2, "readonly: `");
+                posix.writeAll(2, arg);
+                posix.writeAll(2, "': not a valid identifier\n");
+                env.should_exit = true;
+                env.exit_value = 2;
+                return 2;
+            }
             env.markReadonly(arg);
         }
     }
@@ -1933,7 +1977,7 @@ fn printfParseNumericArg(arg: []const u8, had_error: *bool) i64 {
     while (s.len > 0 and s[0] == ' ') s = s[1..];
     if (s.len == 0) return 0;
 
-    if (s.len >= 2 and (s[0] == '\'' or s[0] == '"')) {
+    if (s.len >= 1 and (s[0] == '\'' or s[0] == '"')) {
         const bytes = s[1..];
         if (bytes.len == 0) return 0;
         const b0 = bytes[0];
@@ -1950,9 +1994,12 @@ fn printfParseNumericArg(arg: []const u8, had_error: *bool) i64 {
     s = s[0..end];
     if (s.len == 0) return 0;
 
-    if (std.mem.indexOfScalar(u8, s, '#') != null) {
+    if (std.mem.indexOfScalar(u8, s, '#')) |hash_pos| {
         had_error.* = true;
         printfNumericError(arg);
+        if (hash_pos > 0) {
+            if (std.fmt.parseInt(i64, s[0..hash_pos], 10)) |v| return v else |_| {}
+        }
         return 0;
     }
 
@@ -2023,7 +2070,8 @@ fn printfParseFloatArg(arg: []const u8, had_error: *bool) f64 {
     var s = arg;
     while (s.len > 0 and s[0] == ' ') s = s[1..];
     if (s.len == 0) return 0.0;
-    if (s.len >= 2 and (s[0] == '\'' or s[0] == '"')) {
+    if (s.len >= 1 and (s[0] == '\'' or s[0] == '"')) {
+        if (s.len < 2) return 0.0;
         return @floatFromInt(@as(i64, s[1]));
     }
     return std.fmt.parseFloat(f64, s) catch {
@@ -2259,17 +2307,38 @@ fn printfFormatQString(arg: []const u8, spec: PrintfSpec) void {
     }
 
     var needs_quoting = false;
-    var has_special = false;
-    for (arg) |ch| {
-        switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '/', '.', '-', '+', ':', ',', '@', '%', '^' => {},
-            '\n', '\r', '\t', 0x01...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0xff => {
-                has_special = true;
-                needs_quoting = true;
-            },
-            else => {
-                needs_quoting = true;
-            },
+    var has_control = false;
+    var has_single_quote = false;
+    {
+        var si: usize = 0;
+        while (si < arg.len) {
+            const ch = arg[si];
+            if (ch < 0x80) {
+                switch (ch) {
+                    'a'...'z', 'A'...'Z', '0'...'9', '_', '/', '.', '-', '+', ':', ',', '@', '%', '^' => {},
+                    '\'' => {
+                        has_single_quote = true;
+                        needs_quoting = true;
+                    },
+                    '\n', '\r', '\t', 0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                        has_control = true;
+                        needs_quoting = true;
+                    },
+                    else => {
+                        needs_quoting = true;
+                    },
+                }
+                si += 1;
+            } else {
+                const seq_len = printfUtf8SeqLen(ch);
+                if (seq_len > 1 and si + seq_len <= arg.len and printfValidUtf8Cont(arg[si + 1 .. si + seq_len])) {
+                    si += seq_len;
+                } else {
+                    has_control = true;
+                    needs_quoting = true;
+                    si += 1;
+                }
+            }
         }
     }
 
@@ -2281,13 +2350,40 @@ fn printfFormatQString(arg: []const u8, spec: PrintfSpec) void {
     var buf: [8192]u8 = undefined;
     var len: usize = 0;
 
-    if (has_special) {
+    if (has_control) {
         buf[len] = '$';
         len += 1;
         buf[len] = '\'';
         len += 1;
-        for (arg) |ch| {
+        var ii: usize = 0;
+        while (ii < arg.len) {
             if (len + 10 >= buf.len) break;
+            const ch = arg[ii];
+            if (ch >= 0x80) {
+                const seq_len = printfUtf8SeqLen(ch);
+                if (seq_len > 1 and ii + seq_len <= arg.len and printfValidUtf8Cont(arg[ii + 1 .. ii + seq_len])) {
+                    @memcpy(buf[len .. len + seq_len], arg[ii .. ii + seq_len]);
+                    len += seq_len;
+                    ii += seq_len;
+                } else {
+                    if (ch >= 0xc0 and ch <= 0xf4) {
+                        const hex_chars = "0123456789abcdef";
+                        buf[len] = '\\';
+                        buf[len + 1] = 'x';
+                        buf[len + 2] = hex_chars[ch >> 4];
+                        buf[len + 3] = hex_chars[ch & 0xf];
+                        len += 4;
+                    } else {
+                        buf[len] = '\\';
+                        buf[len + 1] = '0' + (ch >> 6);
+                        buf[len + 2] = '0' + ((ch >> 3) & 7);
+                        buf[len + 3] = '0' + (ch & 7);
+                        len += 4;
+                    }
+                    ii += 1;
+                }
+                continue;
+            }
             switch (ch) {
                 '\'' => {
                     buf[len] = '\\';
@@ -2325,36 +2421,58 @@ fn printfFormatQString(arg: []const u8, spec: PrintfSpec) void {
                     len += 2;
                 },
                 else => {
-                    if (ch < 0x20 or ch >= 0x7f) {
-                        const hex = std.fmt.bufPrint(buf[len..], "\\u{x:0>4}", .{ch}) catch break;
-                        len += hex.len;
+                    if (ch < 0x20 or ch == 0x7f) {
+                        const hex_chars = "0123456789abcdef";
+                        buf[len] = '\\';
+                        buf[len + 1] = 'u';
+                        buf[len + 2] = '0';
+                        buf[len + 3] = '0';
+                        buf[len + 4] = hex_chars[ch >> 4];
+                        buf[len + 5] = hex_chars[ch & 0xf];
+                        len += 6;
                     } else {
                         buf[len] = ch;
                         len += 1;
                     }
                 },
             }
+            ii += 1;
         }
         if (len + 1 < buf.len) {
             buf[len] = '\'';
             len += 1;
         }
+    } else if (has_single_quote) {
+        var ii: usize = 0;
+        while (ii < arg.len) {
+            if (len + 6 >= buf.len) break;
+            const ch = arg[ii];
+            if (ch >= 0x80) {
+                buf[len] = ch;
+                len += 1;
+                ii += 1;
+                continue;
+            }
+            switch (ch) {
+                'a'...'z', 'A'...'Z', '0'...'9', '_', '/', '.', '-', '+', ':', ',', '@', '%', '^' => {
+                    buf[len] = ch;
+                    len += 1;
+                },
+                else => {
+                    buf[len] = '\\';
+                    buf[len + 1] = ch;
+                    len += 2;
+                },
+            }
+            ii += 1;
+        }
     } else {
         buf[len] = '\'';
         len += 1;
         for (arg) |ch| {
-            if (ch == '\'') {
-                if (len + 4 >= buf.len) break;
-                buf[len] = '\'';
-                buf[len + 1] = '\\';
-                buf[len + 2] = '\'';
-                buf[len + 3] = '\'';
-                len += 4;
-            } else {
-                if (len + 1 >= buf.len) break;
-                buf[len] = ch;
-                len += 1;
-            }
+            if (len + 1 >= buf.len) break;
+            buf[len] = ch;
+            len += 1;
         }
         if (len + 1 < buf.len) {
             buf[len] = '\'';
@@ -2374,6 +2492,21 @@ fn printfFormatQString(arg: []const u8, spec: PrintfSpec) void {
     } else {
         posix.writeAll(1, result);
     }
+}
+
+fn printfUtf8SeqLen(lead: u8) u3 {
+    if (lead < 0xC2) return 1;
+    if (lead < 0xE0) return 2;
+    if (lead < 0xF0) return 3;
+    if (lead < 0xF5) return 4;
+    return 1;
+}
+
+fn printfValidUtf8Cont(bytes: []const u8) bool {
+    for (bytes) |b| {
+        if ((b & 0xC0) != 0x80) return false;
+    }
+    return true;
 }
 
 fn printfFormatChar(arg: []const u8, spec: PrintfSpec) void {
@@ -2533,6 +2666,12 @@ fn builtinPrintf(args: []const []const u8, env: *Environment) u8 {
             return 2;
         }
         var_name = args[fmt_idx];
+        if (!isValidVarRef(args[fmt_idx])) {
+            posix.writeAll(2, "printf: `");
+            posix.writeAll(2, args[fmt_idx]);
+            posix.writeAll(2, "': not a valid identifier\n");
+            return 2;
+        }
         fmt_idx += 1;
         if (fmt_idx >= args.len) {
             posix.writeAll(2, "printf: usage: printf format [arguments]\n");
@@ -2681,7 +2820,7 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
         }
 
         if (i >= mask_arg.len) break;
-        const op = mask_arg[i];
+        var op = mask_arg[i];
         if (op != '=' and op != '+' and op != '-') {
             posix.writeAll(2, "umask: invalid symbolic mode\n");
             _ = libc.umask(current);
@@ -2689,32 +2828,41 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
         }
         i += 1;
 
-        var bits: c_uint = 0;
-        while (i < mask_arg.len and mask_arg[i] != ',') : (i += 1) {
-            switch (mask_arg[i]) {
-                'r' => bits |= 4,
-                'w' => bits |= 2,
-                'x' => bits |= 1,
-                else => break,
+        while (true) {
+            var bits: c_uint = 0;
+            while (i < mask_arg.len and mask_arg[i] != ',') : (i += 1) {
+                switch (mask_arg[i]) {
+                    'r' => bits |= 4,
+                    'w' => bits |= 2,
+                    'x' => bits |= 1,
+                    else => break,
+                }
             }
-        }
 
-        var mask_bits: c_uint = 0;
-        if (who_u) mask_bits |= bits << 6;
-        if (who_g) mask_bits |= bits << 3;
-        if (who_o) mask_bits |= bits;
+            var mask_bits: c_uint = 0;
+            if (who_u) mask_bits |= bits << 6;
+            if (who_g) mask_bits |= bits << 3;
+            if (who_o) mask_bits |= bits;
 
-        switch (op) {
-            '=' => {
-                var clear: c_uint = 0;
-                if (who_u) clear |= 0o700;
-                if (who_g) clear |= 0o070;
-                if (who_o) clear |= 0o007;
-                perm = (perm & ~clear) | mask_bits;
-            },
-            '+' => perm |= mask_bits,
-            '-' => perm &= ~mask_bits,
-            else => {},
+            switch (op) {
+                '=' => {
+                    var clear: c_uint = 0;
+                    if (who_u) clear |= 0o700;
+                    if (who_g) clear |= 0o070;
+                    if (who_o) clear |= 0o007;
+                    perm = (perm & ~clear) | mask_bits;
+                },
+                '+' => perm |= mask_bits,
+                '-' => perm &= ~mask_bits,
+                else => {},
+            }
+
+            if (i < mask_arg.len and (mask_arg[i] == '+' or mask_arg[i] == '-' or mask_arg[i] == '=')) {
+                op = mask_arg[i];
+                i += 1;
+                continue;
+            }
+            break;
         }
 
         if (i < mask_arg.len and mask_arg[i] == ',') i += 1;
@@ -3109,6 +3257,10 @@ fn builtinHash(args: []const []const u8, env: *Environment) u8 {
     }
 
     if (std.mem.eql(u8, args[1], "-r")) {
+        if (args.len > 2) {
+            posix.writeAll(2, "hash: -r: too many arguments\n");
+            return 1;
+        }
         env.clearCommandHash();
         return 0;
     }
@@ -3324,18 +3476,18 @@ fn printTrapEntry(action: []const u8, name: []const u8) void {
 }
 
 const trap_sig_entries = [_]struct { num: u6, name: []const u8 }{
-    .{ .num = signals.SIGHUP, .name = "SIGHUP" },
-    .{ .num = signals.SIGINT, .name = "SIGINT" },
-    .{ .num = signals.SIGQUIT, .name = "SIGQUIT" },
-    .{ .num = signals.SIGABRT, .name = "SIGABRT" },
-    .{ .num = signals.SIGALRM, .name = "SIGALRM" },
-    .{ .num = signals.SIGTERM, .name = "SIGTERM" },
-    .{ .num = signals.SIGTSTP, .name = "SIGTSTP" },
-    .{ .num = signals.SIGCONT, .name = "SIGCONT" },
-    .{ .num = signals.SIGCHLD, .name = "SIGCHLD" },
-    .{ .num = signals.SIGUSR1, .name = "SIGUSR1" },
-    .{ .num = signals.SIGUSR2, .name = "SIGUSR2" },
-    .{ .num = signals.SIGPIPE, .name = "SIGPIPE" },
+    .{ .num = signals.SIGHUP, .name = "HUP" },
+    .{ .num = signals.SIGINT, .name = "INT" },
+    .{ .num = signals.SIGQUIT, .name = "QUIT" },
+    .{ .num = signals.SIGABRT, .name = "ABRT" },
+    .{ .num = signals.SIGALRM, .name = "ALRM" },
+    .{ .num = signals.SIGTERM, .name = "TERM" },
+    .{ .num = signals.SIGTSTP, .name = "TSTP" },
+    .{ .num = signals.SIGCONT, .name = "CONT" },
+    .{ .num = signals.SIGCHLD, .name = "CHLD" },
+    .{ .num = signals.SIGUSR1, .name = "USR1" },
+    .{ .num = signals.SIGUSR2, .name = "USR2" },
+    .{ .num = signals.SIGPIPE, .name = "PIPE" },
 };
 
 fn printTraps() void {
@@ -3623,10 +3775,21 @@ fn builtinHistory(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
-    if (args.len < 2) return 0;
+    if (args.len < 2) {
+        var it = env.vars.iterator();
+        while (it.next()) |entry| {
+            posix.writeAll(1, entry.key_ptr.*);
+            posix.writeAll(1, "=");
+            setWriteValue(entry.value_ptr.value);
+            posix.writeAll(1, "\n");
+        }
+        return 0;
+    }
     var flags_export = false;
     var flags_readonly = false;
     var flags_integer = false;
+    var flags_lowercase = false;
+    var flags_uppercase = false;
     var flags_print = false;
     var flags_unset_attrs = false;
     var flags_func = false;
@@ -3634,6 +3797,8 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
     var has_export = false;
     var has_readonly = false;
     var has_integer = false;
+    var has_lowercase = false;
+    var has_uppercase = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -3661,7 +3826,15 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                 'p' => flags_print = true,
                 'f' => flags_func = true,
                 'F' => flags_func_names = true,
-                'a', 'A', 'n', 'g', 'l', 'u', 't' => {},
+                'l' => {
+                    has_lowercase = true;
+                    flags_lowercase = !removing;
+                },
+                'u' => {
+                    has_uppercase = true;
+                    flags_uppercase = !removing;
+                },
+                'a', 'A', 'n', 'g', 't' => {},
                 else => {},
             }
         }
@@ -3748,10 +3921,36 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.indexOf(u8, arg, "=")) |eq| {
-            const name = arg[0..eq];
+            const is_append = eq > 0 and arg[eq - 1] == '+';
+            const name = if (is_append) arg[0 .. eq - 1] else arg[0..eq];
+            if (!isValidVarName(name)) {
+                posix.writeAll(2, args[0]);
+                posix.writeAll(2, ": `");
+                posix.writeAll(2, arg);
+                posix.writeAll(2, "': not a valid identifier\n");
+                env.should_exit = true;
+                env.exit_value = 2;
+                return 2;
+            }
             var val = arg[eq + 1 ..];
+            if (is_append) {
+                const existing = env.get(name) orelse "";
+                val = std.fmt.allocPrint(env.alloc, "{s}{s}", .{ existing, val }) catch val;
+            }
             if (flags_integer) {
                 val = declareEvalInt(val, env);
+            }
+            if (flags_lowercase or flags_uppercase) {
+                if (env.vars.getPtr(name)) |v| {
+                    v.lowercase = flags_lowercase;
+                    v.uppercase = flags_uppercase;
+                } else {
+                    env.set(name, "", flags_export) catch {};
+                    if (env.vars.getPtr(name)) |v| {
+                        v.lowercase = flags_lowercase;
+                        v.uppercase = flags_uppercase;
+                    }
+                }
             }
             env.set(name, val, flags_export) catch {};
             if (flags_integer) {
@@ -3766,12 +3965,16 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     if (has_integer) v.integer = false;
                     if (has_export) v.exported = false;
                     if (has_readonly) v.readonly = false;
+                    if (has_lowercase) v.lowercase = false;
+                    if (has_uppercase) v.uppercase = false;
                 }
             } else {
                 if (env.vars.getPtr(arg)) |v| {
                     if (flags_export) v.exported = true;
                     if (flags_readonly) v.readonly = true;
                     if (flags_integer) v.integer = true;
+                    if (flags_lowercase) { v.lowercase = true; v.uppercase = false; }
+                    if (flags_uppercase) { v.uppercase = true; v.lowercase = false; }
                 } else {
                     env.set(arg, "", flags_export) catch {};
                     if (flags_integer) {
@@ -3779,6 +3982,12 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     }
                     if (flags_readonly) {
                         if (env.vars.getPtr(arg)) |v| v.readonly = true;
+                    }
+                    if (flags_lowercase) {
+                        if (env.vars.getPtr(arg)) |v| { v.lowercase = true; v.uppercase = false; }
+                    }
+                    if (flags_uppercase) {
+                        if (env.vars.getPtr(arg)) |v| { v.uppercase = true; v.lowercase = false; }
                     }
                 }
             }
@@ -3917,6 +4126,7 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
             }
         } else {
             if (env.shopt.ignore_shopt_not_impl) {
+                status = 2;
                 continue;
             }
             if (set_mode == .query) {

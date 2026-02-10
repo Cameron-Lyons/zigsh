@@ -74,6 +74,7 @@ pub const SimpleCommand = struct {
 pub const Assignment = struct {
     name: []const u8,
     value: Word,
+    append: bool = false,
 };
 
 pub const Word = struct {

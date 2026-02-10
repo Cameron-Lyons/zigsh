@@ -452,6 +452,7 @@ pub const Lexer = struct {
         const ch = self.source[self.pos];
         if (ch != '<' and ch != '>') return false;
 
+        if (self.pos - start > 1) return false;
         for (self.source[start..self.pos]) |d| {
             if (d < '0' or d > '9') return false;
         }
@@ -463,7 +464,11 @@ pub const Lexer = struct {
         const eq_idx = std.mem.indexOfScalar(u8, text, '=') orelse return false;
         if (eq_idx == 0) return false;
 
-        const name = text[0..eq_idx];
+        var name = text[0..eq_idx];
+        if (name.len > 0 and name[name.len - 1] == '+') {
+            name = name[0 .. name.len - 1];
+            if (name.len == 0) return false;
+        }
         if (name[0] != '_' and !std.ascii.isAlphabetic(name[0])) return false;
         for (name[1..]) |c| {
             if (c != '_' and !std.ascii.isAlphanumeric(c)) return false;
