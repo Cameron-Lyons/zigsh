@@ -109,6 +109,7 @@ pub const ParameterExp = union(enum) {
     substring: SubstringOp,
     case_conv: CaseConvOp,
     indirect: []const u8,
+    transform: TransformOp,
 };
 
 pub const ParamOp = struct {
@@ -246,6 +247,11 @@ pub const CaseConvOp = struct {
 };
 
 pub const CaseConvMode = enum { upper_first, upper_all, lower_first, lower_all };
+
+pub const TransformOp = struct {
+    name: []const u8,
+    operator: u8,
+};
 
 pub const FunctionDef = struct {
     name: []const u8,

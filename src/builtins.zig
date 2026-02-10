@@ -1594,11 +1594,12 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     }
 
     var buf: [4096]u8 = undefined;
+    var escaped: [4096]bool = .{false} ** 4096;
     var total: usize = 0;
     var hit_eof = false;
 
-    const max_chars = nchars orelse buf.len;
-    if (raw or nchars != null) {
+    if (raw) {
+        const max_chars = nchars orelse buf.len;
         while (total < buf.len and total < max_chars) {
             const n = posix.read(read_fd, buf[total .. total + 1]) catch {
                 hit_eof = true;
@@ -1610,6 +1611,41 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
             }
             if (!nchars_exact and ((use_nul_delim and buf[total] == 0) or (!use_nul_delim and buf[total] == delim))) break;
             total += 1;
+        }
+    } else if (nchars != null) {
+        var logical_chars: usize = 0;
+        const max_chars = nchars.?;
+        while (total < buf.len and logical_chars < max_chars) {
+            var byte_buf: [1]u8 = undefined;
+            const n = posix.read(read_fd, &byte_buf) catch {
+                hit_eof = true;
+                break;
+            };
+            if (n == 0) {
+                hit_eof = true;
+                break;
+            }
+            const ch = byte_buf[0];
+            if (!nchars_exact and ((use_nul_delim and ch == 0) or (!use_nul_delim and ch == delim))) break;
+            if (ch == '\\') {
+                const n2 = posix.read(read_fd, &byte_buf) catch {
+                    hit_eof = true;
+                    break;
+                };
+                if (n2 == 0) {
+                    hit_eof = true;
+                    break;
+                }
+                if (byte_buf[0] == '\n') continue;
+                buf[total] = byte_buf[0];
+                escaped[total] = true;
+                total += 1;
+                logical_chars += 1;
+            } else {
+                buf[total] = ch;
+                total += 1;
+                logical_chars += 1;
+            }
         }
     } else {
         while (total < buf.len) {
@@ -1635,6 +1671,7 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
                 }
                 if (byte_buf[0] == '\n') continue;
                 buf[total] = byte_buf[0];
+                escaped[total] = true;
                 total += 1;
             } else {
                 buf[total] = ch;
@@ -1651,16 +1688,16 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
             env.set(effective_names[0], line, false) catch return 1;
         } else {
             var start: usize = 0;
-            while (start < line.len and isIfsWhitespace(line[start], ifs)) : (start += 1) {}
+            while (start < line.len and !escaped[start] and isIfsWhitespace(line[start], ifs)) : (start += 1) {}
             var end: usize = line.len;
-            while (end > start and isIfsWhitespace(line[end - 1], ifs)) : (end -= 1) {}
+            while (end > start and !escaped[end - 1] and isIfsWhitespace(line[end - 1], ifs)) : (end -= 1) {}
             env.set(effective_names[0], line[start..end], false) catch return 1;
         }
         return if (hit_eof) 1 else 0;
     }
 
     var pos: usize = 0;
-    while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+    while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
 
     var var_idx: usize = 0;
     while (var_idx < effective_names.len - 1) : (var_idx += 1) {
@@ -1669,21 +1706,34 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
             continue;
         }
         const field_start = pos;
-        while (pos < line.len and !isIfsChar(line[pos], ifs)) : (pos += 1) {}
+        while (pos < line.len and (escaped[pos] or !isIfsChar(line[pos], ifs))) : (pos += 1) {}
         env.set(effective_names[var_idx], line[field_start..pos], false) catch return 1;
 
         if (pos < line.len) {
-            while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
-            if (pos < line.len and isIfsNonWhitespace(line[pos], ifs)) {
+            while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+            if (pos < line.len and !escaped[pos] and isIfsNonWhitespace(line[pos], ifs)) {
                 pos += 1;
-                while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
             }
         }
     }
 
     if (var_idx < effective_names.len) {
         var end: usize = line.len;
-        while (end > pos and isIfsWhitespace(line[end - 1], ifs)) : (end -= 1) {}
+        while (end > pos and !escaped[end - 1] and isIfsWhitespace(line[end - 1], ifs)) : (end -= 1) {}
+        if (end > pos and !escaped[end - 1] and isIfsNonWhitespace(line[end - 1], ifs)) {
+            var trial_end = end - 1;
+            while (trial_end > pos and !escaped[trial_end - 1] and isIfsWhitespace(line[trial_end - 1], ifs)) : (trial_end -= 1) {}
+            var has_nws_ifs = false;
+            var i = pos;
+            while (i < trial_end) : (i += 1) {
+                if (!escaped[i] and isIfsNonWhitespace(line[i], ifs)) {
+                    has_nws_ifs = true;
+                    break;
+                }
+            }
+            if (!has_nws_ifs) end = trial_end;
+        }
         env.set(effective_names[var_idx], line[pos..end], false) catch return 1;
     }
 

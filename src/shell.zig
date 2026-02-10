@@ -7,6 +7,7 @@ const JobTable = @import("jobs.zig").JobTable;
 const LineEditor = @import("line_editor.zig").LineEditor;
 const signals = @import("signals.zig");
 const posix = @import("posix.zig");
+const Expander = @import("expander.zig").Expander;
 
 pub const Shell = struct {
     env: Environment,
@@ -161,7 +162,10 @@ pub const Shell = struct {
             self.jobs.notifyDoneJobs();
             self.checkSignalTraps();
 
-            const prompt = self.env.get("PS1") orelse "$ ";
+            const ps1_raw = self.env.get("PS1") orelse "$ ";
+            const prompt_expanded = Expander.expandPromptString(self.gpa, ps1_raw, &self.env, &self.jobs) catch null;
+            defer if (prompt_expanded) |p| self.gpa.free(p);
+            const prompt = prompt_expanded orelse ps1_raw;
             const line = editor.readLine(prompt) orelse break;
             if (line.len == 0) continue;
 
@@ -187,7 +191,10 @@ pub const Shell = struct {
                     break;
                 } else |err| {
                     if (isIncompleteError(err)) {
-                        const ps2 = self.env.get("PS2") orelse "> ";
+                        const ps2_raw = self.env.get("PS2") orelse "> ";
+                        const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
+                        defer if (ps2_expanded) |p| self.gpa.free(p);
+                        const ps2 = ps2_expanded orelse ps2_raw;
                         const cont = editor.readLine(ps2) orelse break;
                         accum.append(self.gpa, '\n') catch break;
                         accum.appendSlice(self.gpa, cont) catch break;
@@ -211,7 +218,10 @@ pub const Shell = struct {
             self.jobs.notifyDoneJobs();
             self.checkSignalTraps();
 
-            const prompt = self.env.get("PS1") orelse "$ ";
+            const ps1_raw = self.env.get("PS1") orelse "$ ";
+            const prompt_expanded = Expander.expandPromptString(self.gpa, ps1_raw, &self.env, &self.jobs) catch null;
+            defer if (prompt_expanded) |p| self.gpa.free(p);
+            const prompt = prompt_expanded orelse ps1_raw;
             posix.writeAll(2, prompt);
 
             const n = posix.read(0, &buf) catch break;
@@ -244,7 +254,10 @@ pub const Shell = struct {
                     break;
                 } else |err| {
                     if (isIncompleteError(err)) {
-                        const ps2 = self.env.get("PS2") orelse "> ";
+                        const ps2_raw = self.env.get("PS2") orelse "> ";
+                        const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
+                        defer if (ps2_expanded) |p| self.gpa.free(p);
+                        const ps2 = ps2_expanded orelse ps2_raw;
                         posix.writeAll(2, ps2);
                         const n2 = posix.read(0, &buf) catch break;
                         if (n2 == 0) break;

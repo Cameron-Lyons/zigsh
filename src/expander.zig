@@ -20,6 +20,30 @@ pub const ExpandError = error{
 
 const JobTable = @import("jobs.zig").JobTable;
 
+const libc = struct {
+    extern "c" fn getlogin() ?[*:0]const u8;
+    extern "c" fn time(tloc: ?*time_t) time_t;
+    extern "c" fn localtime(timer: *const time_t) ?*const Tm;
+    extern "c" fn strftime(buf: [*]u8, maxsize: usize, format: [*:0]const u8, tp: *const Tm) usize;
+    extern "c" fn ttyname(fd: c_int) ?[*:0]const u8;
+    extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
+
+    const time_t = i64;
+    const Tm = extern struct {
+        sec: c_int,
+        min: c_int,
+        hour: c_int,
+        mday: c_int,
+        mon: c_int,
+        year: c_int,
+        wday: c_int,
+        yday: c_int,
+        isdst: c_int,
+        gmtoff: c_long,
+        zone: ?[*:0]const u8,
+    };
+};
+
 pub const Expander = struct {
     env: *Environment,
     jobs: *JobTable,
@@ -64,8 +88,10 @@ pub const Expander = struct {
 
     pub fn expandWordsToFields(self: *Expander, words: []const ast.Word) ExpandError![]const []const u8 {
         var raw_fields: std.ArrayListUnmanaged([]const u8) = .empty;
+        var word_boundaries: std.ArrayListUnmanaged(usize) = .empty;
         const expanded_words = braceExpandWords(self.alloc, words) catch words;
         for (expanded_words) |word| {
+            try word_boundaries.append(self.alloc, raw_fields.items.len);
             if (findQuotedAt(word)) |at_info| {
                 try self.expandQuotedAtWord(word, at_info, &raw_fields);
                 continue;
@@ -105,7 +131,12 @@ pub const Expander = struct {
         }
         var fields: std.ArrayListUnmanaged([]const u8) = .empty;
         var prev_sentinel = false;
-        for (raw_fields.items) |field| {
+        var boundary_idx: usize = 0;
+        for (raw_fields.items, 0..) |field, fi| {
+            while (boundary_idx < word_boundaries.items.len and word_boundaries.items[boundary_idx] <= fi) {
+                if (word_boundaries.items[boundary_idx] == fi) prev_sentinel = false;
+                boundary_idx += 1;
+            }
             if (isSentinelOnly(field)) {
                 if (!prev_sentinel) {
                     try fields.append(self.alloc, try self.alloc.dupe(u8, ""));
@@ -318,6 +349,7 @@ pub const Expander = struct {
                 if (self.expandDynamic(var_name)) |val| return val;
                 return try self.alloc.dupe(u8, "");
             },
+            .transform => |op| return try self.expandTransform(op),
         }
     }
 
@@ -686,6 +718,326 @@ pub const Expander = struct {
         return result.toOwnedSlice(self.alloc);
     }
 
+    fn expandTransform(self: *Expander, op: ast.TransformOp) ExpandError![]const u8 {
+        const val = self.getParamValue(op.name) orelse "";
+        switch (op.operator) {
+            'P' => {
+                return self.expandPromptWithShellExpansion(val);
+            },
+            'Q' => {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                try result.append(self.alloc, '\'');
+                for (val) |ch| {
+                    if (ch == '\'') {
+                        try result.appendSlice(self.alloc, "'\\''");
+                    } else {
+                        try result.append(self.alloc, ch);
+                    }
+                }
+                try result.append(self.alloc, '\'');
+                return result.toOwnedSlice(self.alloc);
+            },
+            'E' => {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                var i: usize = 0;
+                while (i < val.len) {
+                    if (val[i] == '\\' and i + 1 < val.len) {
+                        i += 1;
+                        switch (val[i]) {
+                            'n' => try result.append(self.alloc, '\n'),
+                            't' => try result.append(self.alloc, '\t'),
+                            'r' => try result.append(self.alloc, '\r'),
+                            'a' => try result.append(self.alloc, 0x07),
+                            'b' => try result.append(self.alloc, 0x08),
+                            'e', 'E' => try result.append(self.alloc, 0x1b),
+                            '\\' => try result.append(self.alloc, '\\'),
+                            else => {
+                                try result.append(self.alloc, '\\');
+                                try result.append(self.alloc, val[i]);
+                            },
+                        }
+                        i += 1;
+                    } else {
+                        try result.append(self.alloc, val[i]);
+                        i += 1;
+                    }
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
+            else => return try self.alloc.dupe(u8, val),
+        }
+    }
+
+    fn expandPromptWithShellExpansion(self: *Expander, input: []const u8) ExpandError![]const u8 {
+        const marked = try expandPromptStringMarked(self.alloc, input, self.env, self.jobs);
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        var i: usize = 0;
+        while (i < marked.len) {
+            if (marked[i] == 0x01) {
+                i += 1;
+                while (i < marked.len and marked[i] != 0x01) {
+                    try result.append(self.alloc, marked[i]);
+                    i += 1;
+                }
+                if (i < marked.len) i += 1;
+            } else if (marked[i] == '\\' and i + 1 < marked.len) {
+                const next = marked[i + 1];
+                if (next == '$' or next == '`' or next == '"' or next == '\\' or next == '\n') {
+                    try result.append(self.alloc, next);
+                    i += 2;
+                } else {
+                    try result.append(self.alloc, marked[i]);
+                    i += 1;
+                }
+            } else if (marked[i] == '$') {
+                i += 1;
+                if (i < marked.len and marked[i] == '{') {
+                    i += 1;
+                    const name_start = i;
+                    while (i < marked.len and marked[i] != '}') : (i += 1) {}
+                    const name = marked[name_start..i];
+                    if (i < marked.len) i += 1;
+                    if (self.env.get(name)) |val| {
+                        try result.appendSlice(self.alloc, val);
+                    }
+                } else if (i < marked.len and marked[i] == '(') {
+                    i += 1;
+                    const cmd_start = i;
+                    var depth: u32 = 1;
+                    while (i < marked.len and depth > 0) {
+                        if (marked[i] == '(') depth += 1;
+                        if (marked[i] == ')') depth -= 1;
+                        if (depth > 0) i += 1;
+                    }
+                    const cmd_text = marked[cmd_start..i];
+                    if (i < marked.len) i += 1;
+                    const cmd_result = self.expandCommandSub(.{ .body = cmd_text }) catch "";
+                    try result.appendSlice(self.alloc, cmd_result);
+                } else {
+                    const name_start = i;
+                    while (i < marked.len and (std.ascii.isAlphanumeric(marked[i]) or marked[i] == '_')) : (i += 1) {}
+                    const name = marked[name_start..i];
+                    if (name.len > 0) {
+                        if (self.env.get(name)) |val| {
+                            try result.appendSlice(self.alloc, val);
+                        }
+                    } else {
+                        try result.append(self.alloc, '$');
+                    }
+                }
+            } else {
+                try result.append(self.alloc, marked[i]);
+                i += 1;
+            }
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
+    fn expandPromptStringMarked(alloc: std.mem.Allocator, input: []const u8, env: *Environment, jobs: *JobTable) ExpandError![]const u8 {
+        return expandPromptStringInner(alloc, input, env, jobs, true);
+    }
+
+    pub fn expandPromptString(alloc: std.mem.Allocator, input: []const u8, env: *Environment, jobs: *JobTable) ExpandError![]const u8 {
+        return expandPromptStringInner(alloc, input, env, jobs, false);
+    }
+
+    fn appendLiteral(alloc: std.mem.Allocator, result: *std.ArrayListUnmanaged(u8), ch: u8, mark: bool) !void {
+        if (mark) try result.append(alloc, 0x01);
+        try result.append(alloc, ch);
+        if (mark) try result.append(alloc, 0x01);
+    }
+
+    fn appendLiteralSlice(alloc: std.mem.Allocator, result: *std.ArrayListUnmanaged(u8), s: []const u8, mark: bool) !void {
+        if (mark) try result.append(alloc, 0x01);
+        try result.appendSlice(alloc, s);
+        if (mark) try result.append(alloc, 0x01);
+    }
+
+    fn expandPromptStringInner(alloc: std.mem.Allocator, input: []const u8, env: *Environment, jobs: *JobTable, mark: bool) ExpandError![]const u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        var i: usize = 0;
+        while (i < input.len) {
+            if (input[i] == '\\') {
+                i += 1;
+                if (i >= input.len) {
+                    try result.append(alloc,'\\');
+                    break;
+                }
+                switch (input[i]) {
+                    'a' => try appendLiteral(alloc, &result, 0x07, mark),
+                    'e' => try appendLiteral(alloc, &result, 0x1b, mark),
+                    'n' => try appendLiteral(alloc, &result, '\n', mark),
+                    'r' => try appendLiteral(alloc, &result, '\r', mark),
+                    '\\' => try result.append(alloc, '\\'),
+                    '$' => {
+                        if (posix.geteuid() == 0)
+                            try appendLiteral(alloc, &result, '#', mark)
+                        else
+                            try appendLiteral(alloc, &result, '$', mark);
+                    },
+                    '[', ']' => {},
+                    'h' => {
+                        var hostname_buf: [256]u8 = undefined;
+                        const hostname = getHostname(&hostname_buf);
+                        if (std.mem.indexOfScalar(u8, hostname, '.')) |dot| {
+                            try appendLiteralSlice(alloc, &result, hostname[0..dot], mark);
+                        } else {
+                            try appendLiteralSlice(alloc, &result, hostname, mark);
+                        }
+                    },
+                    'H' => {
+                        var hostname_buf: [256]u8 = undefined;
+                        const hostname = getHostname(&hostname_buf);
+                        try appendLiteralSlice(alloc, &result, hostname, mark);
+                    },
+                    'u' => {
+                        const user = env.get("USER") orelse blk: {
+                            const login = libc.getlogin();
+                            break :blk if (login) |l| std.mem.span(l) else "?";
+                        };
+                        try appendLiteralSlice(alloc, &result, user, mark);
+                    },
+                    'w' => {
+                        const pwd = env.get("PWD") orelse "?";
+                        const home = env.get("HOME");
+                        if (home) |h| {
+                            if (std.mem.startsWith(u8, pwd, h)) {
+                                try appendLiteral(alloc, &result, '~', mark);
+                                try appendLiteralSlice(alloc, &result, pwd[h.len..], mark);
+                            } else {
+                                try appendLiteralSlice(alloc, &result, pwd, mark);
+                            }
+                        } else {
+                            try appendLiteralSlice(alloc, &result, pwd, mark);
+                        }
+                    },
+                    'W' => {
+                        const pwd = env.get("PWD") orelse "?";
+                        const home = env.get("HOME");
+                        if (home) |h| {
+                            if (std.mem.eql(u8, pwd, h)) {
+                                try appendLiteral(alloc, &result, '~', mark);
+                            } else {
+                                const base = std.fs.path.basename(pwd);
+                                try appendLiteralSlice(alloc, &result, base, mark);
+                            }
+                        } else {
+                            const base = std.fs.path.basename(pwd);
+                            try appendLiteralSlice(alloc, &result, base, mark);
+                        }
+                    },
+                    't' => {
+                        const buf = strftimeAlloc(alloc, "%H:%M:%S") catch try alloc.dupe(u8, "??:??:??");
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    'T' => {
+                        const buf = strftimeAlloc(alloc, "%I:%M:%S") catch try alloc.dupe(u8, "??:??:??");
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    '@' => {
+                        const buf = strftimeAlloc(alloc, "%I:%M %p") catch try alloc.dupe(u8, "??:?? ??");
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    'A' => {
+                        const buf = strftimeAlloc(alloc, "%H:%M") catch try alloc.dupe(u8, "??:??");
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    'd' => {
+                        const buf = strftimeAlloc(alloc, "%a %b %d") catch try alloc.dupe(u8, "??? ??? ??");
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    'D' => {
+                        i += 1;
+                        if (i < input.len and input[i] == '{') {
+                            i += 1;
+                            const fmt_start = i;
+                            while (i < input.len and input[i] != '}') : (i += 1) {}
+                            const fmt = input[fmt_start..i];
+                            if (i < input.len) i += 1;
+                            const fmt_str = if (fmt.len == 0) "%X" else fmt;
+                            var fmt_buf: [128]u8 = undefined;
+                            if (fmt_str.len < fmt_buf.len) {
+                                @memcpy(fmt_buf[0..fmt_str.len], fmt_str);
+                                fmt_buf[fmt_str.len] = 0;
+                                const fmt_z: [*:0]const u8 = fmt_buf[0..fmt_str.len :0];
+                                const buf = strftimeAlloc(alloc, fmt_z) catch try alloc.dupe(u8, "");
+                                try appendLiteralSlice(alloc, &result, buf, mark);
+                            }
+                        }
+                        continue;
+                    },
+                    's' => try appendLiteralSlice(alloc, &result, env.shell_name, mark),
+                    'v' => try appendLiteralSlice(alloc, &result, "0.1", mark),
+                    'V' => try appendLiteralSlice(alloc, &result, "0.1.0", mark),
+                    'j' => {
+                        const buf = std.fmt.allocPrint(alloc, "{d}", .{jobs.count}) catch return error.OutOfMemory;
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    'l' => {
+                        const tty_ptr = libc.ttyname(0);
+                        if (tty_ptr) |ptr| {
+                            const tty = std.mem.span(ptr);
+                            const base = std.fs.path.basename(tty);
+                            try appendLiteralSlice(alloc, &result, base, mark);
+                        } else {
+                            try appendLiteralSlice(alloc, &result, "tty", mark);
+                        }
+                    },
+                    '!' => {
+                        if (env.history) |h| {
+                            const num = h.count + 1;
+                            const buf = std.fmt.allocPrint(alloc, "{d}", .{num}) catch return error.OutOfMemory;
+                            try appendLiteralSlice(alloc, &result, buf, mark);
+                        } else {
+                            try appendLiteral(alloc, &result, '0', mark);
+                        }
+                    },
+                    '#' => {
+                        const num = env.command_number;
+                        const buf = std.fmt.allocPrint(alloc, "{d}", .{num}) catch return error.OutOfMemory;
+                        try appendLiteralSlice(alloc, &result, buf, mark);
+                    },
+                    '0'...'7' => {
+                        var octal: u32 = input[i] - '0';
+                        var count: usize = 1;
+                        while (count < 3 and i + 1 < input.len and input[i + 1] >= '0' and input[i + 1] <= '7') {
+                            i += 1;
+                            octal = octal * 8 + (input[i] - '0');
+                            count += 1;
+                        }
+                        try appendLiteral(alloc, &result, @intCast(octal & 0xFF), mark);
+                    },
+                    else => {
+                        try appendLiteral(alloc, &result, '\\', mark);
+                        try appendLiteral(alloc, &result, input[i], mark);
+                    },
+                }
+                i += 1;
+            } else {
+                try result.append(alloc, input[i]);
+                i += 1;
+            }
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    fn getHostname(buf: *[256]u8) []const u8 {
+        const rc = libc.gethostname(buf, buf.len);
+        if (rc != 0) return "localhost";
+        return std.mem.sliceTo(buf, 0);
+    }
+
+    fn strftimeAlloc(alloc: std.mem.Allocator, fmt: [*:0]const u8) ![]const u8 {
+        var now: libc.time_t = undefined;
+        _ = libc.time(&now);
+        const tm = libc.localtime(&now);
+        if (tm == null) return error.OutOfMemory;
+        var buf: [128]u8 = undefined;
+        const len = libc.strftime(&buf, buf.len, fmt, tm.?);
+        if (len == 0) return error.OutOfMemory;
+        return try alloc.dupe(u8, buf[0..len]);
+    }
+
     fn expandDynamic(self: *Expander, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, name, "RANDOM")) {
             var ts: std.c.timespec = undefined;
@@ -706,7 +1058,7 @@ pub const Expander = struct {
         }
         if (std.mem.eql(u8, name, "HOSTNAME")) {
             var buf: [256]u8 = undefined;
-            const rc = std.c.gethostname(&buf, buf.len);
+            const rc = libc.gethostname(&buf, buf.len);
             if (rc == 0) {
                 const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
                 return self.alloc.dupe(u8, buf[0..len]) catch null;
@@ -1004,6 +1356,7 @@ pub const Expander = struct {
 
         if (pid == 0) {
             signals.clearTrapsForSubshell();
+            self.env.in_subshell = true;
             posix.close(pipe_fds[0]);
             posix.dup2(pipe_fds[1], 1) catch posix.exit(1);
             posix.close(pipe_fds[1]);

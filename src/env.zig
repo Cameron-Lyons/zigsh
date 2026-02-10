@@ -32,6 +32,7 @@ pub const Environment = struct {
     shell_name: []const u8,
     job_table: ?*JobTable,
     history: ?*LineEditor.History,
+    command_number: u32,
 
     pub const Variable = struct {
         value: []const u8,
@@ -161,6 +162,7 @@ pub const Environment = struct {
             .shell_name = "zigsh",
             .job_table = null,
             .history = null,
+            .command_number = 0,
         };
 
         env.importEnviron();
