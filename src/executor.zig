@@ -65,6 +65,7 @@ pub const Executor = struct {
 
     fn executeList(self: *Executor, list: ast.List) u8 {
         var status: u8 = 0;
+        if (!self.env.in_subshell) self.env.command_number += 1;
         const first_bg = list.rest.len > 0 and list.rest[0].op == .amp;
         if (first_bg) {
             status = self.runInBackground(list.first);
@@ -80,6 +81,7 @@ pub const Executor = struct {
         for (list.rest, 0..) |item, idx| {
             if (self.env.should_exit or self.env.should_return or
                 self.env.break_count > 0 or self.env.continue_count > 0) break;
+            if (!self.env.in_subshell) self.env.command_number += 1;
             const next_bg = (idx + 1 < list.rest.len) and list.rest[idx + 1].op == .amp;
             if (next_bg) {
                 status = self.runInBackground(item.and_or);
@@ -218,6 +220,7 @@ pub const Executor = struct {
 
             if (pid == 0) {
                 signals.clearTrapsForSubshell();
+                self.env.in_subshell = true;
                 if (prev_read_fd) |rd| {
                     posix.dup2(rd, types.STDIN) catch posix.exit(1);
                     posix.close(rd);

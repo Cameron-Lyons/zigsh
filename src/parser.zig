@@ -815,6 +815,15 @@ pub const Parser = struct {
             return try self.parseCaseConv(text, i, name, in_dquote);
         }
 
+        if (text[i.*] == '@' and i.* + 1 < text.len) {
+            const op_char = text[i.* + 1];
+            if (i.* + 2 >= text.len or text[i.* + 2] == '}') {
+                i.* += 2;
+                if (i.* < text.len and text[i.*] == '}') i.* += 1;
+                return .{ .parameter = .{ .transform = .{ .name = name, .operator = op_char } } };
+            }
+        }
+
         if (text[i.*] == '/') {
             return try self.parsePatternSub(text, i, name, in_dquote);
         }
