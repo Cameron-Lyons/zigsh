@@ -57,6 +57,7 @@ pub const Environment = struct {
         verbose: bool = false,
         interactive: bool = false,
         pipefail: bool = false,
+        history: bool = false,
 
         flag_buf: [16]u8 = undefined,
 
@@ -104,6 +105,7 @@ pub const Environment = struct {
         else if (std.mem.eql(u8, name, "noclobber")) { self.options.noclobber = enable; }
         else if (std.mem.eql(u8, name, "verbose")) { self.options.verbose = enable; }
         else if (std.mem.eql(u8, name, "pipefail")) { self.options.pipefail = enable; }
+        else if (std.mem.eql(u8, name, "history")) { self.options.history = enable; }
     }
 
     pub fn setShortOption(self: *Environment, ch: u8, enable: bool) void {

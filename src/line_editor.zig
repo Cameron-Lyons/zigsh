@@ -43,6 +43,7 @@ pub const LineEditor = struct {
     pub const History = struct {
         entries: [1024]?[]const u8,
         count: usize,
+        just_cleared: bool,
         alloc: std.mem.Allocator,
         file_path: ?[]const u8,
 
@@ -50,6 +51,7 @@ pub const LineEditor = struct {
             return .{
                 .entries = [_]?[]const u8{null} ** 1024,
                 .count = 0,
+                .just_cleared = false,
                 .alloc = alloc,
                 .file_path = null,
             };
@@ -87,6 +89,17 @@ pub const LineEditor = struct {
                 }
                 self.entries[self.entries.len - 1] = duped;
             }
+        }
+
+        pub fn clear(self: *History) void {
+            for (0..self.count) |i| {
+                if (self.entries[i]) |e| {
+                    self.alloc.free(e);
+                    self.entries[i] = null;
+                }
+            }
+            self.count = 0;
+            self.just_cleared = true;
         }
 
         pub fn get(self: *const History, idx: usize) ?[]const u8 {

@@ -72,6 +72,15 @@ pub const Executor = struct {
         } else {
             status = self.executeAndOr(list.first);
         }
+        if (!self.env.in_subshell and self.env.options.history) {
+            if (self.env.history) |h| {
+                if (h.just_cleared) {
+                    h.just_cleared = false;
+                } else {
+                    h.count += 1;
+                }
+            }
+        }
         if (self.env.options.errexit and status != 0 and self.env.errexit_suppressed == 0 and !self.bang_reached and !self.env.should_exit) {
             self.env.should_exit = true;
             self.env.exit_value = status;
@@ -87,6 +96,15 @@ pub const Executor = struct {
                 status = self.runInBackground(item.and_or);
             } else {
                 status = self.executeAndOr(item.and_or);
+            }
+            if (!self.env.in_subshell and self.env.options.history) {
+                if (self.env.history) |h| {
+                    if (h.just_cleared) {
+                        h.just_cleared = false;
+                    } else {
+                        h.count += 1;
+                    }
+                }
             }
             if (self.env.options.errexit and status != 0 and self.env.errexit_suppressed == 0 and !self.bang_reached and !self.env.should_exit) {
                 self.env.should_exit = true;

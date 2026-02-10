@@ -103,9 +103,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 if (i < args.len) {
                     sh.env.setShoptOption(args[i], false);
                 }
+            } else if (std.mem.eql(u8, args[i], "--rcfile") or std.mem.eql(u8, args[i], "--init-file")) {
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--norc") or std.mem.eql(u8, args[i], "--noprofile") or std.mem.eql(u8, args[i], "--posix")) {
+                // ignored
             } else if (args[i].len > 1 and args[i][0] == '-' and args[i][1] != '-') {
                 for (args[i][1..]) |ch| {
                     sh.env.setShortOption(ch, true);
+                    if (ch == 'i' and sh.env.get("PS1") == null) {
+                        sh.env.set("PS1", "\\s-\\v\\$ ", false) catch {};
+                    }
                 }
             } else if (args[i].len > 0 and args[i][0] != '-') {
                 sh.env.shell_name = args[i];

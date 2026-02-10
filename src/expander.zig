@@ -719,6 +719,9 @@ pub const Expander = struct {
     }
 
     fn expandTransform(self: *Expander, op: ast.TransformOp) ExpandError![]const u8 {
+        if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
+            return self.expandTransformSpecial(op);
+        }
         const val = self.getParamValue(op.name) orelse "";
         switch (op.operator) {
             'P' => {
@@ -766,6 +769,38 @@ pub const Expander = struct {
             },
             else => return try self.alloc.dupe(u8, val),
         }
+    }
+
+    fn expandTransformSpecial(self: *Expander, op: ast.TransformOp) ExpandError![]const u8 {
+        const params = self.env.positional_params;
+        if (params.len == 0) return try self.alloc.dupe(u8, "");
+        const sep: u8 = if (std.mem.eql(u8, op.name, "*")) blk: {
+            const ifs = self.env.get("IFS") orelse " \t\n";
+            break :blk if (ifs.len > 0) ifs[0] else 0;
+        } else ' ';
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        for (params, 0..) |param, idx| {
+            if (idx > 0 and sep != 0) try result.append(self.alloc, sep);
+            switch (op.operator) {
+                'P' => {
+                    const expanded = try self.expandPromptWithShellExpansion(param);
+                    try result.appendSlice(self.alloc, expanded);
+                },
+                'Q' => {
+                    try result.append(self.alloc, '\'');
+                    for (param) |ch| {
+                        if (ch == '\'') {
+                            try result.appendSlice(self.alloc, "'\\''");
+                        } else {
+                            try result.append(self.alloc, ch);
+                        }
+                    }
+                    try result.append(self.alloc, '\'');
+                },
+                else => try result.appendSlice(self.alloc, param),
+            }
+        }
+        return result.toOwnedSlice(self.alloc);
     }
 
     fn expandPromptWithShellExpansion(self: *Expander, input: []const u8) ExpandError![]const u8 {
@@ -966,7 +1001,7 @@ pub const Expander = struct {
                         }
                         continue;
                     },
-                    's' => try appendLiteralSlice(alloc, &result, env.shell_name, mark),
+                    's' => try appendLiteralSlice(alloc, &result, "zigsh", mark),
                     'v' => try appendLiteralSlice(alloc, &result, "0.1", mark),
                     'V' => try appendLiteralSlice(alloc, &result, "0.1.0", mark),
                     'j' => {
