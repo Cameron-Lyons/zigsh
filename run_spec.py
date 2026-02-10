@@ -9,6 +9,17 @@ import tempfile
 SHELL = os.environ.get("TEST_SHELL", "./zig-out/bin/zigsh")
 TIMEOUT = 10
 
+def _should_use_ok_dash_status(ln):
+    m = re.match(r"^## OK ([\w/]+)\b", ln)
+    if not m:
+        return False
+    shells = m.group(1).split("/")
+    if "dash" not in shells:
+        return False
+    if "bash" in shells:
+        return True
+    return all(s in ("dash", "ash", "mksh") for s in shells)
+
 def parse_spec_file(path):
     with open(path) as f:
         lines = f.readlines()
@@ -47,7 +58,7 @@ def parse_spec_file(path):
             code = "".join(real_code_lines)
 
             while i < len(lines):
-                ln = lines[i].rstrip("\n")
+                ln = lines[i].rstrip()
                 if ln.startswith("#### "):
                     break
                 if ln.startswith("## STDOUT:"):
@@ -60,13 +71,22 @@ def parse_spec_file(path):
                     if i < len(lines) and lines[i].startswith("## END"):
                         i += 1
                     continue
-                if re.match(r"^## (OK|BUG) dash(/\w+)* STDOUT:", ln):
+                m_ok = re.match(r"^## OK (\w+(?:/\w+)*) STDOUT:", ln)
+                if m_ok and "dash" in m_ok.group(1).split("/"):
                     stdout_lines = []
                     i += 1
                     while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
                         stdout_lines.append(lines[i])
                         i += 1
-                    expect_stdout = "".join(stdout_lines)
+                    if _should_use_ok_dash_status(ln.replace("STDOUT:", "status: 0").rstrip()):
+                        expect_stdout = "".join(stdout_lines)
+                    if i < len(lines) and lines[i].startswith("## END"):
+                        i += 1
+                    continue
+                if re.match(r"^## BUG dash(/\w+)* STDOUT:", ln):
+                    i += 1
+                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
+                        i += 1
                     if i < len(lines) and lines[i].startswith("## END"):
                         i += 1
                     continue
@@ -104,34 +124,23 @@ def parse_spec_file(path):
                 m = re.match(r"^## status: (\d+)$", ln)
                 if m:
                     expect_status = int(m.group(1))
-                if re.match(r"^## BUG (bash|mksh|zsh|dash(/\w+)*)", ln):
-                    m_bug_stdout = re.match(r'^## BUG dash(/\w+)* stdout: (.*)$', ln)
-                    if m_bug_stdout:
-                        expect_stdout = m_bug_stdout.group(2) + "\n"
-                    m_bug_stdout_json = re.match(r'^## BUG dash(/\w+)* stdout-json: "(.*)"$', ln)
-                    if m_bug_stdout_json:
+                if False:
+                    pass
+                m_ok_st = re.match(r"^## OK (\w+(?:/\w+)*) stdout", ln)
+                if m_ok_st and "dash" in m_ok_st.group(1).split("/") and _should_use_ok_dash_status(ln):
+                    m2 = re.match(r'^## OK \w+(?:/\w+)* stdout: (.*)$', ln)
+                    if m2:
+                        expect_stdout = m2.group(1) + "\n"
+                    m2 = re.match(r'^## OK \w+(?:/\w+)* stdout-json: "(.*)"$', ln)
+                    if m2:
                         try:
-                            expect_stdout_json = json.loads('"' + m_bug_stdout_json.group(2) + '"')
+                            expect_stdout_json = json.loads('"' + m2.group(1) + '"')
                             expect_stdout = None
                         except:
                             pass
-                    m_bug_status = re.match(r'^## BUG dash(/\w+)* status: (\d+)$', ln)
-                    if m_bug_status:
-                        expect_status = int(m_bug_status.group(2))
-                if re.match(r"^## OK dash(/\w+)* stdout", ln):
-                    m2 = re.match(r'^## OK dash(/\w+)* stdout: (.*)$', ln)
-                    if m2:
-                        expect_stdout = m2.group(2) + "\n"
-                    m2 = re.match(r'^## OK dash(/\w+)* stdout-json: "(.*)"$', ln)
-                    if m2:
-                        try:
-                            expect_stdout_json = json.loads('"' + m2.group(2) + '"')
-                            expect_stdout = None
-                        except:
-                            pass
-                m = re.match(r"^## OK dash(/\w+)* status: (\d+)$", ln)
-                if m:
-                    expect_status = int(m.group(2))
+                m_ok_status = re.match(r"^## OK (\w+(?:/\w+)*) status: (\d+)$", ln)
+                if m_ok_status and "dash" in m_ok_status.group(1).split("/") and _should_use_ok_dash_status(ln):
+                    expect_status = int(m_ok_status.group(2))
                 m = re.match(r"^## N-I dash(/\w+)* status: (\d+)$", ln)
                 if m:
                     n_i_dash = True

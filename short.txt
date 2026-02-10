@@ -1,7 +1,0 @@
--c: core file size (blocks)       unlimited
--d: data seg size (kbytes)        unlimited
--f: file size (blocks)            unlimited
--n: open files                    1048576
--s: stack size (kbytes)           16384
--t: cpu time (seconds)            unlimited
--v: virtual memory (kbytes)       unlimited

@@ -62,25 +62,7 @@ pub fn sigNameFromNum(signum: u6) ?[]const u8 {
 }
 
 pub fn sigFullName(signum: u6) ?[]const u8 {
-    return switch (signum) {
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        6 => "SIGABRT",
-        9 => "SIGKILL",
-        10 => "SIGUSR1",
-        12 => "SIGUSR2",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
-        17 => "SIGCHLD",
-        18 => "SIGCONT",
-        19 => "SIGSTOP",
-        20 => "SIGTSTP",
-        21 => "SIGTTIN",
-        22 => "SIGTTOU",
-        else => null,
-    };
+    return sigNameFromNum(signum);
 }
 
 pub const TRAP_EXIT: usize = 0;
