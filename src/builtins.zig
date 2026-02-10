@@ -475,6 +475,7 @@ fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable:
     else if (std.mem.eql(u8, name, "noclobber")) { options.noclobber = enable; }
     else if (std.mem.eql(u8, name, "verbose")) { options.verbose = enable; }
     else if (std.mem.eql(u8, name, "pipefail")) { options.pipefail = enable; }
+    else if (std.mem.eql(u8, name, "history")) { options.history = enable; }
     else {
         posix.writeAll(2, "set: unknown option: ");
         posix.writeAll(2, name);
@@ -3594,10 +3595,14 @@ fn sigFromName(name: []const u8) ?u6 {
     return null;
 }
 
-fn builtinHistory(args: []const []const u8, _: *Environment) u8 {
+fn builtinHistory(args: []const []const u8, env: *Environment) u8 {
     if (args.len <= 1) return 0;
     if (args.len == 2) {
         const arg = args[1];
+        if (std.mem.eql(u8, arg, "-c")) {
+            if (env.history) |h| h.clear();
+            return 0;
+        }
         if (arg.len > 0 and arg[0] == '-') {
             posix.writeAll(2, "history: ");
             posix.writeAll(2, arg);
