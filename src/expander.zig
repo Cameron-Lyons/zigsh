@@ -1500,6 +1500,10 @@ pub const Expander = struct {
         var expanded_expr: std.ArrayListUnmanaged(u8) = .empty;
         var i: usize = 0;
         while (i < expr.len) {
+            if (expr[i] == '\\' and i + 1 < expr.len and expr[i + 1] == '\n') {
+                i += 2;
+                continue;
+            }
             if (expr[i] == '$' and i + 1 < expr.len) {
                 if (expr[i + 1] == '(') {
                     if (i + 2 < expr.len and expr[i + 2] == '(') {

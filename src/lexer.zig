@@ -452,11 +452,11 @@ pub const Lexer = struct {
         const ch = self.source[self.pos];
         if (ch != '<' and ch != '>') return false;
 
-        if (self.pos - start > 1) return false;
-        for (self.source[start..self.pos]) |d| {
-            if (d < '0' or d > '9') return false;
+        if (self.pos <= start) return false;
+        for (self.source[start..self.pos]) |c| {
+            if (c < '0' or c > '9') return false;
         }
-        return self.pos > start;
+        return true;
     }
 
     fn isAssignmentWord(self: *Lexer, start: u32) bool {
@@ -484,6 +484,7 @@ pub const Lexer = struct {
     }
 
     fn collectPendingHeredocs(self: *Lexer) void {
+        if (self.pending_heredoc_count == 0) return;
         for (self.pending_heredocs[0..self.pending_heredoc_count]) |*hd| {
             const body_start = self.pos;
             var body_end = body_start;

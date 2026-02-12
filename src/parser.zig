@@ -113,19 +113,22 @@ pub const Parser = struct {
         while (true) {
             if (self.current.tag == .semicolon) {
                 const peek_save = self.lexer.pos;
+                const peek_pending = self.lexer.pending_heredoc_count;
                 self.lexer.reserved_word_context = true;
                 try self.advance();
                 if (self.isCommandStart()) {
                     const and_or = try self.parseAndOr();
                     try rest.append(self.alloc, .{ .op = .semi, .and_or = and_or });
                 } else {
-                    self.lexer.pos = peek_save;
+                    if (peek_pending == 0 or self.lexer.pending_heredoc_count > 0)
+                        self.lexer.pos = peek_save;
                     self.current.tag = .semicolon;
                     break;
                 }
             } else if (self.current.tag == .ampersand) {
                 const save_pos = self.lexer.pos;
                 const save_tok = self.current;
+                const save_pending = self.lexer.pending_heredoc_count;
                 self.lexer.reserved_word_context = true;
                 try self.advance();
                 if (self.isCommandStart()) {
@@ -137,12 +140,14 @@ pub const Parser = struct {
                         const and_or = try self.parseAndOr();
                         try rest.append(self.alloc, .{ .op = .amp, .and_or = and_or });
                     } else {
-                        self.lexer.pos = save_pos;
+                        if (save_pending == 0 or self.lexer.pending_heredoc_count > 0)
+                            self.lexer.pos = save_pos;
                         self.current = save_tok;
                         break;
                     }
                 } else {
-                    self.lexer.pos = save_pos;
+                    if (save_pending == 0 or self.lexer.pending_heredoc_count > 0)
+                        self.lexer.pos = save_pos;
                     self.current = save_tok;
                     break;
                 }
@@ -187,12 +192,14 @@ pub const Parser = struct {
         if (self.current.tag == .word and std.mem.eql(u8, self.tokenText(self.current), "time")) {
             const save_pos = self.lexer.pos;
             const save_tok = self.current;
+            const save_pending = self.lexer.pending_heredoc_count;
             try self.advance();
             if (self.current.tag == .word and std.mem.eql(u8, self.tokenText(self.current), "-p")) {
                 try self.advance();
             }
             if (self.current.tag == .eof or self.current.tag == .newline or self.current.tag == .semicolon) {
-                self.lexer.pos = save_pos;
+                if (save_pending == 0 or self.lexer.pending_heredoc_count > 0)
+                    self.lexer.pos = save_pos;
                 self.current = save_tok;
             }
         }
@@ -1306,6 +1313,11 @@ pub const Parser = struct {
             if (std.mem.eql(u8, word_text, "-")) {
                 return .{ .fd = fd, .op = op, .target = .close };
             }
+            if (word_text.len >= 2 and word_text[word_text.len - 1] == '-') {
+                if (std.fmt.parseInt(i32, word_text[0 .. word_text.len - 1], 10)) |target_fd| {
+                    return .{ .fd = fd, .op = op, .target = .{ .fd_move = target_fd } };
+                } else |_| {}
+            }
             if (std.fmt.parseInt(i32, word_text, 10)) |target_fd| {
                 return .{ .fd = fd, .op = op, .target = .{ .fd = target_fd } };
             } else |_| {}
@@ -1322,14 +1334,34 @@ pub const Parser = struct {
 
         var quoted = false;
         var delimiter = delim_text;
-        if (delim_text.len >= 2 and delim_text[0] == '\'' and delim_text[delim_text.len - 1] == '\'') {
+        if (std.mem.indexOfAny(u8, delim_text, "'\"\\") != null) {
             quoted = true;
-            delimiter = delim_text[1 .. delim_text.len - 1];
-        } else if (delim_text.len >= 2 and delim_text[0] == '"' and delim_text[delim_text.len - 1] == '"') {
-            quoted = true;
-            delimiter = delim_text[1 .. delim_text.len - 1];
-        } else if (std.mem.indexOfScalar(u8, delim_text, '\\') != null) {
-            quoted = true;
+            var stripped: List(u8) = .empty;
+            var i: usize = 0;
+            while (i < delim_text.len) {
+                if (delim_text[i] == '\'') {
+                    i += 1;
+                    while (i < delim_text.len and delim_text[i] != '\'') {
+                        stripped.append(self.alloc, delim_text[i]) catch return error.OutOfMemory;
+                        i += 1;
+                    }
+                    if (i < delim_text.len) i += 1;
+                } else if (delim_text[i] == '"') {
+                    i += 1;
+                    while (i < delim_text.len and delim_text[i] != '"') {
+                        stripped.append(self.alloc, delim_text[i]) catch return error.OutOfMemory;
+                        i += 1;
+                    }
+                    if (i < delim_text.len) i += 1;
+                } else if (delim_text[i] == '\\' and i + 1 < delim_text.len) {
+                    stripped.append(self.alloc, delim_text[i + 1]) catch return error.OutOfMemory;
+                    i += 2;
+                } else {
+                    stripped.append(self.alloc, delim_text[i]) catch return error.OutOfMemory;
+                    i += 1;
+                }
+            }
+            delimiter = stripped.items;
         }
 
         const body_ptr = self.alloc.create([]const u8) catch return error.OutOfMemory;
@@ -1648,6 +1680,9 @@ pub const Parser = struct {
         const saved_pos = self.lexer.pos;
         const saved_current = self.current;
         const saved_rwc = self.lexer.reserved_word_context;
+        const saved_pending_count = self.lexer.pending_heredoc_count;
+        var saved_pending_heredocs: [16]Lexer.HeredocPending = undefined;
+        @memcpy(saved_pending_heredocs[0..saved_pending_count], self.lexer.pending_heredocs[0..saved_pending_count]);
 
         const name = self.tokenText(self.current);
 
@@ -1678,6 +1713,10 @@ pub const Parser = struct {
         self.lexer.pos = saved_pos;
         self.current = saved_current;
         self.lexer.reserved_word_context = saved_rwc;
+        if (saved_pending_count > 0 and self.lexer.pending_heredoc_count == 0) {
+            self.lexer.pending_heredoc_count = saved_pending_count;
+            @memcpy(self.lexer.pending_heredocs[0..saved_pending_count], saved_pending_heredocs[0..saved_pending_count]);
+        }
         return null;
     }
 
