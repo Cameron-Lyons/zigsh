@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 
-SHELL = os.environ.get("TEST_SHELL", "./zig-out/bin/zigsh")
+SHELL = os.path.abspath(os.environ.get("TEST_SHELL", "./zig-out/bin/zigsh"))
 TIMEOUT = 10
 
 def _should_use_ok_dash_status(ln):
@@ -18,7 +18,8 @@ def _should_use_ok_dash_status(ln):
         return False
     if "bash" in shells:
         return True
-    return all(s in ("dash", "ash", "mksh") for s in shells)
+    return False
+
 
 def parse_spec_file(path):
     with open(path) as f:
@@ -164,7 +165,13 @@ def parse_spec_file(path):
 
 def run_case(case):
     code = case["code"]
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+    workdir = tempfile.mkdtemp()
+    os.makedirs(os.path.join(workdir, "_tmp", "spec-tmp"), exist_ok=True)
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(os.path.join(repo_root, "_tmp", "spec-tmp"), exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sh", delete=False, dir=workdir
+    ) as f:
         f.write(code)
         f.flush()
         fname = f.name
@@ -174,12 +181,13 @@ def run_case(case):
             [SHELL, fname],
             capture_output=True,
             timeout=TIMEOUT,
+            cwd=workdir,
             env={
                 **os.environ,
                 "PATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "oil", "spec", "bin")
                     + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
                 "SH": os.path.abspath(SHELL),
-                "TMP": tempfile.mkdtemp(),
+                "TMP": os.path.join(workdir, "_tmp"),
                 "REPO_ROOT": os.path.dirname(os.path.abspath(__file__)),
             },
         )
@@ -191,6 +199,8 @@ def run_case(case):
         return "ERROR", str(e)
     finally:
         os.unlink(fname)
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
 
     if case["n_i_dash"]:
         return "N-I", "not implemented in dash"

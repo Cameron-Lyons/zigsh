@@ -351,7 +351,7 @@ pub const Executor = struct {
                 for (simple.redirects) |redir| {
                     self.applyAstRedirect(redir, &redir_state, &expander) catch {
                         redir_state.restore();
-                        return 2;
+                        return 1;
                     };
                 }
                 redir_state.restore();
@@ -393,9 +393,9 @@ pub const Executor = struct {
                     posix.writeAll(2, "zigsh: arithmetic syntax error\n");
                     if (!self.env.options.interactive) {
                         self.env.should_exit = true;
-                        self.env.exit_value = 2;
+                        self.env.exit_value = 1;
                     }
-                    return 2;
+                    return 1;
                 } else {
                     posix.writeAll(2, "zigsh: expansion error\n");
                 }
@@ -435,7 +435,7 @@ pub const Executor = struct {
         for (simple.redirects) |redir| {
             self.applyAstRedirect(redir, &redir_state, &expander) catch {
                 redir_state.restore();
-                return 2;
+                return 1;
             };
         }
 
@@ -582,7 +582,7 @@ pub const Executor = struct {
         for (cp.redirects) |redir| {
             self.applyAstRedirect(redir, &redir_state, &expander) catch {
                 redir_state.restore();
-                return 2;
+                return 1;
             };
         }
 
@@ -873,8 +873,8 @@ pub const Executor = struct {
         var expander = Expander.init(self.alloc, self.env, self.jobs);
         const expr = expander.expandArithmetic(raw_expr) catch {
             if (env_ptr.should_exit) {
-                env_ptr.exit_value = 2;
-                return 2;
+                env_ptr.exit_value = 1;
+                return 1;
             }
             return 1;
         };
@@ -1351,7 +1351,24 @@ pub const Executor = struct {
         switch (redir.target) {
             .word => |word| {
                 const expanded = expander.expandWord(word) catch return error.RedirectionFailed;
-                if (redir.op == .dup_output and redir.fd == null) {
+                if (op == .dup_input or op == .dup_output) {
+                    if (std.mem.eql(u8, expanded, "-")) {
+                        try redirect.applyCloseRedirect(fd, state);
+                    } else if (parseFdMove(expanded)) |target_fd| {
+                        try redirect.applyDupRedirect(fd, target_fd, state);
+                        if (target_fd != fd) posix.close(target_fd);
+                    } else if (std.fmt.parseInt(i32, expanded, 10)) |target_fd| {
+                        try redirect.applyDupRedirect(fd, target_fd, state);
+                    } else |_| {
+                        if (redir.op == .dup_output and redir.fd == null) {
+                            const path_z = self.alloc.dupeZ(u8, expanded) catch return error.RedirectionFailed;
+                            try redirect.applyFileRedirect(types.STDOUT, path_z.ptr, .output, state, self.env.options.noclobber);
+                            try redirect.applyDupRedirect(types.STDERR, types.STDOUT, state);
+                        } else {
+                            return error.RedirectionFailed;
+                        }
+                    }
+                } else if (redir.op == .dup_output and redir.fd == null) {
                     const path_z = self.alloc.dupeZ(u8, expanded) catch return error.RedirectionFailed;
                     try redirect.applyFileRedirect(types.STDOUT, path_z.ptr, .output, state, self.env.options.noclobber);
                     try redirect.applyDupRedirect(types.STDERR, types.STDOUT, state);
@@ -1361,6 +1378,10 @@ pub const Executor = struct {
                 }
             },
             .fd => |target_fd| try redirect.applyDupRedirect(fd, target_fd, state),
+            .fd_move => |target_fd| {
+                try redirect.applyDupRedirect(fd, target_fd, state);
+                if (target_fd != fd) posix.close(target_fd);
+            },
             .close => try redirect.applyCloseRedirect(fd, state),
             .heredoc => |hd| {
                 const pipe_fds = posix.pipe() catch return error.RedirectionFailed;
@@ -1788,17 +1809,9 @@ pub const Executor = struct {
     fn executeInlineSpecial(self: *Executor, source: []const u8) u8 {
         var lexer = Lexer.init(source);
         var parser = Parser.init(self.alloc, &lexer) catch {
-            if (!self.env.options.interactive) {
-                self.env.should_exit = true;
-                self.env.exit_value = 2;
-            }
             return 2;
         };
         const program = parser.parseProgram() catch {
-            if (!self.env.options.interactive) {
-                self.env.should_exit = true;
-                self.env.exit_value = 2;
-            }
             return 2;
         };
         return self.executeProgram(program);
@@ -1863,6 +1876,13 @@ fn isSpecialBuiltin(name: []const u8) bool {
         if (std.mem.eql(u8, name, s)) return true;
     }
     return false;
+}
+
+fn parseFdMove(s: []const u8) ?i32 {
+    if (s.len >= 2 and s[s.len - 1] == '-') {
+        return std.fmt.parseInt(i32, s[0 .. s.len - 1], 10) catch return null;
+    }
+    return null;
 }
 
 fn astToRedirectOp(op: ast.RedirectOp) redirect.RedirectOp {

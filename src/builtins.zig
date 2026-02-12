@@ -591,7 +591,7 @@ fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
 fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
     if (args.len > 2) {
         posix.writeAll(2, "break: too many arguments\n");
-        return 2;
+        return 1;
     }
     var n: u32 = 1;
     if (args.len > 1) {
@@ -599,11 +599,11 @@ fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(2, "break: ");
             posix.writeAll(2, args[1]);
             posix.writeAll(2, ": numeric argument required\n");
-            return 2;
+            return 1;
         };
         if (n == 0) {
             posix.writeAll(2, "break: loop count must be > 0\n");
-            return 2;
+            return 1;
         }
     }
     if (env.loop_depth == 0) return if (env.in_subshell) @as(u8, 1) else 0;

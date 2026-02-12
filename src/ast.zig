@@ -167,6 +167,7 @@ pub const RedirectOp = enum {
 pub const RedirectTarget = union(enum) {
     word: Word,
     fd: i32,
+    fd_move: i32,
     close: void,
     heredoc: HereDoc,
 };

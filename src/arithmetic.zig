@@ -77,8 +77,8 @@ pub const Arithmetic = struct {
                     .mul_eq => old_val *% rhs,
                     .div_eq => if (rhs == 0) return error.DivisionByZero else @divTrunc(old_val, rhs),
                     .mod_eq => if (rhs == 0) return error.DivisionByZero else @rem(old_val, rhs),
-                    .shl_eq => old_val << @intCast(@min(@max(rhs, 0), 63)),
-                    .shr_eq => old_val >> @intCast(@min(@max(rhs, 0), 63)),
+                    .shl_eq => @bitCast(@as(u64, @bitCast(old_val)) << @as(u6, @truncate(@as(u64, @bitCast(rhs))))),
+                    .shr_eq => @bitCast(@as(u64, @bitCast(old_val)) >> @as(u6, @truncate(@as(u64, @bitCast(rhs))))),
                     .and_eq => old_val & rhs,
                     .or_eq => old_val | rhs,
                     .xor_eq => old_val ^ rhs,
@@ -291,15 +291,13 @@ pub const Arithmetic = struct {
             if (self.matchStr("<<")) {
                 self.skipWhitespace();
                 const right = try self.parseAddSub();
-                if (right < 0) return error.InvalidExpression;
-                const shift: u6 = @intCast(@min(right, 63));
-                left = left << shift;
+                const shift: u6 = @truncate(@as(u64, @bitCast(right)));
+                left = @bitCast(@as(u64, @bitCast(left)) << shift);
             } else if (self.matchStr(">>")) {
                 self.skipWhitespace();
                 const right = try self.parseAddSub();
-                if (right < 0) return error.InvalidExpression;
-                const shift: u6 = @intCast(@min(right, 63));
-                left = left >> shift;
+                const shift: u6 = @truncate(@as(u64, @bitCast(right)));
+                left = @bitCast(@as(u64, @bitCast(left)) >> shift);
             } else break;
         }
         return left;
