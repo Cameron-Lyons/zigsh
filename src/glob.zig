@@ -2,6 +2,14 @@ const std = @import("std");
 const c = std.c;
 
 pub fn expand(alloc: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    return expandImpl(alloc, pattern, false);
+}
+
+pub fn expandDotglob(alloc: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    return expandImpl(alloc, pattern, true);
+}
+
+fn expandImpl(alloc: std.mem.Allocator, pattern: []const u8, dotglob: bool) ![]const []const u8 {
     if (!hasGlobChars(pattern)) {
         const copy = try alloc.dupe(u8, pattern);
         const result = try alloc.alloc([]const u8, 1);
@@ -37,7 +45,7 @@ pub fn expand(alloc: std.mem.Allocator, pattern: []const u8) ![]const []const u8
         const name = std.mem.sliceTo(name_ptr, 0);
 
         if (name[0] == '.') {
-            if (file_pattern.len == 0 or file_pattern[0] != '.') continue;
+            if (!dotglob and (file_pattern.len == 0 or file_pattern[0] != '.')) continue;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         }
 
@@ -66,7 +74,25 @@ pub fn expand(alloc: std.mem.Allocator, pattern: []const u8) ![]const []const u8
     return results.toOwnedSlice(alloc);
 }
 
+pub fn fnmatchNoCase(pattern: []const u8, text: []const u8) bool {
+    return fnmatchImpl(pattern, text, true);
+}
+
 pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
+    return fnmatchImpl(pattern, text, false);
+}
+
+fn eqlNoCase(a: u8, b: u8, nocase: bool) bool {
+    if (a == b) return true;
+    if (nocase) return std.ascii.toLower(a) == std.ascii.toLower(b);
+    return false;
+}
+
+pub fn fnmatchPathname(pattern: []const u8, text: []const u8) bool {
+    return fnmatchPathnameImpl(pattern, text, false);
+}
+
+fn fnmatchPathnameImpl(pattern: []const u8, text: []const u8, nocase: bool) bool {
     var pi: usize = 0;
     var ti: usize = 0;
     var star_pi: ?usize = null;
@@ -75,7 +101,120 @@ pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
     while (ti < text.len) {
         if (pi < pattern.len and pattern[pi] == '\\' and pi + 1 < pattern.len) {
             pi += 1;
-            if (pattern[pi] == text[ti]) {
+            if (eqlNoCase(pattern[pi], text[ti], nocase)) {
+                pi += 1;
+                ti += 1;
+            } else if (star_pi) |sp| {
+                if (text[star_ti] == '/') {
+                    star_pi = null;
+                    return false;
+                }
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+            continue;
+        }
+        if (pi < pattern.len and pattern[pi] == '/') {
+            if (text[ti] == '/') {
+                pi += 1;
+                ti += 1;
+                star_pi = null;
+            } else if (star_pi) |sp| {
+                if (text[star_ti] == '/') {
+                    star_pi = null;
+                    return false;
+                }
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+            continue;
+        }
+        if (pi < pattern.len and pattern[pi] == '[') {
+            const saved_pi = pi;
+            if (matchBracket(pattern, &pi, text[ti], nocase)) {
+                if (text[ti] == '/') return false;
+                ti += 1;
+                continue;
+            } else if (pi != saved_pi) {
+                if (star_pi) |sp| {
+                    if (text[star_ti] == '/') {
+                        star_pi = null;
+                        return false;
+                    }
+                    pi = sp + 1;
+                    star_ti += 1;
+                    ti = star_ti;
+                } else {
+                    return false;
+                }
+                continue;
+            } else {
+                if (text[ti] == '[') {
+                    pi += 1;
+                    ti += 1;
+                } else if (star_pi) |sp| {
+                    if (text[star_ti] == '/') {
+                        star_pi = null;
+                        return false;
+                    }
+                    pi = sp + 1;
+                    star_ti += 1;
+                    ti = star_ti;
+                } else {
+                    return false;
+                }
+                continue;
+            }
+        }
+        if (pi < pattern.len and pattern[pi] == '?') {
+            if (text[ti] == '/') return false;
+            pi += 1;
+            ti += utf8CharLen(text[ti]);
+        } else if (pi < pattern.len and eqlNoCase(pattern[pi], text[ti], nocase)) {
+            pi += 1;
+            ti += 1;
+        } else if (pi < pattern.len and pattern[pi] == '*') {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (star_pi) |sp| {
+            if (text[star_ti] == '/') {
+                star_pi = null;
+                return false;
+            }
+            pi = sp + 1;
+            star_ti += utf8CharLen(text[star_ti]);
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.len) {
+        if (pattern[pi] == '*') {
+            pi += 1;
+        } else {
+            break;
+        }
+    }
+    return pi == pattern.len;
+}
+
+fn fnmatchImpl(pattern: []const u8, text: []const u8, nocase: bool) bool {
+    var pi: usize = 0;
+    var ti: usize = 0;
+    var star_pi: ?usize = null;
+    var star_ti: usize = 0;
+
+    while (ti < text.len) {
+        if (pi < pattern.len and pattern[pi] == '\\' and pi + 1 < pattern.len) {
+            pi += 1;
+            if (eqlNoCase(pattern[pi], text[ti], nocase)) {
                 pi += 1;
                 ti += 1;
             } else if (star_pi) |sp| {
@@ -89,7 +228,7 @@ pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
         }
         if (pi < pattern.len and pattern[pi] == '[') {
             const saved_pi = pi;
-            if (matchBracket(pattern, &pi, text[ti])) {
+            if (matchBracket(pattern, &pi, text[ti], nocase)) {
                 ti += 1;
                 continue;
             } else if (pi != saved_pi) {
@@ -118,7 +257,7 @@ pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
         if (pi < pattern.len and pattern[pi] == '?') {
             pi += 1;
             ti += utf8CharLen(text[ti]);
-        } else if (pi < pattern.len and pattern[pi] == text[ti]) {
+        } else if (pi < pattern.len and eqlNoCase(pattern[pi], text[ti], nocase)) {
             pi += 1;
             ti += 1;
         } else if (pi < pattern.len and pattern[pi] == '*') {
@@ -145,7 +284,7 @@ pub fn fnmatch(pattern: []const u8, text: []const u8) bool {
     return pi == pattern.len;
 }
 
-fn matchBracket(pattern: []const u8, pi: *usize, ch: u8) bool {
+fn matchBracket(pattern: []const u8, pi: *usize, ch: u8, nocase: bool) bool {
     var i = pi.* + 1;
     if (i >= pattern.len) return false;
 
@@ -156,7 +295,12 @@ fn matchBracket(pattern: []const u8, pi: *usize, ch: u8) bool {
     }
 
     var matched = false;
-    var first = true;
+    var first = if (negate) blk: {
+        if (i < pattern.len and pattern[i] == ']') {
+            if (i + 1 >= pattern.len or pattern[i + 1] == ']') break :blk false;
+        }
+        break :blk true;
+    } else true;
     while (i < pattern.len) {
         if (pattern[i] == ']' and !first) {
             pi.* = i + 1;
@@ -195,12 +339,19 @@ fn matchBracket(pattern: []const u8, pi: *usize, ch: u8) bool {
                 end_char = pattern[i + char_len + 2];
                 end_len = 2;
             }
-            if (ch >= current_char and ch <= end_char) {
-                matched = true;
+            if (nocase) {
+                const lch = std.ascii.toLower(ch);
+                if (lch >= std.ascii.toLower(current_char) and lch <= std.ascii.toLower(end_char)) {
+                    matched = true;
+                }
+            } else {
+                if (ch >= current_char and ch <= end_char) {
+                    matched = true;
+                }
             }
             i += char_len + 1 + end_len;
         } else {
-            if (current_char == ch) {
+            if (eqlNoCase(current_char, ch, nocase)) {
                 matched = true;
             }
             i += char_len;

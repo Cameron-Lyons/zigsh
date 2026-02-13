@@ -94,14 +94,23 @@ pub const Shell = struct {
 
         var lexer = Lexer.init(source);
         var parser = Parser.init(alloc, &lexer) catch return 2;
-        const program = parser.parseProgram() catch |err| {
-            self.reportError("syntax error", err);
-            return 2;
-        };
+        parser.env = &self.env;
 
         var executor = Executor.init(alloc, &self.env, &self.jobs);
-        const status = executor.executeProgram(program);
-        self.env.last_exit_status = status;
+        var status: u8 = 0;
+
+        while (true) {
+            const cmd = parser.parseOneCommand() catch |err| {
+                self.reportError("syntax error", err);
+                return 2;
+            };
+            if (cmd == null) break;
+            status = executor.executeCompleteCommand(cmd.?);
+            self.env.last_exit_status = status;
+            if (self.env.should_exit) break;
+            if (self.env.should_return) break;
+        }
+
         return status;
     }
 
@@ -180,6 +189,7 @@ pub const Shell = struct {
 
                 var lexer = Lexer.init(accum.items);
                 var parser = Parser.init(alloc, &lexer) catch break;
+                parser.env = &self.env;
                 if (parser.parseProgram()) |program| {
                     if (self.env.options.verbose) {
                         posix.writeAll(2, accum.items);
@@ -243,6 +253,7 @@ pub const Shell = struct {
 
                 var lexer = Lexer.init(accum.items);
                 var parser = Parser.init(alloc, &lexer) catch break;
+                parser.env = &self.env;
                 if (parser.parseProgram()) |program| {
                     if (self.env.options.verbose) {
                         posix.writeAll(2, accum.items);

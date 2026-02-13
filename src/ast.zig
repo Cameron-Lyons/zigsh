@@ -75,6 +75,7 @@ pub const Assignment = struct {
     name: []const u8,
     value: Word,
     append: bool = false,
+    array_values: ?[]const Word = null,
 };
 
 pub const Word = struct {
@@ -111,6 +112,8 @@ pub const ParameterExp = union(enum) {
     case_conv: CaseConvOp,
     indirect: []const u8,
     transform: TransformOp,
+    prefix_list: PrefixListOp,
+    bad_sub: []const u8,
 };
 
 pub const ParamOp = struct {
@@ -253,6 +256,11 @@ pub const CaseConvMode = enum { upper_first, upper_all, lower_first, lower_all }
 pub const TransformOp = struct {
     name: []const u8,
     operator: u8,
+};
+
+pub const PrefixListOp = struct {
+    prefix: []const u8,
+    join: bool,
 };
 
 pub const FunctionDef = struct {

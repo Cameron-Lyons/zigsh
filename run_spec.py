@@ -65,8 +65,9 @@ def parse_spec_file(path):
                 if ln.startswith("## STDOUT:"):
                     stdout_lines = []
                     i += 1
-                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
-                        stdout_lines.append(lines[i])
+                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I|status:|stdout|stdout-json) ", lines[i]):
+                        if not lines[i].startswith("# "):
+                            stdout_lines.append(lines[i])
                         i += 1
                     expect_stdout = "".join(stdout_lines)
                     if i < len(lines) and lines[i].startswith("## END"):
@@ -76,7 +77,7 @@ def parse_spec_file(path):
                 if m_ok and "dash" in m_ok.group(1).split("/"):
                     stdout_lines = []
                     i += 1
-                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
+                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I|status:|stdout|stdout-json) ", lines[i]):
                         stdout_lines.append(lines[i])
                         i += 1
                     if _should_use_ok_dash_status(ln.replace("STDOUT:", "status: 0").rstrip()):
@@ -86,14 +87,14 @@ def parse_spec_file(path):
                     continue
                 if re.match(r"^## BUG dash(/\w+)* STDOUT:", ln):
                     i += 1
-                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
+                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I|status:|stdout|stdout-json) ", lines[i]):
                         i += 1
                     if i < len(lines) and lines[i].startswith("## END"):
                         i += 1
                     continue
                 if re.match(r"^## N-I dash(/\w+)* STDOUT:", ln):
                     i += 1
-                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
+                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I|status:|stdout|stdout-json) ", lines[i]):
                         i += 1
                     if i < len(lines) and lines[i].startswith("## END"):
                         i += 1
@@ -101,7 +102,7 @@ def parse_spec_file(path):
                     continue
                 if re.match(r"^## (OK|BUG\S*|N-I) \S+ STDOUT:", ln) and not re.match(r"^## (OK|BUG|N-I) dash(/\w+)* STDOUT:", ln):
                     i += 1
-                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I) ", lines[i]):
+                    while i < len(lines) and not lines[i].startswith("## END") and not re.match(r"^## (OK|BUG\S*|N-I|status:|stdout|stdout-json) ", lines[i]):
                         i += 1
                     if i < len(lines) and lines[i].startswith("## END"):
                         i += 1
@@ -169,8 +170,9 @@ def run_case(case):
     os.makedirs(os.path.join(workdir, "_tmp", "spec-tmp"), exist_ok=True)
     repo_root = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(os.path.join(repo_root, "_tmp", "spec-tmp"), exist_ok=True)
+    scriptdir = tempfile.mkdtemp()
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".sh", delete=False, dir=workdir
+        mode="w", suffix=".sh", delete=False, dir=scriptdir
     ) as f:
         f.write(code)
         f.flush()
@@ -198,8 +200,8 @@ def run_case(case):
     except Exception as e:
         return "ERROR", str(e)
     finally:
-        os.unlink(fname)
         import shutil
+        shutil.rmtree(scriptdir, ignore_errors=True)
         shutil.rmtree(workdir, ignore_errors=True)
 
     if case["n_i_dash"]:

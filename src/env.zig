@@ -34,6 +34,9 @@ pub const Environment = struct {
     job_table: ?*JobTable,
     history: ?*LineEditor.History,
     command_number: u32,
+    dir_stack: std.ArrayListUnmanaged([]const u8),
+    scope_stack: std.ArrayListUnmanaged(ScopeFrame),
+    arrays: std.StringHashMap([]const []const u8),
 
     pub const Variable = struct {
         value: []const u8,
@@ -42,6 +45,15 @@ pub const Environment = struct {
         integer: bool = false,
         lowercase: bool = false,
         uppercase: bool = false,
+    };
+
+    const SavedVar = struct {
+        name: []const u8,
+        variable: ?Variable,
+    };
+
+    const ScopeFrame = struct {
+        saved: std.ArrayListUnmanaged(SavedVar),
     };
 
     pub const FunctionDef = struct {
@@ -169,9 +181,40 @@ pub const Environment = struct {
             .job_table = null,
             .history = null,
             .command_number = 0,
+            .dir_stack = .empty,
+            .scope_stack = .empty,
+            .arrays = std.StringHashMap([]const []const u8).init(alloc),
         };
 
         env.importEnviron();
+
+        var pwd_valid = false;
+        if (env.get("PWD")) |pwd| {
+            if (pwd.len > 0 and pwd[0] == '/') {
+                const pwd_z = std.posix.toPosixPath(pwd) catch null;
+                const dot_z = std.posix.toPosixPath(".") catch null;
+                if (pwd_z != null and dot_z != null) {
+                    const pwd_st = posix.stat(&pwd_z.?) catch null;
+                    const dot_st = posix.stat(&dot_z.?) catch null;
+                    if (pwd_st != null and dot_st != null) {
+                        if (pwd_st.?.ino == dot_st.?.ino and
+                            pwd_st.?.dev_major == dot_st.?.dev_major and
+                            pwd_st.?.dev_minor == dot_st.?.dev_minor)
+                        {
+                            pwd_valid = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!pwd_valid) {
+            var cwd_buf: [4096]u8 = undefined;
+            const cwd = posix.getcwd(&cwd_buf) catch null;
+            if (cwd) |c_pwd| {
+                env.set("PWD", c_pwd, true) catch {};
+            }
+        }
+
         return env;
     }
 
@@ -191,6 +234,17 @@ pub const Environment = struct {
         self.functions.deinit();
 
         self.positional_stack.deinit(self.alloc);
+
+        for (self.scope_stack.items) |*frame| {
+            for (frame.saved.items) |sv| {
+                if (sv.variable) |v| {
+                    self.alloc.free(v.value);
+                }
+                self.alloc.free(sv.name);
+            }
+            frame.saved.deinit(self.alloc);
+        }
+        self.scope_stack.deinit(self.alloc);
 
         var ait = self.aliases.iterator();
         while (ait.next()) |entry| {
@@ -270,6 +324,33 @@ pub const Environment = struct {
         if (self.vars.get(name)) |v| {
             if (v.readonly) return .readonly;
         }
+        var fi: usize = self.scope_stack.items.len;
+        while (fi > 0) {
+            fi -= 1;
+            const frame = &self.scope_stack.items[fi];
+            for (frame.saved.items, 0..) |sv, idx| {
+                if (std.mem.eql(u8, sv.name, name)) {
+                    if (self.vars.fetchRemove(name)) |kv| {
+                        self.alloc.free(kv.key);
+                        self.alloc.free(kv.value.value);
+                    }
+                    if (sv.variable) |orig| {
+                        self.vars.put(sv.name, orig) catch {};
+                    } else {
+                        self.alloc.free(sv.name);
+                    }
+                    _ = frame.saved.orderedRemove(idx);
+                    if (std.mem.eql(u8, name, "IFS")) {
+                        if (self.vars.get(name)) |v| {
+                            self.ifs = v.value;
+                        } else {
+                            self.ifs = " \t\n";
+                        }
+                    }
+                    return .ok;
+                }
+            }
+        }
         if (self.vars.fetchRemove(name)) |kv| {
             self.alloc.free(kv.key);
             self.alloc.free(kv.value.value);
@@ -278,6 +359,91 @@ pub const Environment = struct {
             self.ifs = " \t\n";
         }
         return .ok;
+    }
+
+    pub fn removeVarDirect(self: *Environment, name: []const u8) void {
+        if (self.vars.fetchRemove(name)) |kv| {
+            self.alloc.free(kv.key);
+            self.alloc.free(kv.value.value);
+        }
+        if (std.mem.eql(u8, name, "IFS")) {
+            self.ifs = " \t\n";
+        }
+    }
+
+    pub fn setArray(self: *Environment, name: []const u8, elements: []const []const u8) !void {
+        const owned_elems = try self.alloc.alloc([]const u8, elements.len);
+        for (elements, 0..) |elem, i| {
+            owned_elems[i] = try self.alloc.dupe(u8, elem);
+        }
+        const owned_name = if (self.arrays.getKey(name)) |k| k else try self.alloc.dupe(u8, name);
+        try self.arrays.put(owned_name, owned_elems);
+        const scalar = if (elements.len > 0) elements[0] else "";
+        self.set(name, scalar, false) catch {};
+    }
+
+    pub fn getArray(self: *const Environment, name: []const u8) ?[]const []const u8 {
+        return self.arrays.get(name);
+    }
+
+    pub fn pushScope(self: *Environment) !void {
+        try self.scope_stack.append(self.alloc, .{ .saved = .empty });
+    }
+
+    pub fn popScope(self: *Environment) void {
+        if (self.scope_stack.items.len == 0) return;
+        var frame = self.scope_stack.pop().?;
+        var i: usize = frame.saved.items.len;
+        while (i > 0) {
+            i -= 1;
+            const sv = frame.saved.items[i];
+            if (sv.variable) |orig| {
+                if (self.vars.fetchRemove(sv.name)) |kv| {
+                    self.alloc.free(kv.key);
+                    self.alloc.free(kv.value.value);
+                }
+                self.vars.put(sv.name, orig) catch {
+                    self.alloc.free(sv.name);
+                    self.alloc.free(orig.value);
+                };
+                if (std.mem.eql(u8, sv.name, "IFS")) {
+                    if (self.vars.get(sv.name)) |v| {
+                        self.ifs = v.value;
+                    }
+                }
+            } else {
+                if (self.vars.fetchRemove(sv.name)) |kv| {
+                    self.alloc.free(kv.key);
+                    self.alloc.free(kv.value.value);
+                }
+                self.alloc.free(sv.name);
+                if (std.mem.eql(u8, sv.name, "IFS")) {
+                    self.ifs = " \t\n";
+                }
+            }
+        }
+        frame.saved.deinit(self.alloc);
+    }
+
+    pub fn declareLocal(self: *Environment, name: []const u8) !void {
+        if (self.scope_stack.items.len == 0) return;
+        const frame = &self.scope_stack.items[self.scope_stack.items.len - 1];
+        for (frame.saved.items) |sv| {
+            if (std.mem.eql(u8, sv.name, name)) return;
+        }
+        const saved_name = try self.alloc.dupe(u8, name);
+        const saved_var: ?Variable = if (self.vars.get(name)) |v|
+            Variable{
+                .value = try self.alloc.dupe(u8, v.value),
+                .exported = v.exported,
+                .readonly = v.readonly,
+                .integer = v.integer,
+                .lowercase = v.lowercase,
+                .uppercase = v.uppercase,
+            }
+        else
+            null;
+        try frame.saved.append(self.alloc, .{ .name = saved_name, .variable = saved_var });
     }
 
     pub fn unsetFunction(self: *Environment, name: []const u8) bool {
@@ -294,6 +460,12 @@ pub const Environment = struct {
             v.exported = true;
         } else {
             self.set(name, "", true) catch {};
+        }
+    }
+
+    pub fn markUnexported(self: *Environment, name: []const u8) void {
+        if (self.vars.getPtr(name)) |v| {
+            v.exported = false;
         }
     }
 

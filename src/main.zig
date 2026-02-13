@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (args.len > 0) {
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "-c")) {
+            if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "+c")) {
                 i += 1;
                 if (i >= args.len) {
                     posix.writeAll(2, "zigsh: -c: option requires an argument\n");
@@ -113,6 +113,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     if (ch == 'i' and sh.env.get("PS1") == null) {
                         sh.env.set("PS1", "\\s-\\v\\$ ", false) catch {};
                     }
+                }
+            } else if (args[i].len > 1 and args[i][0] == '+') {
+                for (args[i][1..]) |ch| {
+                    sh.env.setShortOption(ch, false);
                 }
             } else if (args[i].len > 0 and args[i][0] != '-') {
                 sh.env.shell_name = args[i];
