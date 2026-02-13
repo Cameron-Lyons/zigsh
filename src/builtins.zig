@@ -99,7 +99,9 @@ fn builtinExit(args: []const []const u8, env: *Environment) u8 {
         }
         if (args.len > 2) {
             posix.writeAll(2, "exit: too many arguments\n");
-            return 1;
+            env.should_exit = true;
+            env.exit_value = 2;
+            return 2;
         }
     }
     env.should_exit = true;
@@ -385,6 +387,55 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
         if (unset_func) {
             _ = env.unsetFunction(name);
         } else {
+            if (std.mem.indexOfScalar(u8, name, '[')) |bracket| {
+                if (name.len > bracket + 2 and name[name.len - 1] == ']') {
+                    const base = name[0..bracket];
+                    const subscript = name[bracket + 1 .. name.len - 1];
+                    if (!isValidVarName(base)) {
+                        posix.writeAll(2, "zigsh: unset: `");
+                        posix.writeAll(2, name);
+                        posix.writeAll(2, "': not a valid identifier\n");
+                        status = 2;
+                        continue;
+                    }
+                    if (std.mem.eql(u8, subscript, "@") or std.mem.eql(u8, subscript, "*")) {
+                        if (env.unset(base) == .readonly) {
+                            posix.writeAll(2, "zigsh: unset: ");
+                            posix.writeAll(2, base);
+                            posix.writeAll(2, ": readonly variable\n");
+                            status = 1;
+                        }
+                        continue;
+                    }
+                    const Arithmetic = @import("arithmetic.zig").Arithmetic;
+                    const unset_lookup = struct {
+                        var e: *Environment = undefined;
+                        fn f(vname: []const u8) ?[]const u8 {
+                            return e.get(vname);
+                        }
+                    };
+                    unset_lookup.e = env;
+                    const idx = Arithmetic.evaluate(subscript, &unset_lookup.f) catch {
+                        status = 1;
+                        continue;
+                    };
+                    if (env.getArray(base)) |elems| {
+                        const effective_idx: ?usize = if (idx < 0) blk: {
+                            const neg: usize = @intCast(-idx);
+                            if (neg > elems.len) break :blk null;
+                            break :blk elems.len - neg;
+                        } else blk: {
+                            const ui: usize = @intCast(idx);
+                            break :blk if (ui < elems.len) ui else null;
+                        };
+                        if (effective_idx) |eidx| {
+                            @constCast(elems)[eidx] = "";
+                            if (eidx == 0) env.set(base, "", false) catch {};
+                        }
+                    }
+                    continue;
+                }
+            }
             if (!isValidVarName(name)) {
                 posix.writeAll(2, "zigsh: unset: `");
                 posix.writeAll(2, name);
@@ -1033,6 +1084,34 @@ fn testUnary(op: []const u8, operand: []const u8, test_env: *Environment) u8 {
     if (std.mem.eql(u8, op, "-z")) return if (operand.len == 0) 0 else 1;
 
     if (std.mem.eql(u8, op, "-v")) {
+        if (std.mem.indexOfScalar(u8, operand, '[')) |bracket| {
+            if (operand.len > bracket + 2 and operand[operand.len - 1] == ']') {
+                const base = operand[0..bracket];
+                const subscript = operand[bracket + 1 .. operand.len - 1];
+                if (std.mem.eql(u8, subscript, "@") or std.mem.eql(u8, subscript, "*")) {
+                    return if (test_env.getArray(base) != null) 0 else 1;
+                }
+                const Arithmetic = @import("arithmetic.zig").Arithmetic;
+                const test_lookup = struct {
+                    var e: *Environment = undefined;
+                    fn f(name: []const u8) ?[]const u8 {
+                        return e.get(name);
+                    }
+                };
+                test_lookup.e = test_env;
+                const idx = Arithmetic.evaluate(subscript, &test_lookup.f) catch return 1;
+                const elems = test_env.getArray(base) orelse return 1;
+                const effective_idx: usize = if (idx < 0) blk: {
+                    const neg: usize = @intCast(-idx);
+                    if (neg > elems.len) return 1;
+                    break :blk elems.len - neg;
+                } else blk: {
+                    break :blk @intCast(idx);
+                };
+                if (effective_idx >= elems.len) return 1;
+                return 0;
+            }
+        }
         return if (test_env.get(operand) != null) 0 else 1;
     }
     if (std.mem.eql(u8, op, "-o")) {
@@ -4165,6 +4244,8 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
     var flags_unset_attrs = false;
     var flags_func = false;
     var flags_func_names = false;
+    var flags_array = false;
+    var flags_global = false;
     var has_export = false;
     var has_readonly = false;
     var has_integer = false;
@@ -4205,7 +4286,9 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     has_uppercase = true;
                     flags_uppercase = !removing;
                 },
-                'a', 'A', 'n', 'g', 't' => {},
+                'a' => { flags_array = true; },
+                'g' => { flags_global = true; },
+                'A', 'n', 't' => {},
                 else => {},
             }
         }
@@ -4306,7 +4389,8 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
         return status;
     }
 
-    const is_local = std.mem.eql(u8, args[0], "local");
+    const in_function = env.function_name_stack.items.len > 0;
+    const is_local = std.mem.eql(u8, args[0], "local") or (in_function and !flags_global);
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.indexOf(u8, arg, "=")) |eq| {
@@ -4370,7 +4454,10 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
             }
             if (is_local) {
                 env.declareLocal(arg) catch {};
-                if (!flags_export and !flags_readonly and !flags_integer and !flags_lowercase and !flags_uppercase and !flags_unset_attrs) {
+            }
+            if (flags_array and env.getArray(arg) == null) {
+                env.setArray(arg, &.{}) catch {};
+                if (!flags_export and !flags_readonly and !flags_integer and !flags_lowercase and !flags_uppercase and !flags_unset_attrs and !flags_array) {
                     env.removeVarDirect(arg);
                     continue;
                 }

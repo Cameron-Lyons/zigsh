@@ -957,7 +957,7 @@ pub const Expander = struct {
         var start: i64 = raw_offset;
         if (start < 0) {
             start = total + start;
-            if (start < 0) start = 0;
+            if (start < 0) return try self.alloc.dupe(u8, "");
         }
 
         var end: i64 = total;
@@ -1075,9 +1075,35 @@ pub const Expander = struct {
         if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
             return self.expandTransformSpecial(op);
         }
+        if (parseArraySubscript(op.name)) |arr| {
+            if (std.mem.eql(u8, arr.subscript, "*") or std.mem.eql(u8, arr.subscript, "@")) {
+                if (self.env.getArray(arr.base)) |elems| {
+                    const sep: u8 = if (std.mem.eql(u8, arr.subscript, "*")) blk: {
+                        const ifs = self.env.get("IFS") orelse " \t\n";
+                        break :blk if (ifs.len > 0) ifs[0] else 0;
+                    } else ' ';
+                    var result: std.ArrayListUnmanaged(u8) = .empty;
+                    for (elems, 0..) |elem, idx| {
+                        if (idx > 0 and sep != 0) try result.append(self.alloc, sep);
+                        const elem_op: ast.TransformOp = .{ .name = op.name, .operator = op.operator };
+                        const transformed = try self.expandTransformElement(elem_op, elem);
+                        try result.appendSlice(self.alloc, transformed);
+                    }
+                    return result.toOwnedSlice(self.alloc);
+                }
+            }
+        }
         const maybe_val = self.getParamValue(op.name);
-        if (maybe_val == null and (op.operator == 'Q' or op.operator == 'a')) {
-            return try self.alloc.dupe(u8, "");
+        if (maybe_val == null) {
+            if (self.env.options.nounset) {
+                const msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter not set\n", .{op.name}) catch return error.OutOfMemory;
+                _ = std.c.write(2, msg.ptr, msg.len);
+                self.alloc.free(msg);
+                return error.UnsetVariable;
+            }
+            if (op.operator == 'Q' or op.operator == 'a') {
+                return try self.alloc.dupe(u8, "");
+            }
         }
         const val = maybe_val orelse "";
         switch (op.operator) {
@@ -1184,6 +1210,69 @@ pub const Expander = struct {
                 }
                 return result.toOwnedSlice(self.alloc);
             },
+            'a' => {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
+                if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
+                if (self.env.vars.get(base_name)) |variable| {
+                    if (variable.integer) try result.append(self.alloc, 'i');
+                    if (variable.lowercase) try result.append(self.alloc, 'l');
+                    if (variable.readonly) try result.append(self.alloc, 'r');
+                    if (variable.uppercase) try result.append(self.alloc, 'u');
+                    if (variable.exported) try result.append(self.alloc, 'x');
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
+            else => return try self.alloc.dupe(u8, val),
+        }
+    }
+
+    fn expandTransformElement(self: *Expander, op: ast.TransformOp, val: []const u8) ExpandError![]const u8 {
+        switch (op.operator) {
+            'Q' => {
+                var needs_ansi = false;
+                for (val) |ch| {
+                    if (ch < 0x20 or ch == 0x7f) { needs_ansi = true; break; }
+                }
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                if (needs_ansi) {
+                    try result.appendSlice(self.alloc, "$'");
+                    for (val) |ch| {
+                        switch (ch) {
+                            '\n' => try result.appendSlice(self.alloc, "\\n"),
+                            '\t' => try result.appendSlice(self.alloc, "\\t"),
+                            '\r' => try result.appendSlice(self.alloc, "\\r"),
+                            0x07 => try result.appendSlice(self.alloc, "\\a"),
+                            0x08 => try result.appendSlice(self.alloc, "\\b"),
+                            0x1b => try result.appendSlice(self.alloc, "\\E"),
+                            '\\' => try result.appendSlice(self.alloc, "\\\\"),
+                            '\'' => try result.appendSlice(self.alloc, "\\'"),
+                            else => {
+                                if (ch < 0x20 or ch == 0x7f) {
+                                    var esc_buf: [6]u8 = undefined;
+                                    const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
+                                    try result.appendSlice(self.alloc, esc);
+                                } else {
+                                    try result.append(self.alloc, ch);
+                                }
+                            },
+                        }
+                    }
+                    try result.append(self.alloc, '\'');
+                } else {
+                    try result.append(self.alloc, '\'');
+                    for (val) |ch| {
+                        if (ch == '\'') {
+                            try result.appendSlice(self.alloc, "'\\''");
+                        } else {
+                            try result.append(self.alloc, ch);
+                        }
+                    }
+                    try result.append(self.alloc, '\'');
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
+            'P' => return self.expandPromptWithShellExpansion(val),
             'a' => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
                 const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
@@ -2563,6 +2652,7 @@ pub const Expander = struct {
                     .suffix_strip => |op| op.name,
                     .suffix_strip_long => |op| op.name,
                     .case_conv => |op| op.name,
+                    .transform => |op| op.name,
                     else => return self.env.positional_params,
                 };
                 if (parseArraySubscript(name)) |arr| {
@@ -2639,6 +2729,65 @@ pub const Expander = struct {
             .suffix_strip => |op| return try self.stripStr(val, op.pattern, .suffix_short),
             .suffix_strip_long => |op| return try self.stripStr(val, op.pattern, .suffix_long),
             .case_conv => |op| return try self.caseConvStr(val, op.mode),
+            .transform => |op| {
+                switch (op.operator) {
+                    'Q' => {
+                        var result: std.ArrayListUnmanaged(u8) = .empty;
+                        var needs_ansi = false;
+                        for (val) |ch| {
+                            if (ch < 0x20 or ch == 0x7f) { needs_ansi = true; break; }
+                        }
+                        if (needs_ansi) {
+                            try result.appendSlice(self.alloc, "$'");
+                            for (val) |ch| {
+                                switch (ch) {
+                                    '\n' => try result.appendSlice(self.alloc, "\\n"),
+                                    '\t' => try result.appendSlice(self.alloc, "\\t"),
+                                    '\r' => try result.appendSlice(self.alloc, "\\r"),
+                                    '\\' => try result.appendSlice(self.alloc, "\\\\"),
+                                    '\'' => try result.appendSlice(self.alloc, "\\'"),
+                                    else => {
+                                        if (ch < 0x20 or ch == 0x7f) {
+                                            var esc_buf: [6]u8 = undefined;
+                                            const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
+                                            try result.appendSlice(self.alloc, esc);
+                                        } else {
+                                            try result.append(self.alloc, ch);
+                                        }
+                                    },
+                                }
+                            }
+                            try result.append(self.alloc, '\'');
+                        } else {
+                            try result.append(self.alloc, '\'');
+                            for (val) |ch| {
+                                if (ch == '\'') {
+                                    try result.appendSlice(self.alloc, "'\\''");
+                                } else {
+                                    try result.append(self.alloc, ch);
+                                }
+                            }
+                            try result.append(self.alloc, '\'');
+                        }
+                        return result.toOwnedSlice(self.alloc);
+                    },
+                    'P' => return self.expandPromptWithShellExpansion(val),
+                    'a' => {
+                        var result: std.ArrayListUnmanaged(u8) = .empty;
+                        const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
+                        if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
+                        if (self.env.vars.get(base_name)) |variable| {
+                            if (variable.integer) try result.append(self.alloc, 'i');
+                            if (variable.lowercase) try result.append(self.alloc, 'l');
+                            if (variable.readonly) try result.append(self.alloc, 'r');
+                            if (variable.uppercase) try result.append(self.alloc, 'u');
+                            if (variable.exported) try result.append(self.alloc, 'x');
+                        }
+                        return result.toOwnedSlice(self.alloc);
+                    },
+                    else => return try self.alloc.dupe(u8, val),
+                }
+            },
             else => return try self.alloc.dupe(u8, val),
         }
     }
@@ -2746,7 +2895,8 @@ pub const Expander = struct {
         for (params, 0..) |param, i| {
             var field: std.ArrayListUnmanaged(u8) = .empty;
             if (i == 0) try field.appendSlice(self.alloc, prefix.items);
-            try field.appendSlice(self.alloc, param);
+            const transformed = try self.applyParamOpToValue(at_param, param);
+            try field.appendSlice(self.alloc, transformed);
             if (i == params.len - 1) try field.appendSlice(self.alloc, suffix.items);
 
             const field_text = try field.toOwnedSlice(self.alloc);
