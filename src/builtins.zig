@@ -1112,6 +1112,9 @@ fn testUnary(op: []const u8, operand: []const u8, test_env: *Environment) u8 {
                 return 0;
             }
         }
+        if (test_env.getArray(operand)) |elems| {
+            return if (elems.len > 0) 0 else 1;
+        }
         return if (test_env.get(operand) != null) 0 else 1;
     }
     if (std.mem.eql(u8, op, "-o")) {
@@ -4341,14 +4344,36 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
 
     const filter_by_attrs = flags_print and (flags_readonly or flags_export or flags_integer);
     if (flags_print and i >= args.len) {
-        var it = env.vars.iterator();
-        while (it.next()) |entry| {
-            if (filter_by_attrs) {
-                if (flags_readonly and !entry.value_ptr.readonly) continue;
-                if (flags_export and !entry.value_ptr.exported) continue;
-                if (flags_integer and !entry.value_ptr.integer) continue;
+        if (!flags_array) {
+            var it = env.vars.iterator();
+            while (it.next()) |entry| {
+                if (env.getArray(entry.key_ptr.*) != null) continue;
+                if (filter_by_attrs) {
+                    if (flags_readonly and !entry.value_ptr.readonly) continue;
+                    if (flags_export and !entry.value_ptr.exported) continue;
+                    if (flags_integer and !entry.value_ptr.integer) continue;
+                }
+                declarePrintVar(entry.key_ptr.*, entry.value_ptr.*);
             }
-            declarePrintVar(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        if (flags_array or !filter_by_attrs) {
+            var arr_it = env.arrays.iterator();
+            while (arr_it.next()) |entry| {
+                posix.writeAll(1, "declare -a ");
+                posix.writeAll(1, entry.key_ptr.*);
+                posix.writeAll(1, "=(");
+                for (entry.value_ptr.*, 0..) |e, idx| {
+                    if (idx > 0) posix.writeAll(1, " ");
+                    posix.writeAll(1, "[");
+                    var idx_buf: [16]u8 = undefined;
+                    const idx_s = std.fmt.bufPrint(&idx_buf, "{d}", .{idx}) catch continue;
+                    posix.writeAll(1, idx_s);
+                    posix.writeAll(1, "]=\"");
+                    posix.writeAll(1, e);
+                    posix.writeAll(1, "\"");
+                }
+                posix.writeAll(1, ")\n");
+            }
         }
         return 0;
     }
@@ -4356,14 +4381,7 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
         var status: u8 = 0;
         while (i < args.len) : (i += 1) {
             const name = args[i];
-            if (env.vars.get(name)) |v| {
-                if (filter_by_attrs) {
-                    if (flags_readonly and !v.readonly) continue;
-                    if (flags_export and !v.exported) continue;
-                    if (flags_integer and !v.integer) continue;
-                }
-                declarePrintVar(name, v);
-            } else if (env.getArray(name)) |elems| {
+            if (env.getArray(name)) |elems| {
                 posix.writeAll(1, "declare -a ");
                 posix.writeAll(1, name);
                 posix.writeAll(1, "=(");
@@ -4378,6 +4396,13 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     posix.writeAll(1, "\"");
                 }
                 posix.writeAll(1, ")\n");
+            } else if (env.vars.get(name)) |v| {
+                if (filter_by_attrs) {
+                    if (flags_readonly and !v.readonly) continue;
+                    if (flags_export and !v.exported) continue;
+                    if (flags_integer and !v.integer) continue;
+                }
+                declarePrintVar(name, v);
             } else {
                 posix.writeAll(2, args[0]);
                 posix.writeAll(2, ": ");

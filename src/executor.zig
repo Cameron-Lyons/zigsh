@@ -1006,6 +1006,9 @@ pub const Executor = struct {
                     return effective_idx < elems.len;
                 }
             }
+            if (self.env.getArray(val)) |elems| {
+                return elems.len > 0;
+            }
             return self.env.get(val) != null;
         }
         if (std.mem.eql(u8, op, "-o")) {
