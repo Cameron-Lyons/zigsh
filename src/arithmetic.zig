@@ -562,9 +562,21 @@ pub const Arithmetic = struct {
         while (self.pos < self.expr.len and types.isNameCont(self.expr[self.pos])) {
             self.pos += 1;
         }
-        const name = self.expr[start..self.pos];
+        const base_name = self.expr[start..self.pos];
+
+        var subscript_buf: [256]u8 = undefined;
+        var lookup_name = base_name;
+        if (self.pos < self.expr.len and self.expr[self.pos] == '[') {
+            self.pos += 1;
+            const subscript_val = try self.parseComma();
+            self.skipWhitespace();
+            if (self.pos >= self.expr.len or self.expr[self.pos] != ']') return error.InvalidExpression;
+            self.pos += 1;
+            lookup_name = std.fmt.bufPrint(&subscript_buf, "{s}[{d}]", .{ base_name, subscript_val }) catch base_name;
+        }
+
         const val = blk: {
-            const v = self.lookup(name) orelse break :blk @as(i64, 0);
+            const v = self.lookup(lookup_name) orelse break :blk @as(i64, 0);
             break :blk std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\n"), 10) catch blk2: {
                 if (v.len > 0) {
                     var sub = Arithmetic{
@@ -586,12 +598,12 @@ pub const Arithmetic = struct {
 
         if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '+' and self.expr[self.pos + 1] == '+') {
             self.pos += 2;
-            if (self.setter) |s| s(name, val +% 1);
+            if (self.setter) |s| s(lookup_name, val +% 1);
             return val;
         }
         if (self.pos + 1 < self.expr.len and self.expr[self.pos] == '-' and self.expr[self.pos + 1] == '-') {
             self.pos += 2;
-            if (self.setter) |s| s(name, val -% 1);
+            if (self.setter) |s| s(lookup_name, val -% 1);
             return val;
         }
 
