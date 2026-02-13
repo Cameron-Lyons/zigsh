@@ -631,8 +631,6 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
 
     if (i < args.len) {
         env.positional_params = args[i..];
-        env.set("OPTIND", "1", false) catch {};
-        env.set("OPTPOS", "0", false) catch {};
     }
     return 0;
 }
@@ -3530,18 +3528,13 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     }
     const raw_optstring = args[1];
     const varname = args[2];
-    if (varname.len == 0 or (varname[0] != '_' and !std.ascii.isAlphabetic(varname[0]))) {
-        posix.writeAll(2, "getopts: ");
-        posix.writeAll(2, varname);
-        posix.writeAll(2, ": invalid variable name\n");
-        return 2;
-    }
-    for (varname[1..]) |vc| {
-        if (vc != '_' and !std.ascii.isAlphanumeric(vc)) {
-            posix.writeAll(2, "getopts: ");
-            posix.writeAll(2, varname);
-            posix.writeAll(2, ": invalid variable name\n");
-            return 2;
+    var invalid_varname = varname.len == 0 or (varname[0] != '_' and !std.ascii.isAlphabetic(varname[0]));
+    if (!invalid_varname) {
+        for (varname[1..]) |vc| {
+            if (vc != '_' and !std.ascii.isAlphanumeric(vc)) {
+                invalid_varname = true;
+                break;
+            }
         }
     }
     const params = if (args.len > 3) args[3..] else env.positional_params;
@@ -3559,25 +3552,33 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     }
 
     if (optind > params.len) {
-        env.set(varname, "?", false) catch {};
+        if (!invalid_varname) env.set(varname, "?", false) catch {};
         _ = env.unset("OPTARG");
-        return 1;
+        var reset_buf: [16]u8 = undefined;
+        const reset_str = std.fmt.bufPrint(&reset_buf, "{d}", .{params.len + 1}) catch "1";
+        env.set("OPTIND", reset_str, false) catch {};
+        env.set("OPTPOS", "0", false) catch {};
+        return if (invalid_varname) 2 else 1;
     }
 
     const current_arg = params[optind - 1];
 
     if (optpos_val == 0) {
         if (current_arg.len < 2 or current_arg[0] != '-') {
-            env.set(varname, "?", false) catch {};
-            return 1;
+            if (!invalid_varname) env.set(varname, "?", false) catch {};
+            var reset_buf2: [16]u8 = undefined;
+            const reset_str2 = std.fmt.bufPrint(&reset_buf2, "{d}", .{optind}) catch "1";
+            env.set("OPTIND", reset_str2, false) catch {};
+            env.set("OPTPOS", "0", false) catch {};
+            return if (invalid_varname) 2 else 1;
         }
         if (std.mem.eql(u8, current_arg, "--")) {
             optind += 1;
             var ind_buf2: [16]u8 = undefined;
             const ind_str2 = std.fmt.bufPrint(&ind_buf2, "{d}", .{optind}) catch return 1;
             env.set("OPTIND", ind_str2, false) catch {};
-            env.set(varname, "?", false) catch {};
-            return 1;
+            if (!invalid_varname) env.set(varname, "?", false) catch {};
+            return if (invalid_varname) 2 else 1;
         }
         optpos_val = 1;
     }
@@ -3602,10 +3603,10 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
 
     if (!found) {
         if (silent) {
-            env.set(varname, "?", false) catch {};
+            if (!invalid_varname) env.set(varname, "?", false) catch {};
             env.set("OPTARG", val, false) catch {};
         } else {
-            env.set(varname, "?", false) catch {};
+            if (!invalid_varname) env.set(varname, "?", false) catch {};
             _ = env.unset("OPTARG");
             posix.writeAll(2, "getopts: illegal option -- ");
             posix.writeAll(2, val);
@@ -3617,7 +3618,7 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
             optpos_val = 0;
         }
     } else {
-        env.set(varname, val, false) catch {};
+        if (!invalid_varname) env.set(varname, val, false) catch {};
         if (!expects_arg) {
             env.set("OPTARG", "", false) catch {};
         }
@@ -3629,10 +3630,10 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
                 env.set("OPTARG", params[optind - 1], false) catch {};
             } else {
                 if (silent) {
-                    env.set(varname, ":", false) catch {};
+                    if (!invalid_varname) env.set(varname, ":", false) catch {};
                     env.set("OPTARG", val, false) catch {};
                 } else {
-                    env.set(varname, "?", false) catch {};
+                    if (!invalid_varname) env.set(varname, "?", false) catch {};
                     posix.writeAll(2, "getopts: option requires an argument -- ");
                     posix.writeAll(2, val);
                     posix.writeAll(2, "\n");
@@ -3664,6 +3665,12 @@ fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
     var pos_buf: [16]u8 = undefined;
     const pos_str = std.fmt.bufPrint(&pos_buf, "{d}", .{optpos_val}) catch return 1;
     env.set("OPTPOS", pos_str, false) catch {};
+    if (invalid_varname) {
+        posix.writeAll(2, "getopts: ");
+        posix.writeAll(2, varname);
+        posix.writeAll(2, ": invalid variable name\n");
+        return 2;
+    }
     return 0;
 }
 
