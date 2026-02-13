@@ -54,6 +54,9 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "pushd", &builtinPushd },
     .{ "popd", &builtinPopd },
     .{ "dirs", &builtinDirs },
+    .{ "mapfile", &builtinMapfile },
+    .{ "readarray", &builtinMapfile },
+    .{ "help", &builtinHelp },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
@@ -314,11 +317,11 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
         var it = env.vars.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.exported) continue;
-            posix.writeAll(1, "export ");
+            posix.writeAll(1, "declare -x ");
             posix.writeAll(1, entry.key_ptr.*);
-            posix.writeAll(1, "=\"");
-            posix.writeAll(1, entry.value_ptr.value);
-            posix.writeAll(1, "\"\n");
+            posix.writeAll(1, "=");
+            declareWriteQuotedValue(entry.value_ptr.value);
+            posix.writeAll(1, "\n");
         }
         return 0;
     }
@@ -974,6 +977,9 @@ fn testEvaluate(targs: []const []const u8, test_env: *Environment) u8 {
         if (std.mem.eql(u8, targs[0], "!")) {
             return if (testEvaluate(targs[1..], test_env) == 0) 1 else 0;
         }
+        if (isTestBinaryOp(targs[1])) {
+            return testBinary(targs[0], targs[1], targs[2]);
+        }
         if (std.mem.eql(u8, targs[0], "(") and std.mem.eql(u8, targs[2], ")")) {
             return testEvaluate(targs[1..2], test_env);
         }
@@ -1035,20 +1041,20 @@ fn testParsePrimary(targs: []const []const u8, pos: *usize, test_env: *Environme
         return result;
     }
 
-    if (isTestUnaryOp(targs[pos.*]) and pos.* + 1 < targs.len) {
-        const op = targs[pos.*];
-        pos.* += 1;
-        const operand = targs[pos.*];
-        pos.* += 1;
-        return testUnary(op, operand, test_env);
-    }
-
     if (pos.* + 2 < targs.len and isTestBinaryOp(targs[pos.* + 1])) {
         const left = targs[pos.*];
         const op = targs[pos.* + 1];
         const right = targs[pos.* + 2];
         pos.* += 3;
         return testBinary(left, op, right);
+    }
+
+    if (isTestUnaryOp(targs[pos.*]) and pos.* + 1 < targs.len) {
+        const op = targs[pos.*];
+        pos.* += 1;
+        const operand = targs[pos.*];
+        pos.* += 1;
+        return testUnary(op, operand, test_env);
     }
 
     const result: u8 = if (targs[pos.*].len > 0) 0 else 1;
@@ -1131,7 +1137,11 @@ fn testUnary(op: []const u8, operand: []const u8, test_env: *Environment) u8 {
     }
 
     if (std.mem.eql(u8, op, "-t")) {
-        const fd_num = std.fmt.parseInt(posix.fd_t, operand, 10) catch return 2;
+        for (operand) |ch| {
+            if (ch != '-' and (ch < '0' or ch > '9')) return 2;
+        }
+        const fd_num = std.fmt.parseInt(posix.fd_t, operand, 10) catch return 1;
+        if (fd_num < 0) return 1;
         return if (posix.isatty(fd_num)) 0 else 1;
     }
 
@@ -1456,12 +1466,16 @@ fn builtinKill(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(2, "kill: -s requires a signal name\n");
             return 2;
         }
-        sig = sigFromName(args[2]) orelse {
-            posix.writeAll(2, "kill: invalid signal: ");
-            posix.writeAll(2, args[2]);
-            posix.writeAll(2, "\n");
-            return 2;
-        };
+        if (std.fmt.parseInt(u6, args[2], 10)) |n| {
+            sig = n;
+        } else |_| {
+            sig = sigFromName(args[2]) orelse {
+                posix.writeAll(2, "kill: invalid signal: ");
+                posix.writeAll(2, args[2]);
+                posix.writeAll(2, "\n");
+                return 1;
+            };
+        }
         start = 3;
     } else if (args[1].len > 1 and args[1][0] == '-') {
         const sig_str = args[1][1..];
@@ -1670,11 +1684,11 @@ fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
         var it = env.vars.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.readonly) continue;
-            posix.writeAll(1, "readonly ");
+            posix.writeAll(1, "declare -r ");
             posix.writeAll(1, entry.key_ptr.*);
-            posix.writeAll(1, "=\"");
-            posix.writeAll(1, entry.value_ptr.value);
-            posix.writeAll(1, "\"\n");
+            posix.writeAll(1, "=");
+            declareWriteQuotedValue(entry.value_ptr.value);
+            posix.writeAll(1, "\n");
         }
         return 0;
     }
@@ -1736,6 +1750,7 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     var nchars: ?usize = null;
     var nchars_exact = false;
     var read_fd: types.Fd = types.STDIN;
+    var array_var: ?[]const u8 = null;
     var arg_start: usize = 1;
 
     while (arg_start < args.len) {
@@ -1750,6 +1765,13 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
             switch (arg[j]) {
                 'r' => raw = true,
                 's' => {},
+                'a' => {
+                    if (arg_start + 1 < args.len) {
+                        arg_start += 1;
+                        array_var = args[arg_start];
+                    }
+                    break;
+                },
                 'p' => {
                     if (j + 1 < arg.len) {
                         prompt = arg[j + 1 ..];
@@ -1935,6 +1957,41 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     const line = buf[0..total];
     const ifs = env.ifs;
 
+    if (array_var) |av| {
+        var fields: [256][]const u8 = undefined;
+        var field_count: usize = 0;
+        var pos: usize = 0;
+        while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+        if (pos < line.len) {
+            while (pos < line.len) {
+                const field_start = pos;
+                while (pos < line.len and !isIfsChar(line[pos], ifs)) : (pos += 1) {}
+                if (field_count < fields.len) {
+                    fields[field_count] = line[field_start..pos];
+                    field_count += 1;
+                }
+                if (pos >= line.len) break;
+                while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                if (pos >= line.len) break;
+                if (isIfsNonWhitespace(line[pos], ifs)) {
+                    pos += 1;
+                    while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                    while (pos < line.len and isIfsNonWhitespace(line[pos], ifs)) {
+                        if (field_count < fields.len) {
+                            fields[field_count] = "";
+                            field_count += 1;
+                        }
+                        pos += 1;
+                        while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                    }
+                    if (pos >= line.len) break;
+                }
+            }
+        }
+        env.setArray(av, fields[0..field_count]) catch return 1;
+        return if (hit_eof) 1 else 0;
+    }
+
     if (effective_names.len == 1) {
         if (nchars_exact or var_names.len == 0) {
             env.set(effective_names[0], line, false) catch return 1;
@@ -1990,6 +2047,78 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     }
 
     return if (hit_eof) 1 else 0;
+}
+
+fn builtinMapfile(args: []const []const u8, env: *Environment) u8 {
+    var strip_trailing = false;
+    var delim: u8 = '\n';
+    var array_name: []const u8 = "MAPFILE";
+    var arg_start: usize = 1;
+
+    while (arg_start < args.len) {
+        const arg = args[arg_start];
+        if (arg.len == 0 or arg[0] != '-') break;
+        if (std.mem.eql(u8, arg, "--")) {
+            arg_start += 1;
+            break;
+        }
+        if (std.mem.eql(u8, arg, "-t")) {
+            strip_trailing = true;
+        } else if (std.mem.eql(u8, arg, "-d")) {
+            if (arg_start + 1 < args.len) {
+                arg_start += 1;
+                if (args[arg_start].len > 0) {
+                    delim = args[arg_start][0];
+                } else {
+                    delim = 0;
+                }
+            }
+        }
+        arg_start += 1;
+    }
+
+    if (arg_start < args.len) {
+        array_name = args[arg_start];
+    }
+
+    var lines: [4096][]const u8 = undefined;
+    var line_count: usize = 0;
+    var line_buf: [65536]u8 = undefined;
+    var line_pos: usize = 0;
+
+    while (true) {
+        var byte_buf: [1]u8 = undefined;
+        const n = posix.read(types.STDIN, &byte_buf) catch break;
+        if (n == 0) {
+            if (line_pos > 0 and line_count < lines.len) {
+                lines[line_count] = env.alloc.dupe(u8, line_buf[0..line_pos]) catch return 1;
+                line_count += 1;
+            }
+            break;
+        }
+        if (byte_buf[0] == delim) {
+            const end = if (strip_trailing) line_pos else blk: {
+                if (line_pos < line_buf.len) {
+                    line_buf[line_pos] = delim;
+                    break :blk line_pos + 1;
+                }
+                break :blk line_pos;
+            };
+            if (line_count < lines.len) {
+                lines[line_count] = env.alloc.dupe(u8, line_buf[0..end]) catch return 1;
+                line_count += 1;
+            }
+            line_pos = 0;
+        } else {
+            if (line_pos < line_buf.len) {
+                line_buf[line_pos] = byte_buf[0];
+                line_pos += 1;
+            }
+        }
+    }
+
+    env.setArray(array_name, lines[0..line_count]) catch return 1;
+    return 0;
 }
 
 const PrintfSpec = struct {
@@ -3199,9 +3328,9 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
                     posix.writeAll(1, "alias\n");
                 } else {
                     posix.writeAll(1, name);
-                    posix.writeAll(1, " is aliased to '");
+                    posix.writeAll(1, " is an alias for \"");
                     posix.writeAll(1, env.getAlias(name).?);
-                    posix.writeAll(1, "'\n");
+                    posix.writeAll(1, "\"\n");
                 }
             }
             if (!flag_a) continue;
@@ -3226,8 +3355,14 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
                 if (flag_t) {
                     posix.writeAll(1, "function\n");
                 } else {
+                    const fsrc = env.functions.get(name).?.source;
                     posix.writeAll(1, name);
-                    posix.writeAll(1, " is a shell function\n");
+                    posix.writeAll(1, " is a function\n");
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " () \n");
+                    posix.writeAll(1, fsrc);
+                    if (fsrc.len == 0 or fsrc[fsrc.len - 1] != '\n')
+                        posix.writeAll(1, "\n");
                 }
             }
             if (!flag_a) continue;
@@ -3755,8 +3890,7 @@ fn builtinFc(args: []const []const u8, env: *Environment) u8 {
         return 1;
     };
     if (history.count == 0) {
-        posix.writeAll(2, "fc: no history\n");
-        return 1;
+        return 0;
     }
 
     var list_mode = false;
@@ -4229,12 +4363,25 @@ fn builtinHistory(args: []const []const u8, env: *Environment) u8 {
 
 fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
-        var it = env.vars.iterator();
-        while (it.next()) |entry| {
-            posix.writeAll(1, entry.key_ptr.*);
-            posix.writeAll(1, "=");
-            setWriteValue(entry.value_ptr.value);
-            posix.writeAll(1, "\n");
+        const is_local_cmd = std.mem.eql(u8, args[0], "local");
+        if (is_local_cmd) {
+            if (env.scope_stack.items.len > 0) {
+                const frame = &env.scope_stack.items[env.scope_stack.items.len - 1];
+                for (frame.saved.items) |sv| {
+                    posix.writeAll(1, sv.name);
+                    posix.writeAll(1, "=");
+                    setWriteValue(env.get(sv.name) orelse "");
+                    posix.writeAll(1, "\n");
+                }
+            }
+        } else {
+            var it = env.vars.iterator();
+            while (it.next()) |entry| {
+                posix.writeAll(1, entry.key_ptr.*);
+                posix.writeAll(1, "=");
+                setWriteValue(entry.value_ptr.value);
+                posix.writeAll(1, "\n");
+            }
         }
         return 0;
     }
@@ -4343,36 +4490,42 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
     }
 
     const filter_by_attrs = flags_print and (flags_readonly or flags_export or flags_integer);
+    const is_local_print = flags_print and std.mem.eql(u8, args[0], "local");
     if (flags_print and i >= args.len) {
-        if (!flags_array) {
-            var it = env.vars.iterator();
-            while (it.next()) |entry| {
-                if (env.getArray(entry.key_ptr.*) != null) continue;
-                if (filter_by_attrs) {
-                    if (flags_readonly and !entry.value_ptr.readonly) continue;
-                    if (flags_export and !entry.value_ptr.exported) continue;
-                    if (flags_integer and !entry.value_ptr.integer) continue;
+        if (is_local_print) {
+            if (env.scope_stack.items.len > 0) {
+                const frame = &env.scope_stack.items[env.scope_stack.items.len - 1];
+                for (frame.saved.items) |sv| {
+                    if (env.getArray(sv.name) != null) continue;
+                    if (env.vars.get(sv.name)) |v| {
+                        declarePrintVar(sv.name, v);
+                    }
                 }
-                declarePrintVar(entry.key_ptr.*, entry.value_ptr.*);
             }
-        }
-        if (flags_array or !filter_by_attrs) {
-            var arr_it = env.arrays.iterator();
-            while (arr_it.next()) |entry| {
-                posix.writeAll(1, "declare -a ");
-                posix.writeAll(1, entry.key_ptr.*);
-                posix.writeAll(1, "=(");
-                for (entry.value_ptr.*, 0..) |e, idx| {
-                    if (idx > 0) posix.writeAll(1, " ");
-                    posix.writeAll(1, "[");
-                    var idx_buf: [16]u8 = undefined;
-                    const idx_s = std.fmt.bufPrint(&idx_buf, "{d}", .{idx}) catch continue;
-                    posix.writeAll(1, idx_s);
-                    posix.writeAll(1, "]=\"");
-                    posix.writeAll(1, e);
-                    posix.writeAll(1, "\"");
+        } else {
+            if (!flags_array) {
+                var it = env.vars.iterator();
+                while (it.next()) |entry| {
+                    if (env.getArray(entry.key_ptr.*) != null) continue;
+                    if (filter_by_attrs) {
+                        if (flags_readonly and !entry.value_ptr.readonly) continue;
+                        if (flags_export and !entry.value_ptr.exported) continue;
+                        if (flags_integer and !entry.value_ptr.integer) continue;
+                    }
+                    if (flags_global) {
+                        if (declareGetGlobalVar(env, entry.key_ptr.*)) |gv| {
+                            declarePrintVar(entry.key_ptr.*, gv);
+                        }
+                    } else {
+                        declarePrintVar(entry.key_ptr.*, entry.value_ptr.*);
+                    }
                 }
-                posix.writeAll(1, ")\n");
+            }
+            if (flags_array or !filter_by_attrs) {
+                var arr_it = env.arrays.iterator();
+                while (arr_it.next()) |entry| {
+                    declarePrintArray(entry.key_ptr.*, entry.value_ptr.*);
+                }
             }
         }
         return 0;
@@ -4381,21 +4534,19 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
         var status: u8 = 0;
         while (i < args.len) : (i += 1) {
             const name = args[i];
-            if (env.getArray(name)) |elems| {
-                posix.writeAll(1, "declare -a ");
-                posix.writeAll(1, name);
-                posix.writeAll(1, "=(");
-                for (elems, 0..) |e, idx| {
-                    if (idx > 0) posix.writeAll(1, " ");
-                    posix.writeAll(1, "[");
-                    var idx_buf: [16]u8 = undefined;
-                    const idx_s = std.fmt.bufPrint(&idx_buf, "{d}", .{idx}) catch continue;
-                    posix.writeAll(1, idx_s);
-                    posix.writeAll(1, "]=\"");
-                    posix.writeAll(1, e);
-                    posix.writeAll(1, "\"");
+            if (flags_global) {
+                const global_var = declareGetGlobalVar(env, name);
+                if (global_var) |v| {
+                    declarePrintVar(name, v);
+                } else {
+                    posix.writeAll(2, args[0]);
+                    posix.writeAll(2, ": ");
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": not found\n");
+                    status = 1;
                 }
-                posix.writeAll(1, ")\n");
+            } else if (env.getArray(name)) |elems| {
+                declarePrintArray(name, elems);
             } else if (env.vars.get(name)) |v| {
                 if (filter_by_attrs) {
                     if (flags_readonly and !v.readonly) continue;
@@ -4523,8 +4674,7 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
-fn declarePrintVar(name: []const u8, v: Environment.Variable) void {
-    posix.writeAll(1, "declare ");
+fn declareWriteFlags(v: Environment.Variable) void {
     var has_flag = false;
     if (v.exported or v.readonly or v.integer or v.lowercase or v.uppercase) {
         posix.writeAll(1, "-");
@@ -4550,23 +4700,106 @@ fn declarePrintVar(name: []const u8, v: Environment.Variable) void {
         }
     }
     if (!has_flag) posix.writeAll(1, "--");
-    posix.writeAll(1, " ");
-    posix.writeAll(1, name);
-    posix.writeAll(1, "=\"");
-    for (v.value) |ch| {
-        switch (ch) {
-            '"', '\\', '$', '`' => {
-                posix.writeAll(1, "\\");
-                const buf = [1]u8{ch};
-                posix.writeAll(1, &buf);
+}
+
+fn valueNeedsQuoting(value: []const u8) enum { none, single, ansi_c } {
+    if (value.len == 0) return .single;
+    var has_special = false;
+    var has_nonprint = false;
+    var has_single_quote = false;
+    for (value) |ch| {
+        if (ch < 0x20 or ch == 0x7f or ch >= 0x80) {
+            has_nonprint = true;
+        } else switch (ch) {
+            ' ', '\t', '"', '\\', '$', '`', '!', '&', '|', ';', '(', ')', '<', '>', '{', '}', '[', ']', '?', '*', '#', '~', '^', '=', '%', '@', '\'' => {
+                has_special = true;
+                if (ch == '\'') has_single_quote = true;
             },
-            else => {
-                const buf = [1]u8{ch};
-                posix.writeAll(1, &buf);
-            },
+            else => {},
         }
     }
-    posix.writeAll(1, "\"\n");
+    if (has_nonprint) return .ansi_c;
+    if (has_special) return if (has_single_quote) .ansi_c else .single;
+    return .none;
+}
+
+fn declareWriteQuotedValue(value: []const u8) void {
+    switch (valueNeedsQuoting(value)) {
+        .none => posix.writeAll(1, value),
+        .single => {
+            posix.writeAll(1, "'");
+            posix.writeAll(1, value);
+            posix.writeAll(1, "'");
+        },
+        .ansi_c => {
+            posix.writeAll(1, "$'");
+            for (value) |ch| {
+                if (ch < 0x20 or ch == 0x7f) {
+                    switch (ch) {
+                        '\n' => posix.writeAll(1, "\\n"),
+                        '\t' => posix.writeAll(1, "\\t"),
+                        '\r' => posix.writeAll(1, "\\r"),
+                        0x1b => posix.writeAll(1, "\\E"),
+                        else => {
+                            var buf: [4]u8 = undefined;
+                            const s = std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{ch}) catch continue;
+                            posix.writeAll(1, s);
+                        },
+                    }
+                } else if (ch >= 0x80) {
+                    var buf: [4]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{ch}) catch continue;
+                    posix.writeAll(1, s);
+                } else if (ch == '\'' or ch == '\\') {
+                    posix.writeAll(1, "\\");
+                    const buf2 = [1]u8{ch};
+                    posix.writeAll(1, &buf2);
+                } else {
+                    const buf2 = [1]u8{ch};
+                    posix.writeAll(1, &buf2);
+                }
+            }
+            posix.writeAll(1, "'");
+        },
+    }
+}
+
+fn declarePrintVar(name: []const u8, v: Environment.Variable) void {
+    posix.writeAll(1, "declare ");
+    declareWriteFlags(v);
+    posix.writeAll(1, " ");
+    posix.writeAll(1, name);
+    posix.writeAll(1, "=");
+    declareWriteQuotedValue(v.value);
+    posix.writeAll(1, "\n");
+}
+
+fn declarePrintArray(name: []const u8, elems: []const []const u8) void {
+    posix.writeAll(1, "declare -a ");
+    posix.writeAll(1, name);
+    posix.writeAll(1, "=(");
+    for (elems, 0..) |e, idx| {
+        if (idx > 0) posix.writeAll(1, " ");
+        posix.writeAll(1, "[");
+        var idx_buf: [16]u8 = undefined;
+        const idx_s = std.fmt.bufPrint(&idx_buf, "{d}", .{idx}) catch continue;
+        posix.writeAll(1, idx_s);
+        posix.writeAll(1, "]=");
+        declareWriteQuotedValue(e);
+    }
+    posix.writeAll(1, ")\n");
+}
+
+fn declareGetGlobalVar(env: *Environment, name: []const u8) ?Environment.Variable {
+    if (env.scope_stack.items.len > 0) {
+        const frame = &env.scope_stack.items[0];
+        for (frame.saved.items) |sv| {
+            if (std.mem.eql(u8, sv.name, name)) {
+                return sv.variable;
+            }
+        }
+    }
+    return env.vars.get(name);
 }
 
 fn declareEvalInt(val: []const u8, env: *Environment) []const u8 {
@@ -4604,8 +4837,41 @@ fn builtinLet(args: []const []const u8, env: *Environment) u8 {
     };
     lookup_env.e = env;
     var result: i64 = 0;
-    for (args[1..]) |expr| {
-        result = @import("arithmetic.zig").Arithmetic.evaluateWithSetter(expr, &lookup_env.f, &lookup_env.setter) catch return 1;
+    var i: usize = 1;
+    while (i < args.len) {
+        const expr = args[i];
+        if (std.mem.endsWith(u8, expr, "(")) {
+            var concat_buf: [4096]u8 = undefined;
+            var pos: usize = 0;
+            for (expr) |ch| {
+                if (pos < concat_buf.len) {
+                    concat_buf[pos] = ch;
+                    pos += 1;
+                }
+            }
+            i += 1;
+            while (i < args.len) {
+                if (pos < concat_buf.len) {
+                    concat_buf[pos] = ' ';
+                    pos += 1;
+                }
+                for (args[i]) |ch| {
+                    if (pos < concat_buf.len) {
+                        concat_buf[pos] = ch;
+                        pos += 1;
+                    }
+                }
+                if (std.mem.eql(u8, args[i], ")")) {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            result = @import("arithmetic.zig").Arithmetic.evaluateWithSetter(concat_buf[0..pos], &lookup_env.f, &lookup_env.setter) catch return 1;
+        } else {
+            result = @import("arithmetic.zig").Arithmetic.evaluateWithSetter(expr, &lookup_env.f, &lookup_env.setter) catch return 1;
+            i += 1;
+        }
     }
     return if (result != 0) 0 else 1;
 }
@@ -4791,6 +5057,35 @@ fn builtinDirs(args: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
+fn builtinHelp(args: []const []const u8, _: *Environment) u8 {
+    if (args.len < 2) {
+        posix.writeAll(1, "zigsh, version 0.1.0\nType 'help name' for information on builtin commands.\n");
+        return 0;
+    }
+    const topic = args[1];
+    const known_topics = [_][]const u8{
+        "cd",       "echo",     "exit",     "export",  "read",
+        "set",      "shift",    "test",     "trap",    "type",
+        "unset",    "alias",    "break",    "continue", "declare",
+        "eval",     "exec",     "fg",       "bg",      "getopts",
+        "hash",     "history",  "kill",     "let",     "local",
+        "printf",   "pushd",    "popd",     "dirs",    "readonly",
+        "return",   "shopt",    "source",   "umask",   "unalias",
+        "wait",     "mapfile",  "readarray", "true",   "false",
+    };
+    for (known_topics) |t| {
+        if (std.mem.eql(u8, topic, t)) {
+            posix.writeAll(1, topic);
+            posix.writeAll(1, ": shell builtin command\n");
+            return 0;
+        }
+    }
+    posix.writeAll(2, "zigsh: help: no help topics match '");
+    posix.writeAll(2, topic);
+    posix.writeAll(2, "'\n");
+    return 1;
+}
+
 fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
     const Env = @import("env.zig").Environment;
     var set_mode: ShoptMode = .none;
@@ -4799,7 +5094,13 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
 
     while (arg_start < args.len) {
         const a = args[arg_start];
-        if (a.len >= 2 and a[0] == '-') {
+        if (std.mem.eql(u8, a, "--set")) {
+            set_mode = .set;
+            arg_start += 1;
+        } else if (std.mem.eql(u8, a, "--unset")) {
+            set_mode = .unset;
+            arg_start += 1;
+        } else if (a.len >= 2 and a[0] == '-') {
             for (a[1..]) |ch| {
                 switch (ch) {
                     's' => set_mode = .set,
@@ -4843,6 +5144,9 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
             .{ .name = "nocaseglob", .val = &env.shopt.nocaseglob },
             .{ .name = "nocasematch", .val = &env.shopt.nocasematch },
             .{ .name = "nullglob", .val = &env.shopt.nullglob },
+            .{ .name = "progcomp", .val = &env.shopt.progcomp },
+            .{ .name = "hostcomplete", .val = &env.shopt.hostcomplete },
+            .{ .name = "histappend", .val = &env.shopt.histappend },
         };
         var any_off = false;
         for (fields) |f| {
@@ -4877,17 +5181,44 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
                 },
             }
         } else {
-            if (env.shopt.ignore_shopt_not_impl) {
-                status = 2;
-                continue;
-            }
-            if (set_mode == .query) {
-                status = 2;
+            const set_o_ptr: ?*bool = if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace
+            else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit
+            else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset
+            else if (std.mem.eql(u8, name, "pipefail")) &env.options.pipefail
+            else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose
+            else if (std.mem.eql(u8, name, "allexport")) &env.options.allexport
+            else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber
+            else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec
+            else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob
+            else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor
+            else null;
+            if (set_o_ptr) |ptr| {
+                switch (set_mode) {
+                    .set => ptr.* = true,
+                    .unset => ptr.* = false,
+                    .query => {
+                        if (!ptr.*) status = 1;
+                    },
+                    .print, .none => {
+                        posix.writeAll(1, "set ");
+                        posix.writeAll(1, if (ptr.*) "-o " else "+o ");
+                        posix.writeAll(1, name);
+                        posix.writeAll(1, "\n");
+                    },
+                }
             } else {
-                posix.writeAll(2, "shopt: ");
-                posix.writeAll(2, name);
-                posix.writeAll(2, ": invalid shell option name\n");
-                status = if (set_mode == .set or set_mode == .unset) 1 else 2;
+                if (env.shopt.ignore_shopt_not_impl) {
+                    status = 2;
+                    continue;
+                }
+                if (set_mode == .query) {
+                    status = 2;
+                } else {
+                    posix.writeAll(2, "shopt: ");
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": invalid shell option name\n");
+                    status = if (set_mode == .set or set_mode == .unset) 1 else 2;
+                }
             }
         }
     }
@@ -4910,6 +5241,9 @@ fn shoptGetField(shopt: *@import("env.zig").Environment.ShoptOptions, name: []co
         .{ "autocd", &shopt.autocd },
         .{ "cdable_vars", &shopt.cdable_vars },
         .{ "checkwinsize", &shopt.checkwinsize },
+        .{ "progcomp", &shopt.progcomp },
+        .{ "hostcomplete", &shopt.hostcomplete },
+        .{ "histappend", &shopt.histappend },
         .{ "ignore_shopt_not_impl", &shopt.ignore_shopt_not_impl },
     };
     inline for (fields) |f| {

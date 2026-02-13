@@ -226,6 +226,9 @@ pub const Executor = struct {
         var child_pids: [64]posix.pid_t = undefined;
         var num_children: usize = 0;
 
+        const use_lastpipe = self.env.shopt.lastpipe and !self.env.options.monitor;
+        var lastpipe_status: ?u8 = null;
+
         for (pipeline.commands, 0..) |cmd, i| {
             const is_last = (i == pipeline.commands.len - 1);
             var pipe_fds: [2]types.Fd = undefined;
@@ -236,6 +239,21 @@ pub const Executor = struct {
                     return 1;
                 };
                 pipe_fds = fds;
+            }
+
+            if (is_last and use_lastpipe) {
+                var saved_stdin: ?types.Fd = null;
+                if (prev_read_fd) |rd| {
+                    saved_stdin = posix.dup(types.STDIN) catch null;
+                    posix.dup2(rd, types.STDIN) catch {};
+                    posix.close(rd);
+                }
+                lastpipe_status = self.executeCommand(cmd);
+                if (saved_stdin) |saved| {
+                    posix.dup2(saved, types.STDIN) catch {};
+                    posix.close(saved);
+                }
+                continue;
             }
 
             const pid = posix.fork() catch {
@@ -286,7 +304,16 @@ pub const Executor = struct {
                 status = s;
             }
         }
-        self.setPipeStatus(pipe_statuses[0..num_children]);
+        if (lastpipe_status) |lps| {
+            if (num_children < 64) {
+                pipe_statuses[num_children] = lps;
+            }
+            status = lps;
+            if (lps != 0) pipefail_status = lps;
+            self.setPipeStatus(pipe_statuses[0 .. num_children + 1]);
+        } else {
+            self.setPipeStatus(pipe_statuses[0..num_children]);
+        }
 
         if (self.env.options.pipefail) {
             status = if (pipefail_status != 0) pipefail_status else status;
@@ -311,6 +338,35 @@ pub const Executor = struct {
         if (self.env.options.noexec) return 0;
 
         var expander = Expander.init(self.alloc, self.env, self.jobs);
+
+        if (simple.words.len > 0) {
+            const is_declare_cmd = blk: {
+                if (simple.words[0].parts.len == 1) {
+                    switch (simple.words[0].parts[0]) {
+                        .literal => |lit| {
+                            break :blk std.mem.eql(u8, lit, "declare") or
+                                std.mem.eql(u8, lit, "typeset") or
+                                std.mem.eql(u8, lit, "local") or
+                                std.mem.eql(u8, lit, "export") or
+                                std.mem.eql(u8, lit, "readonly");
+                        },
+                        else => {},
+                    }
+                }
+                break :blk false;
+            };
+            if (!is_declare_cmd) {
+                for (simple.assigns) |assign| {
+                    if (assign.array_values != null) {
+                        posix.writeAll(2, "zigsh: ");
+                        posix.writeAll(2, assign.name);
+                        posix.writeAll(2, ": can't assign array to env binding\n");
+                        self.env.last_exit_status = 2;
+                        return 2;
+                    }
+                }
+            }
+        }
 
         const saved_exit = self.env.last_exit_status;
         for (simple.assigns) |assign| {
@@ -385,22 +441,35 @@ pub const Executor = struct {
                         self.env.setArrayElement(base, idx, value) catch {};
                     }
                 } else {
-                    const final_value = if (assign.append) blk: {
-                        const existing = self.env.get(assign.name) orelse "";
-                        break :blk std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
-                    } else value;
-                    self.env.set(assign.name, final_value, false) catch |err| {
-                        if (err == error.ReadonlyVariable) {
-                            posix.writeAll(2, "zigsh: ");
-                            posix.writeAll(2, assign.name);
-                            posix.writeAll(2, ": readonly variable\n");
-                            if (!self.env.options.interactive) {
-                                self.env.should_exit = true;
-                                self.env.exit_value = 1;
+                    if (self.env.getArray(assign.name) != null) {
+                        if (assign.append) {
+                            var existing: []const u8 = "";
+                            if (self.env.getArray(assign.name)) |elems| {
+                                if (elems.len > 0) existing = elems[0];
                             }
-                            return 1;
+                            const appended = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
+                            self.env.setArrayElement(assign.name, 0, appended) catch {};
+                        } else {
+                            self.env.setArrayElement(assign.name, 0, value) catch {};
                         }
-                    };
+                    } else {
+                        const final_value = if (assign.append) blk: {
+                            const existing = self.env.get(assign.name) orelse "";
+                            break :blk std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
+                        } else value;
+                        self.env.set(assign.name, final_value, false) catch |err| {
+                            if (err == error.ReadonlyVariable) {
+                                posix.writeAll(2, "zigsh: ");
+                                posix.writeAll(2, assign.name);
+                                posix.writeAll(2, ": readonly variable\n");
+                                if (!self.env.options.interactive) {
+                                    self.env.should_exit = true;
+                                    self.env.exit_value = 1;
+                                }
+                                return 1;
+                            }
+                        };
+                    }
                 }
             }
         }
@@ -491,7 +560,26 @@ pub const Executor = struct {
             posix.writeAll(2, self.env.get("PS4") orelse "+ ");
             for (fields, 0..) |f, idx| {
                 if (idx > 0) posix.writeAll(2, " ");
-                posix.writeAll(2, f);
+                var needs_quote = false;
+                for (f) |ch| {
+                    if (ch == ' ' or ch == '\t' or ch == '\'' or ch == '"' or
+                        ch == '\\' or ch == '$' or ch == '`' or ch == '|' or
+                        ch == '&' or ch == ';' or ch == '(' or ch == ')' or
+                        ch == '<' or ch == '>' or ch == '*' or ch == '?' or
+                        ch == '[' or ch == ']' or ch == '{' or ch == '}' or
+                        ch == '~' or ch == '#' or ch == '!' or ch == '\n')
+                    {
+                        needs_quote = true;
+                        break;
+                    }
+                }
+                if (needs_quote and f.len > 0) {
+                    posix.writeAll(2, "'");
+                    posix.writeAll(2, f);
+                    posix.writeAll(2, "'");
+                } else {
+                    posix.writeAll(2, f);
+                }
             }
             posix.writeAll(2, "\n");
         }
@@ -908,7 +996,12 @@ pub const Executor = struct {
         const lookup = struct {
             var env: *Environment = undefined;
             fn f(name: []const u8) ?[]const u8 {
-                if (env.get(name)) |v| return v;
+                if (env.getSubscripted(name)) |v| return v;
+                if (std.mem.indexOfScalar(u8, name, '[') == null) {
+                    if (env.getArray(name)) |elems| {
+                        if (elems.len > 0) return elems[0];
+                    }
+                }
                 if (env.options.nounset) {
                     posix.writeAll(2, "zigsh: ");
                     posix.writeAll(2, name);
@@ -921,7 +1014,15 @@ pub const Executor = struct {
             fn setter(name: []const u8, val: i64) void {
                 var buf: [32]u8 = undefined;
                 const val_str = std.fmt.bufPrint(&buf, "{d}", .{val}) catch return;
-                env.set(name, val_str, false) catch {};
+                if (std.mem.indexOfScalar(u8, name, '[') == null) {
+                    if (env.getArray(name) != null) {
+                        env.setArrayElement(name, 0, val_str) catch {};
+                        return;
+                    }
+                }
+                env.setSubscripted(name, val_str) catch {
+                    env.set(name, val_str, false) catch {};
+                };
             }
         };
         lookup.env = env_ptr;

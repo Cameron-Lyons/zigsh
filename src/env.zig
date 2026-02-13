@@ -107,6 +107,9 @@ pub const Environment = struct {
         autocd: bool = false,
         cdable_vars: bool = false,
         checkwinsize: bool = false,
+        progcomp: bool = true,
+        hostcomplete: bool = true,
+        histappend: bool = false,
         ignore_shopt_not_impl: bool = false,
     };
 
