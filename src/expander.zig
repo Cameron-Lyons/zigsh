@@ -967,7 +967,7 @@ pub const Expander = struct {
             } else {
                 const raw_len = Arithmetic.evaluate(len_str, &lookup.f) catch return error.ArithmeticError;
                 if (raw_len < 0) {
-                    end = total + raw_len;
+                    return error.BadSubstitution;
                 } else {
                     end = start + raw_len;
                 }
@@ -1668,6 +1668,35 @@ pub const Expander = struct {
             const usec: u64 = @intCast(@divTrunc(ts.nsec, 1000));
             return std.fmt.allocPrint(self.alloc, "{d}.{d:0>6}", .{ ts.sec, usec }) catch null;
         }
+        if (std.mem.eql(u8, name, "SHELLOPTS")) {
+            var buf: [256]u8 = undefined;
+            var pos: usize = 0;
+            const opts = self.env.options;
+            const entries = .{
+                .{ "allexport", opts.allexport },
+                .{ "errexit", opts.errexit },
+                .{ "monitor", opts.monitor },
+                .{ "noclobber", opts.noclobber },
+                .{ "noexec", opts.noexec },
+                .{ "noglob", opts.noglob },
+                .{ "nounset", opts.nounset },
+                .{ "pipefail", opts.pipefail },
+                .{ "verbose", opts.verbose },
+                .{ "xtrace", opts.xtrace },
+            };
+            inline for (entries) |entry| {
+                if (entry[1]) {
+                    if (pos > 0) {
+                        buf[pos] = ':';
+                        pos += 1;
+                    }
+                    const n: []const u8 = entry[0];
+                    @memcpy(buf[pos .. pos + n.len], n);
+                    pos += n.len;
+                }
+            }
+            return self.alloc.dupe(u8, buf[0..pos]) catch null;
+        }
         return null;
     }
 
@@ -2107,6 +2136,11 @@ pub const Expander = struct {
             var env: *Environment = undefined;
             fn f(name: []const u8) ?[]const u8 {
                 if (env.getSubscripted(name)) |v| return v;
+                if (std.mem.indexOfScalar(u8, name, '[') == null) {
+                    if (env.getArray(name)) |elems| {
+                        if (elems.len > 0) return elems[0];
+                    }
+                }
                 if (env.options.nounset) {
                     posix.writeAll(2, "zigsh: ");
                     posix.writeAll(2, name);
@@ -2119,7 +2153,15 @@ pub const Expander = struct {
             fn setter(name: []const u8, val: i64) void {
                 var buf: [32]u8 = undefined;
                 const val_str = std.fmt.bufPrint(&buf, "{d}", .{val}) catch return;
-                env.setSubscripted(name, val_str) catch {};
+                if (std.mem.indexOfScalar(u8, name, '[') == null) {
+                    if (env.getArray(name) != null) {
+                        env.setArrayElement(name, 0, val_str) catch {};
+                        return;
+                    }
+                }
+                env.setSubscripted(name, val_str) catch {
+                    env.set(name, val_str, false) catch {};
+                };
             }
         };
         lookup.env = env_ptr;

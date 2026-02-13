@@ -376,6 +376,7 @@ pub const Parser = struct {
 
     fn tryAliasExpandWord(self: *Parser) void {
         const env = self.env orelse return;
+        if (!env.shopt.expand_aliases) return;
         if (!self.isUnquotedWord()) return;
         const word_text = self.tokenText(self.current);
         const alias_val = env.getAlias(word_text) orelse return;
@@ -390,6 +391,7 @@ pub const Parser = struct {
 
         while (self.alias_depth < 16) {
             const env = self.env orelse return;
+            if (!env.shopt.expand_aliases) return;
             if (!self.isUnquotedWord()) return;
 
             const word_text = self.tokenText(self.current);

@@ -59,7 +59,24 @@ pub const Arithmetic = struct {
             while (self.pos < self.expr.len and types.isNameCont(self.expr[self.pos])) {
                 self.pos += 1;
             }
-            const name = self.expr[name_start..self.pos];
+            const base_name = self.expr[name_start..self.pos];
+
+            var subscript_buf: [256]u8 = undefined;
+            var assign_name = base_name;
+            if (self.pos < self.expr.len and self.expr[self.pos] == '[') {
+                self.pos += 1;
+                const subscript_val = self.parseComma() catch {
+                    self.pos = saved_pos;
+                    return self.parseTernary();
+                };
+                self.skipWhitespace();
+                if (self.pos >= self.expr.len or self.expr[self.pos] != ']') {
+                    self.pos = saved_pos;
+                    return self.parseTernary();
+                }
+                self.pos += 1;
+                assign_name = std.fmt.bufPrint(&subscript_buf, "{s}[{d}]", .{ base_name, subscript_val }) catch base_name;
+            }
             self.skipWhitespace();
 
             const op = self.matchAssignOp();
@@ -67,8 +84,8 @@ pub const Arithmetic = struct {
                 self.skipWhitespace();
                 const rhs = try self.parseAssign();
                 const old_val = blk: {
-                    const v = self.lookup(name) orelse break :blk @as(i64, 0);
-                    break :blk std.fmt.parseInt(i64, v, 10) catch 0;
+                    const v = self.lookup(assign_name) orelse break :blk @as(i64, 0);
+                    break :blk std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\n"), 10) catch 0;
                 };
                 const new_val: i64 = switch (assign_op) {
                     .eq => rhs,
@@ -83,7 +100,7 @@ pub const Arithmetic = struct {
                     .or_eq => old_val | rhs,
                     .xor_eq => old_val ^ rhs,
                 };
-                if (self.setter) |s| s(name, new_val);
+                if (self.setter) |s| s(assign_name, new_val);
                 return new_val;
             }
 
