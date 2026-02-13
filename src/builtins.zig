@@ -51,6 +51,9 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
     .{ "chdir", &builtinCd },
     .{ "let", &builtinLet },
     .{ "shopt", &builtinShopt },
+    .{ "pushd", &builtinPushd },
+    .{ "popd", &builtinPopd },
+    .{ "dirs", &builtinDirs },
 });
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
@@ -72,9 +75,20 @@ fn builtinFalse(_: []const []const u8, _: *Environment) u8 {
 fn builtinExit(args: []const []const u8, env: *Environment) u8 {
     var code: u8 = env.last_exit_status;
     if (args.len > 1) {
-        if (std.fmt.parseInt(i64, args[1], 10)) |n| {
-            code = @truncate(@as(u64, @bitCast(n)));
-        } else |_| {
+        if (args[1].len == 0) {
+            code = 0;
+        } else if (std.fmt.parseInt(i32, args[1], 10)) |n| {
+            code = @truncate(@as(u32, @bitCast(n)));
+        } else |err| {
+            if (err == error.Overflow) {
+                posix.writeAll(2, "exit: expected a small integer, got ");
+                posix.writeAll(2, args[1]);
+                posix.writeAll(2, "\n");
+                code = 1;
+                env.should_exit = true;
+                env.exit_value = code;
+                return code;
+            }
             posix.writeAll(2, "exit: ");
             posix.writeAll(2, args[1]);
             posix.writeAll(2, ": numeric argument required\n");
@@ -85,7 +99,7 @@ fn builtinExit(args: []const []const u8, env: *Environment) u8 {
         }
         if (args.len > 2) {
             posix.writeAll(2, "exit: too many arguments\n");
-            return 2;
+            return 1;
         }
     }
     env.should_exit = true;
@@ -120,8 +134,7 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
             return 1;
         };
 
-    var old_buf: [4096]u8 = undefined;
-    const old_pwd = posix.getcwd(&old_buf) catch null;
+    const old_pwd = env.get("PWD");
 
     const is_relative = target.len > 0 and target[0] != '/' and
         !(target.len >= 1 and target[0] == '.') and
@@ -168,6 +181,12 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
                 posix.writeAll(2, ": No such file or directory\n");
                 return 1;
             };
+            if (!physical) {
+                const logical_path = buildLogicalPath(env, target) catch null;
+                if (logical_path) |lp| {
+                    posix.chdir(lp) catch {};
+                }
+            }
         }
     }
 
@@ -191,18 +210,70 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
             }
         }
     } else {
-        var new_buf: [4096]u8 = undefined;
-        const new_pwd = posix.getcwd(&new_buf) catch null;
-        if (new_pwd) |pwd| {
-            env.set("PWD", pwd, true) catch {};
-            if (cdpath_hit and is_relative) {
-                posix.writeAll(1, pwd);
-                posix.writeAll(1, "\n");
+        if (cdpath_hit) {
+            var new_buf: [4096]u8 = undefined;
+            const new_pwd = posix.getcwd(&new_buf) catch null;
+            if (new_pwd) |pwd| {
+                env.set("PWD", pwd, true) catch {};
+                if (is_relative) {
+                    posix.writeAll(1, pwd);
+                    posix.writeAll(1, "\n");
+                }
+            }
+        } else {
+            const logical_pwd = buildLogicalPath(env, target) catch null;
+            if (logical_pwd) |pwd| {
+                env.set("PWD", pwd, true) catch {};
+            } else {
+                var new_buf: [4096]u8 = undefined;
+                const new_pwd = posix.getcwd(&new_buf) catch null;
+                if (new_pwd) |pwd| {
+                    env.set("PWD", pwd, true) catch {};
+                }
             }
         }
     }
 
     return 0;
+}
+
+fn buildLogicalPath(env: *Environment, target: []const u8) ![]const u8 {
+    var path_buf: [4096]u8 = undefined;
+    var len: usize = 0;
+
+    if (target.len > 0 and target[0] == '/') {
+        path_buf[0] = '/';
+        len = 1;
+    } else {
+        const pwd = env.get("PWD") orelse return error.NoPwd;
+        if (pwd.len == 0 or pwd[0] != '/') return error.NoPwd;
+        const pwd_len = if (pwd.len > 1 and pwd[pwd.len - 1] == '/') pwd.len - 1 else pwd.len;
+        @memcpy(path_buf[0..pwd_len], pwd[0..pwd_len]);
+        len = pwd_len;
+    }
+
+    var iter = std.mem.splitScalar(u8, target, '/');
+    while (iter.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (len > 1) {
+                len -= 1;
+                while (len > 0 and path_buf[len - 1] != '/') len -= 1;
+                if (len == 0) len = 1;
+            }
+        } else {
+            if (len > 1) {
+                path_buf[len] = '/';
+                len += 1;
+            }
+            if (len + component.len > path_buf.len) return error.PathTooLong;
+            @memcpy(path_buf[len .. len + component.len], component);
+            len += component.len;
+        }
+    }
+
+    if (len > 1 and path_buf[len - 1] == '/') len -= 1;
+    return env.alloc.dupe(u8, path_buf[0..len]) catch return error.OutOfMemory;
 }
 
 fn builtinPwd(args: []const []const u8, env: *Environment) u8 {
@@ -250,7 +321,14 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
         return 0;
     }
 
-    const start_idx: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
+    var start_idx: usize = 1;
+    var unexport = false;
+    while (start_idx < args.len and args[start_idx].len > 0 and args[start_idx][0] == '-') {
+        if (std.mem.eql(u8, args[start_idx], "--")) { start_idx += 1; break; }
+        if (std.mem.eql(u8, args[start_idx], "-n")) { unexport = true; }
+        if (std.mem.eql(u8, args[start_idx], "-p")) {}
+        start_idx += 1;
+    }
     for (args[start_idx..]) |arg| {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             const is_append = eq > 0 and arg[eq - 1] == '+';
@@ -268,7 +346,7 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
                 const existing = env.get(name) orelse "";
                 value = std.fmt.allocPrint(env.alloc, "{s}{s}", .{ existing, value }) catch value;
             }
-            env.set(name, value, true) catch return 1;
+            env.set(name, value, !unexport) catch return 1;
         } else {
             if (!isValidVarName(arg)) {
                 posix.writeAll(2, "export: `");
@@ -278,7 +356,11 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
                 env.exit_value = 2;
                 return 2;
             }
-            env.markExported(arg);
+            if (unexport) {
+                env.markUnexported(arg);
+            } else {
+                env.markExported(arg);
+            }
         }
     }
     return 0;
@@ -384,16 +466,32 @@ fn setWriteValue(value: []const u8) void {
         }
         posix.writeAll(1, "'");
     } else {
-        posix.writeAll(1, "'");
+        var needs_quote = false;
         for (value) |ch| {
-            if (ch == '\'') {
-                posix.writeAll(1, "'\\''");
-            } else {
-                const buf = [1]u8{ch};
-                posix.writeAll(1, &buf);
+            switch (ch) {
+                ' ', '"', '\\', '$', '`', '!', '(', ')', '{', '}', '[', ']', '|', '&', ';', '<', '>', '?', '*', '#', '~', '=' => {
+                    needs_quote = true;
+                },
+                '\'' => {
+                    needs_quote = true;
+                },
+                else => {},
             }
         }
-        posix.writeAll(1, "'");
+        if (needs_quote) {
+            posix.writeAll(1, "'");
+            for (value) |ch| {
+                if (ch == '\'') {
+                    posix.writeAll(1, "'\\''");
+                } else {
+                    const buf = [1]u8{ch};
+                    posix.writeAll(1, &buf);
+                }
+            }
+            posix.writeAll(1, "'");
+        } else {
+            posix.writeAll(1, value);
+        }
     }
 }
 
@@ -564,7 +662,7 @@ fn builtinShift(args: []const []const u8, env: *Environment) u8 {
             return 2;
         };
     }
-    if (n > env.positional_params.len) return 2;
+    if (n > env.positional_params.len) return 1;
     env.positional_params = env.positional_params[n..];
     return 0;
 }
@@ -572,12 +670,22 @@ fn builtinShift(args: []const []const u8, env: *Environment) u8 {
 fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
     var val: u8 = env.last_exit_status;
     if (args.len > 1) {
-        if (std.fmt.parseInt(i64, args[1], 10)) |n| {
-            val = @truncate(@as(u64, @bitCast(n)));
-        } else |_| {
+        if (args[1].len == 0) {
+            val = 0;
+        } else if (std.fmt.parseInt(i32, args[1], 10)) |n| {
+            val = @truncate(@as(u32, @bitCast(n)));
+        } else |err| {
+            if (err == error.Overflow) {
+                posix.writeAll(2, "return: expected a small integer, got ");
+                posix.writeAll(2, args[1]);
+                posix.writeAll(2, "\n");
+                env.should_return = true;
+                env.return_value = 1;
+                return 1;
+            }
             posix.writeAll(2, "return: ");
             posix.writeAll(2, args[1]);
-            posix.writeAll(2, ": Illegal number\n");
+            posix.writeAll(2, ": numeric argument required\n");
             env.should_exit = true;
             env.exit_value = 2;
             return 2;
@@ -599,6 +707,7 @@ fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(2, "break: ");
             posix.writeAll(2, args[1]);
             posix.writeAll(2, ": numeric argument required\n");
+            if (env.loop_depth > 0) env.break_count = 1;
             return 1;
         };
         if (n == 0) {
@@ -606,7 +715,14 @@ fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
             return 1;
         }
     }
-    if (env.loop_depth == 0) return if (env.in_subshell) @as(u8, 1) else 0;
+    if (env.loop_depth == 0) {
+        if (env.in_subshell) {
+            env.should_exit = true;
+            env.exit_value = 1;
+            return 1;
+        }
+        return 0;
+    }
     env.break_count = n;
     return 0;
 }
@@ -626,6 +742,7 @@ fn builtinContinue(args: []const []const u8, env: *Environment) u8 {
             posix.writeAll(2, "continue: ");
             posix.writeAll(2, args[1]);
             posix.writeAll(2, ": numeric argument required\n");
+            if (env.loop_depth > 0) env.break_count = 1;
             return 1;
         };
         if (n == 0) {
@@ -633,7 +750,14 @@ fn builtinContinue(args: []const []const u8, env: *Environment) u8 {
             return 1;
         }
     }
-    if (env.loop_depth == 0) return if (env.in_subshell) @as(u8, 1) else 0;
+    if (env.loop_depth == 0) {
+        if (env.in_subshell) {
+            env.should_exit = true;
+            env.exit_value = 1;
+            return 1;
+        }
+        return 0;
+    }
     env.continue_count = n;
     return 0;
 }
@@ -1138,7 +1262,7 @@ fn builtinWait(args: []const []const u8, env: *Environment) u8 {
                     posix.writeAll(2, "wait: no such job: ");
                     posix.writeAll(2, arg);
                     posix.writeAll(2, "\n");
-                    status = 2;
+                    status = 127;
                     continue;
                 };
                 const result = posix.waitpid(job.pid, 0);
@@ -1475,6 +1599,7 @@ fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
 
     const start_ro: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "-p")) 2 else 1;
     for (args[start_ro..]) |arg| {
+        if (arg.len > 0 and (arg[0] == '-' or arg[0] == '+')) continue;
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             const is_append = eq > 0 and arg[eq - 1] == '+';
             const name = if (is_append) arg[0 .. eq - 1] else arg[0..eq];
@@ -1970,7 +2095,7 @@ fn printfGetNextArg(arg_args: []const []const u8, arg_idx: *usize) []const u8 {
     return "";
 }
 
-fn printfParseNumericArg(arg: []const u8, had_error: *bool) i64 {
+fn printfParseNumericArg(arg: []const u8, had_error: *bool, had_overflow: ?*bool) i64 {
     if (arg.len == 0) return 0;
 
     var s = arg;
@@ -2030,7 +2155,14 @@ fn printfParseNumericArg(arg: []const u8, had_error: *bool) i64 {
         } else |_| {}
     }
 
-    if (std.fmt.parseInt(i64, s, 0)) |v| return v else |_| {}
+    if (std.fmt.parseInt(i64, s, 0)) |v| return v else |err| {
+        if (err == error.Overflow) {
+            had_error.* = true;
+            if (had_overflow) |ov| ov.* = true;
+            printfNumericError(arg);
+            return 0;
+        }
+    }
 
     had_error.* = true;
     if (!has_trailing_space) printfNumericError(arg);
@@ -2563,7 +2695,7 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
             if (spec.width_star) {
                 const w_arg = printfGetNextArg(printf_args, arg_idx);
                 var w_err = false;
-                const w = printfParseNumericArg(w_arg, &w_err);
+                const w = printfParseNumericArg(w_arg, &w_err, null);
                 if (w_err) status = 1;
                 if (w < 0) {
                     spec.flag_minus = true;
@@ -2575,7 +2707,7 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
             if (spec.precision_star) {
                 const p_arg = printfGetNextArg(printf_args, arg_idx);
                 var p_err = false;
-                const p = printfParseNumericArg(p_arg, &p_err);
+                const p = printfParseNumericArg(p_arg, &p_err, null);
                 if (p_err) status = 1;
                 spec.precision = if (p >= 0) @intCast(p) else null;
             }
@@ -2594,14 +2726,18 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
                 'd', 'i' => {
                     const arg = printfGetNextArg(printf_args, arg_idx);
                     var had_error = false;
-                    const val = printfParseNumericArg(arg, &had_error);
+                    var had_overflow = false;
+                    const val = printfParseNumericArg(arg, &had_error, &had_overflow);
+                    if (had_overflow) return .{ .status = 1, .early_exit = false };
                     if (had_error) status = 1;
                     printfFormatInt(val, spec);
                 },
                 'u', 'o', 'x', 'X' => {
                     const arg = printfGetNextArg(printf_args, arg_idx);
                     var had_error = false;
-                    const val = printfParseNumericArg(arg, &had_error);
+                    var had_overflow = false;
+                    const val = printfParseNumericArg(arg, &had_error, &had_overflow);
+                    if (had_overflow) return .{ .status = 1, .early_exit = false };
                     if (had_error) status = 1;
                     printfFormatInt(val, spec);
                 },
@@ -2785,15 +2921,32 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
     }
 
     if (arg_start >= args.len) return 0;
+
+    if (args.len - arg_start > 1) {
+        posix.writeAll(2, "umask: too many arguments\n");
+        return 1;
+    }
+
     const mask_arg = args[arg_start];
+
+    if (mask_arg.len == 0) {
+        posix.writeAll(2, "umask: invalid symbolic mode\n");
+        return 1;
+    }
 
     if (std.fmt.parseInt(c_uint, mask_arg, 8)) |new_mask| {
         _ = libc.umask(new_mask);
         return 0;
     } else |_| {}
 
+    if (mask_arg[0] == '-' and mask_arg.len > 1) {
+        posix.writeAll(2, "umask: invalid option\n");
+        return 1;
+    }
+
     const current = libc.umask(0);
     var perm: c_uint = ~current & 0o777;
+    const original_perm = perm;
 
     var i: usize = 0;
     while (i < mask_arg.len) {
@@ -2835,6 +2988,9 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
                     'r' => bits |= 4,
                     'w' => bits |= 2,
                     'x' => bits |= 1,
+                    'u' => bits |= (original_perm >> 6) & 7,
+                    'g' => bits |= (original_perm >> 3) & 7,
+                    'o' => bits |= original_perm & 7,
                     else => break,
                 }
             }
@@ -2865,7 +3021,13 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
             break;
         }
 
-        if (i < mask_arg.len and mask_arg[i] == ',') i += 1;
+        if (i < mask_arg.len and mask_arg[i] == ',') {
+            i += 1;
+        } else if (i < mask_arg.len) {
+            posix.writeAll(2, "umask: invalid symbolic mode\n");
+            _ = libc.umask(current);
+            return 1;
+        }
     }
 
     _ = libc.umask(~perm & 0o777);
@@ -2874,34 +3036,178 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
 
 fn builtinType(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) return 0;
-    var status: u8 = 0;
-    for (args[1..]) |name| {
-        if (isShellKeyword(name)) {
-            posix.writeAll(1, name);
-            posix.writeAll(1, " is a shell keyword\n");
-        } else if (env.getAlias(name)) |val| {
-            posix.writeAll(1, name);
-            posix.writeAll(1, " is aliased to '");
-            posix.writeAll(1, val);
-            posix.writeAll(1, "'\n");
-        } else if (builtins.get(name) != null or isExecutorBuiltin(name)) {
-            posix.writeAll(1, name);
-            if (isSpecialBuiltin(name)) {
-                posix.writeAll(1, " is a special shell builtin\n");
-            } else {
-                posix.writeAll(1, " is a shell builtin\n");
+
+    var flag_t = false;
+    var flag_p = false;
+    var flag_P = false;
+    var flag_a = false;
+    var flag_f = false;
+    var name_start: usize = 1;
+    for (args[1..], 1..) |arg, idx| {
+        if (arg.len > 0 and arg[0] == '-' and arg.len > 1) {
+            var valid = true;
+            for (arg[1..]) |ch| {
+                switch (ch) {
+                    't', 'p', 'P', 'a', 'f' => {},
+                    else => {
+                        valid = false;
+                        break;
+                    },
+                }
             }
-        } else if (env.functions.get(name) != null) {
-            posix.writeAll(1, name);
-            posix.writeAll(1, " is a shell function\n");
-        } else if (findInPathStr(name, env)) |path| {
-            posix.writeAll(1, name);
-            posix.writeAll(1, " is ");
-            posix.writeAll(1, path);
-            posix.writeAll(1, "\n");
+            if (valid) {
+                for (arg[1..]) |ch| {
+                    switch (ch) {
+                        't' => flag_t = true,
+                        'p' => flag_p = true,
+                        'P' => flag_P = true,
+                        'a' => flag_a = true,
+                        'f' => flag_f = true,
+                        else => {},
+                    }
+                }
+                name_start = idx + 1;
+                continue;
+            }
+        }
+        break;
+    }
+
+    if (name_start >= args.len) return 0;
+
+    var status: u8 = 0;
+    for (args[name_start..]) |name| {
+        var found = false;
+
+        if (flag_P) {
+            if (flag_a) {
+                var any = false;
+                const path_env = env.get("PATH") orelse "/usr/bin:/bin";
+                var iter = std.mem.splitScalar(u8, path_env, ':');
+                while (iter.next()) |dir| {
+                    const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                    const full_z = std.posix.toPosixPath(full) catch continue;
+                    if (posix.access(&full_z, 1) and !isDirectory(&full_z)) {
+                        posix.writeAll(1, full);
+                        posix.writeAll(1, "\n");
+                        any = true;
+                    }
+                }
+                if (!any) {
+                    status = 1;
+                }
+            } else {
+                if (findInPathNonDir(name, env)) |path| {
+                    posix.writeAll(1, path);
+                    posix.writeAll(1, "\n");
+                } else {
+                    status = 1;
+                }
+            }
+            continue;
+        }
+
+        if (!flag_f and env.getAlias(name) != null) {
+            found = true;
+            if (!flag_p) {
+                if (flag_t) {
+                    posix.writeAll(1, "alias\n");
+                } else {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is aliased to '");
+                    posix.writeAll(1, env.getAlias(name).?);
+                    posix.writeAll(1, "'\n");
+                }
+            }
+            if (!flag_a) continue;
+        }
+
+        if (isShellKeyword(name)) {
+            found = true;
+            if (!flag_p) {
+                if (flag_t) {
+                    posix.writeAll(1, "keyword\n");
+                } else {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is a shell keyword\n");
+                }
+            }
+            if (!flag_a) continue;
+        }
+
+        if (!flag_f and env.functions.get(name) != null) {
+            found = true;
+            if (!flag_p) {
+                if (flag_t) {
+                    posix.writeAll(1, "function\n");
+                } else {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is a shell function\n");
+                }
+            }
+            if (!flag_a) continue;
+        }
+
+        if (builtins.get(name) != null or isExecutorBuiltin(name)) {
+            found = true;
+            if (!flag_p) {
+                if (flag_t) {
+                    posix.writeAll(1, "builtin\n");
+                } else {
+                    posix.writeAll(1, name);
+                    if (isSpecialBuiltin(name)) {
+                        posix.writeAll(1, " is a special shell builtin\n");
+                    } else {
+                        posix.writeAll(1, " is a shell builtin\n");
+                    }
+                }
+            }
+            if (!flag_a) continue;
+        }
+
+        if (flag_a) {
+            const path_env = env.get("PATH") orelse "/usr/bin:/bin";
+            var iter = std.mem.splitScalar(u8, path_env, ':');
+            while (iter.next()) |dir| {
+                const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                const full_z = std.posix.toPosixPath(full) catch continue;
+                if (posix.access(&full_z, 1) and !isDirectory(&full_z)) {
+                    found = true;
+                    if (flag_t) {
+                        posix.writeAll(1, "file\n");
+                    } else if (flag_p) {
+                        posix.writeAll(1, full);
+                        posix.writeAll(1, "\n");
+                    } else {
+                        posix.writeAll(1, name);
+                        posix.writeAll(1, " is ");
+                        posix.writeAll(1, full);
+                        posix.writeAll(1, "\n");
+                    }
+                }
+            }
         } else {
-            posix.writeAll(2, name);
-            posix.writeAll(2, ": not found\n");
+            if (findInPathNonDir(name, env)) |path| {
+                found = true;
+                if (flag_t) {
+                    posix.writeAll(1, "file\n");
+                } else if (flag_p) {
+                    posix.writeAll(1, path);
+                    posix.writeAll(1, "\n");
+                } else {
+                    posix.writeAll(1, name);
+                    posix.writeAll(1, " is ");
+                    posix.writeAll(1, path);
+                    posix.writeAll(1, "\n");
+                }
+            }
+        }
+
+        if (!found) {
+            if (!flag_p) {
+                posix.writeAll(2, name);
+                posix.writeAll(2, ": not found\n");
+            }
             status = 1;
         }
     }
@@ -2910,7 +3216,7 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
 
 fn isExecutorBuiltin(name: []const u8) bool {
     const executor_builtins = [_][]const u8{
-        ".", "source", "eval", "exec", "command",
+        ".", "source", "eval", "exec", "command", "builtin",
     };
     for (executor_builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
@@ -2922,7 +3228,7 @@ fn isShellKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{
         "if", "then", "else", "elif", "fi", "do", "done",
         "case", "esac", "while", "until", "for", "in",
-        "{", "}", "!", "[[", "]]",
+        "{", "}", "!", "[[", "]]", "time",
     };
     for (keywords) |kw| {
         if (std.mem.eql(u8, name, kw)) return true;
@@ -2958,6 +3264,27 @@ fn findInPath(name: []const u8, env: *const Environment) bool {
 }
 
 var find_path_result_buf: [4096]u8 = undefined;
+
+fn isDirectory(path_z: [*:0]const u8) bool {
+    const st = posix.stat(path_z) catch return false;
+    return (st.mode & posix.S_IFDIR) != 0;
+}
+
+fn findInPathNonDir(name: []const u8, env: *const Environment) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const path_z = std.posix.toPosixPath(name) catch return null;
+        if (posix.access(&path_z, 1) and !isDirectory(&path_z)) return name;
+        return null;
+    }
+    const path_env = env.get("PATH") orelse "/usr/bin:/bin";
+    var iter = std.mem.splitScalar(u8, path_env, ':');
+    while (iter.next()) |dir| {
+        const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const full_z = std.posix.toPosixPath(full) catch continue;
+        if (posix.access(&full_z, 1) and !isDirectory(&full_z)) return full;
+    }
+    return null;
+}
 
 fn findInPathStr(name: []const u8, env: *const Environment) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
@@ -3186,19 +3513,39 @@ fn builtinBg(args: []const []const u8, env: *Environment) u8 {
 
 fn builtinAlias(args: []const []const u8, env: *Environment) u8 {
     if (args.len < 2) {
+        var names: [256][]const u8 = undefined;
+        var n: usize = 0;
         var it = env.aliases.iterator();
         while (it.next()) |entry| {
-            posix.writeAll(1, "alias ");
-            posix.writeAll(1, entry.key_ptr.*);
-            posix.writeAll(1, "='");
-            posix.writeAll(1, entry.value_ptr.*);
-            posix.writeAll(1, "'\n");
+            if (n < 256) {
+                names[n] = entry.key_ptr.*;
+                n += 1;
+            }
+        }
+        const slice = names[0..n];
+        std.mem.sort([]const u8, slice, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        for (slice) |name| {
+            if (env.getAlias(name)) |val| {
+                posix.writeAll(1, "alias ");
+                posix.writeAll(1, name);
+                posix.writeAll(1, "='");
+                posix.writeAll(1, val);
+                posix.writeAll(1, "'\n");
+            }
         }
         return 0;
     }
 
     var status: u8 = 0;
-    for (args[1..]) |arg| {
+    var arg_start: usize = 1;
+    if (arg_start < args.len and std.mem.eql(u8, args[arg_start], "--")) {
+        arg_start += 1;
+    }
+    for (args[arg_start..]) |arg| {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             const name = arg[0..eq];
             const value = arg[eq + 1 ..];
@@ -3235,7 +3582,11 @@ fn builtinUnalias(args: []const []const u8, env: *Environment) u8 {
     }
 
     var status: u8 = 0;
-    for (args[1..]) |name| {
+    var unalias_start: usize = 1;
+    if (unalias_start < args.len and std.mem.eql(u8, args[unalias_start], "--")) {
+        unalias_start += 1;
+    }
+    for (args[unalias_start..]) |name| {
         if (!env.removeAlias(name)) {
             posix.writeAll(2, "unalias: ");
             posix.writeAll(2, name);
@@ -3476,18 +3827,18 @@ fn printTrapEntry(action: []const u8, name: []const u8) void {
 }
 
 const trap_sig_entries = [_]struct { num: u6, name: []const u8 }{
-    .{ .num = signals.SIGHUP, .name = "HUP" },
-    .{ .num = signals.SIGINT, .name = "INT" },
-    .{ .num = signals.SIGQUIT, .name = "QUIT" },
-    .{ .num = signals.SIGABRT, .name = "ABRT" },
-    .{ .num = signals.SIGALRM, .name = "ALRM" },
-    .{ .num = signals.SIGTERM, .name = "TERM" },
-    .{ .num = signals.SIGTSTP, .name = "TSTP" },
-    .{ .num = signals.SIGCONT, .name = "CONT" },
-    .{ .num = signals.SIGCHLD, .name = "CHLD" },
-    .{ .num = signals.SIGUSR1, .name = "USR1" },
-    .{ .num = signals.SIGUSR2, .name = "USR2" },
-    .{ .num = signals.SIGPIPE, .name = "PIPE" },
+    .{ .num = signals.SIGHUP, .name = "SIGHUP" },
+    .{ .num = signals.SIGINT, .name = "SIGINT" },
+    .{ .num = signals.SIGQUIT, .name = "SIGQUIT" },
+    .{ .num = signals.SIGABRT, .name = "SIGABRT" },
+    .{ .num = signals.SIGALRM, .name = "SIGALRM" },
+    .{ .num = signals.SIGTERM, .name = "SIGTERM" },
+    .{ .num = signals.SIGTSTP, .name = "SIGTSTP" },
+    .{ .num = signals.SIGCONT, .name = "SIGCONT" },
+    .{ .num = signals.SIGCHLD, .name = "SIGCHLD" },
+    .{ .num = signals.SIGUSR1, .name = "SIGUSR1" },
+    .{ .num = signals.SIGUSR2, .name = "SIGUSR2" },
+    .{ .num = signals.SIGPIPE, .name = "SIGPIPE" },
 };
 
 fn printTraps() void {
@@ -3620,8 +3971,17 @@ fn builtinUlimit(args: []const []const u8, _: *Environment) u8 {
                 }
             }
         } else {
+            if (set_value != null) {
+                posix.writeAll(2, "ulimit: too many arguments\n");
+                return 1;
+            }
             set_value = arg;
         }
+    }
+
+    if (show_all and set_value != null) {
+        posix.writeAll(2, "ulimit: -a: too many arguments\n");
+        return 1;
     }
 
     if (show_all) {
@@ -3918,6 +4278,7 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
         return status;
     }
 
+    const is_local = std.mem.eql(u8, args[0], "local");
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.indexOf(u8, arg, "=")) |eq| {
@@ -3931,6 +4292,9 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                 env.should_exit = true;
                 env.exit_value = 2;
                 return 2;
+            }
+            if (is_local) {
+                env.declareLocal(name) catch {};
             }
             var val = arg[eq + 1 ..];
             if (is_append) {
@@ -3960,6 +4324,13 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                 if (env.vars.getPtr(name)) |v| v.readonly = true;
             }
         } else {
+            if (is_local) {
+                env.declareLocal(arg) catch {};
+                if (!flags_export and !flags_readonly and !flags_integer and !flags_lowercase and !flags_uppercase and !flags_unset_attrs) {
+                    env.removeVarDirect(arg);
+                    continue;
+                }
+            }
             if (flags_unset_attrs) {
                 if (env.vars.getPtr(arg)) |v| {
                     if (has_integer) v.integer = false;
@@ -3968,14 +4339,14 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     if (has_lowercase) v.lowercase = false;
                     if (has_uppercase) v.uppercase = false;
                 }
-            } else {
+            } else if (!is_local or flags_export or flags_readonly or flags_integer or flags_lowercase or flags_uppercase) {
                 if (env.vars.getPtr(arg)) |v| {
                     if (flags_export) v.exported = true;
                     if (flags_readonly) v.readonly = true;
                     if (flags_integer) v.integer = true;
                     if (flags_lowercase) { v.lowercase = true; v.uppercase = false; }
                     if (flags_uppercase) { v.uppercase = true; v.lowercase = false; }
-                } else {
+                } else if (!is_local) {
                     env.set(arg, "", flags_export) catch {};
                     if (flags_integer) {
                         if (env.vars.getPtr(arg)) |v| v.integer = true;
@@ -4038,6 +4409,185 @@ fn builtinLet(args: []const []const u8, env: *Environment) u8 {
 }
 
 const ShoptMode = enum { none, set, unset, query, print };
+
+fn tildePrefix(path: []const u8, env: *const Environment) []const u8 {
+    const home = env.get("HOME") orelse return path;
+    if (home.len == 0) return path;
+    if (std.mem.startsWith(u8, path, home)) {
+        if (path.len == home.len) return "~";
+        if (path[home.len] == '/') {
+            var buf: [4096]u8 = undefined;
+            const result = std.fmt.bufPrint(&buf, "~{s}", .{path[home.len..]}) catch return path;
+            return env.alloc.dupe(u8, result) catch return path;
+        }
+    }
+    return path;
+}
+
+fn printDirStack(env: *Environment, long: bool, vertical: bool, numbered: bool) void {
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd = posix.getcwd(&cwd_buf) catch "";
+    const display_cwd = if (long) cwd else tildePrefix(cwd, env);
+    if (numbered) {
+        posix.writeAll(1, " 0  ");
+        posix.writeAll(1, display_cwd);
+        posix.writeAll(1, "\n");
+    } else {
+        posix.writeAll(1, display_cwd);
+    }
+    for (env.dir_stack.items, 0..) |dir, i| {
+        const display = if (long) dir else tildePrefix(dir, env);
+        if (numbered) {
+            var num_buf: [16]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, " {d}  ", .{i + 1}) catch "";
+            posix.writeAll(1, num_str);
+            posix.writeAll(1, display);
+            posix.writeAll(1, "\n");
+        } else if (vertical) {
+            posix.writeAll(1, "\n");
+            posix.writeAll(1, display);
+        } else {
+            posix.writeAll(1, " ");
+            posix.writeAll(1, display);
+        }
+    }
+    if (!numbered) posix.writeAll(1, "\n");
+}
+
+fn builtinPushd(args: []const []const u8, env: *Environment) u8 {
+    var dir: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            i += 1;
+            if (i < args.len) dir = args[i];
+            break;
+        }
+        if (args[i].len > 0 and args[i][0] == '-') {
+            posix.writeAll(2, "pushd: ");
+            posix.writeAll(2, args[i]);
+            posix.writeAll(2, ": invalid option\n");
+            return 2;
+        }
+        if (dir != null) {
+            posix.writeAll(2, "pushd: too many arguments\n");
+            return 1;
+        }
+        dir = args[i];
+    }
+    if (dir == null and i < args.len) dir = args[i];
+
+    const target = dir orelse {
+        posix.writeAll(2, "pushd: no other directory\n");
+        return 1;
+    };
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd = posix.getcwd(&cwd_buf) catch {
+        posix.writeAll(2, "pushd: error getting current directory\n");
+        return 1;
+    };
+    const saved = env.alloc.dupe(u8, cwd) catch return 1;
+
+    posix.chdir(target) catch {
+        posix.writeAll(2, "pushd: ");
+        posix.writeAll(2, target);
+        posix.writeAll(2, ": No such file or directory\n");
+        env.alloc.free(saved);
+        return 1;
+    };
+
+    var new_cwd_buf: [4096]u8 = undefined;
+    const new_cwd = posix.getcwd(&new_cwd_buf) catch target;
+    env.set("PWD", new_cwd, true) catch {};
+
+    env.dir_stack.insert(env.alloc, 0, saved) catch {
+        env.alloc.free(saved);
+        return 1;
+    };
+
+    printDirStack(env, false, false, false);
+    return 0;
+}
+
+fn builtinPopd(args: []const []const u8, env: *Environment) u8 {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            continue;
+        }
+        if (args[i].len > 0 and args[i][0] == '-') {
+            posix.writeAll(2, "popd: ");
+            posix.writeAll(2, args[i]);
+            posix.writeAll(2, ": invalid option\n");
+            return 2;
+        }
+        posix.writeAll(2, "popd: ");
+        posix.writeAll(2, args[i]);
+        posix.writeAll(2, ": invalid argument\n");
+        return 2;
+    }
+
+    if (env.dir_stack.items.len == 0) {
+        posix.writeAll(2, "popd: directory stack empty\n");
+        return 1;
+    }
+
+    const dir = env.dir_stack.orderedRemove(0);
+    defer env.alloc.free(dir);
+
+    posix.chdir(dir) catch {
+        posix.writeAll(2, "popd: ");
+        posix.writeAll(2, dir);
+        posix.writeAll(2, ": No such file or directory\n");
+        return 1;
+    };
+
+    var cwd_buf: [4096]u8 = undefined;
+    const new_cwd = posix.getcwd(&cwd_buf) catch dir;
+    env.set("PWD", new_cwd, true) catch {};
+
+    printDirStack(env, false, false, false);
+    return 0;
+}
+
+fn builtinDirs(args: []const []const u8, env: *Environment) u8 {
+    var flag_c = false;
+    var flag_l = false;
+    var flag_v = false;
+    var flag_p = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (args[i].len > 0 and args[i][0] == '-') {
+            for (args[i][1..]) |ch| {
+                switch (ch) {
+                    'c' => flag_c = true,
+                    'l' => flag_l = true,
+                    'v' => flag_v = true,
+                    'p' => flag_p = true,
+                    else => {
+                        posix.writeAll(2, "dirs: invalid option\n");
+                        return 1;
+                    },
+                }
+            }
+        } else {
+            posix.writeAll(2, "dirs: too many arguments\n");
+            return 1;
+        }
+    }
+
+    if (flag_c) {
+        for (env.dir_stack.items) |dir| {
+            env.alloc.free(dir);
+        }
+        env.dir_stack.clearRetainingCapacity();
+        return 0;
+    }
+
+    printDirStack(env, flag_l, flag_p, flag_v);
+    return 0;
+}
 
 fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
     const Env = @import("env.zig").Environment;
@@ -4306,19 +4856,19 @@ test "printfParseNumericArg" {
     const testing = std.testing;
     var err = false;
 
-    try testing.expectEqual(@as(i64, 42), printfParseNumericArg("42", &err));
+    try testing.expectEqual(@as(i64, 42), printfParseNumericArg("42", &err, null));
     try testing.expectEqual(false, err);
 
-    try testing.expectEqual(@as(i64, 0x1F), printfParseNumericArg("0x1F", &err));
+    try testing.expectEqual(@as(i64, 0x1F), printfParseNumericArg("0x1F", &err, null));
     try testing.expectEqual(false, err);
 
-    try testing.expectEqual(@as(i64, 65), printfParseNumericArg("'A", &err));
+    try testing.expectEqual(@as(i64, 65), printfParseNumericArg("'A", &err, null));
     try testing.expectEqual(false, err);
 
-    try testing.expectEqual(@as(i64, -10), printfParseNumericArg("-10", &err));
+    try testing.expectEqual(@as(i64, -10), printfParseNumericArg("-10", &err, null));
     try testing.expectEqual(false, err);
 
-    try testing.expectEqual(@as(i64, 0), printfParseNumericArg("", &err));
+    try testing.expectEqual(@as(i64, 0), printfParseNumericArg("", &err, null));
     try testing.expectEqual(false, err);
 }
 

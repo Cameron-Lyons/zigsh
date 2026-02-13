@@ -80,7 +80,7 @@ pub fn applyFileRedirect(fd: types.Fd, path: [*:0]const u8, op: RedirectOp, stat
         .read_write => posix.oRdwrCreat(),
         .dup_input, .dup_output => posix.oRdonly(),
     };
-    const new_fd = posix.openZ(path, flags, 0o644) catch return error.RedirectionFailed;
+    const new_fd = posix.openZ(path, flags, 0o666) catch return error.RedirectionFailed;
     if (new_fd != fd) {
         posix.dup2(new_fd, fd) catch return error.DupFailed;
         posix.close(new_fd);

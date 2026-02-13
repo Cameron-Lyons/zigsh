@@ -33,13 +33,30 @@ pub const ParseError = error{
     InvalidEscapeSequence,
     UnexpectedEOF,
     InvalidToken,
+    BadSubstitution,
 };
+
+fn isTextWordBoundary(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\n' or ch == ';' or ch == '|' or ch == '&' or ch == '(' or ch == ')' or ch == '$' or ch == '`';
+}
+
+fn isKeywordAt(text: []const u8, pos: usize, keyword: []const u8) bool {
+    if (pos + keyword.len > text.len) return false;
+    if (!std.mem.eql(u8, text[pos .. pos + keyword.len], keyword)) return false;
+    if (pos > 0 and !isTextWordBoundary(text[pos - 1])) return false;
+    if (pos + keyword.len < text.len and !isTextWordBoundary(text[pos + keyword.len])) return false;
+    return true;
+}
 
 pub const Parser = struct {
     lexer: *Lexer,
     alloc: std.mem.Allocator,
     current: Token,
     source: []const u8,
+    env: ?*@import("env.zig").Environment = null,
+    expanding_aliases: [16][]const u8 = undefined,
+    expanding_alias_count: u8 = 0,
+    alias_depth: u8 = 0,
 
     pub fn init(alloc: std.mem.Allocator, lexer: *Lexer) !Parser {
         const source = lexer.source;
@@ -85,6 +102,60 @@ pub const Parser = struct {
             try self.skipNewlines();
         }
         return .{ .commands = try commands.toOwnedSlice(self.alloc) };
+    }
+
+    pub fn parseOneCommand(self: *Parser) ParseError!?ast.CompleteCommand {
+        try self.skipNewlines();
+        if (self.current.tag == .eof) return null;
+        const line = self.lexer.line;
+        const first = try self.parseAndOr();
+        var rest: List(ast.ListRest) = .empty;
+        while (true) {
+            if (self.current.tag == .semicolon) {
+                const peek_save = self.lexer.pos;
+                const peek_pending = self.lexer.pending_heredoc_count;
+                self.lexer.reserved_word_context = true;
+                try self.advance();
+                if (self.isCommandStart()) {
+                    const and_or = try self.parseAndOr();
+                    try rest.append(self.alloc, .{ .op = .semi, .and_or = and_or });
+                } else {
+                    if (peek_pending == 0 or self.lexer.pending_heredoc_count > 0)
+                        self.lexer.pos = peek_save;
+                    self.current.tag = .semicolon;
+                    break;
+                }
+            } else if (self.current.tag == .ampersand) {
+                const save_pos = self.lexer.pos;
+                const save_tok = self.current;
+                const save_pending = self.lexer.pending_heredoc_count;
+                self.lexer.reserved_word_context = true;
+                try self.advance();
+                if (self.isCommandStart()) {
+                    const and_or = try self.parseAndOr();
+                    try rest.append(self.alloc, .{ .op = .amp, .and_or = and_or });
+                } else {
+                    if (save_pending == 0 or self.lexer.pending_heredoc_count > 0)
+                        self.lexer.pos = save_pos;
+                    self.current = save_tok;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        var bg = false;
+        if (self.current.tag == .ampersand) {
+            bg = true;
+            try self.advance();
+        } else if (self.current.tag == .semicolon) {
+            try self.advance();
+        }
+        if (self.current.tag == .newline) {
+            try self.advance();
+        }
+        const list: ast.List = .{ .first = first, .rest = try rest.toOwnedSlice(self.alloc) };
+        return .{ .list = list, .bg = bg, .line = line };
     }
 
     fn parseCompleteCommand(self: *Parser) ParseError!ast.CompleteCommand {
@@ -251,6 +322,8 @@ pub const Parser = struct {
     fn parseCommand(self: *Parser) ParseError!ast.Command {
         self.lexer.reserved_word_context = true;
 
+        self.tryAliasExpand();
+
         switch (self.current.tag) {
             .kw_if => return .{ .compound = try self.parseCompoundWithRedirects(.{ .if_clause = try self.parseIfClause() }) },
             .kw_while => return .{ .compound = try self.parseCompoundWithRedirects(.{ .while_clause = try self.parseWhileClause() }) },
@@ -268,12 +341,121 @@ pub const Parser = struct {
                 }
                 return .{ .compound = try self.parseCompoundWithRedirects(.{ .subshell = try self.parseSubshell() }) };
             },
+            .kw_do, .kw_done, .kw_then, .kw_else, .kw_elif, .kw_fi, .kw_esac, .kw_in,
+            .dsemi, .semi_and, .dsemi_and,
+            => {
+                posix.writeAll(2, "zigsh: syntax error near unexpected token `");
+                posix.writeAll(2, self.tokenText(self.current));
+                posix.writeAll(2, "'\n");
+                return error.UnexpectedToken;
+            },
             else => {
                 if (try self.tryParseFunctionDef()) |func_def| {
                     return .{ .function_def = func_def };
                 }
                 return .{ .simple = try self.parseSimpleCommand() };
             },
+        }
+    }
+
+    fn isAlreadyExpanding(self: *Parser, name: []const u8) bool {
+        for (self.expanding_aliases[0..self.expanding_alias_count]) |expanding| {
+            if (std.mem.eql(u8, expanding, name)) return true;
+        }
+        return false;
+    }
+
+    fn isUnquotedWord(self: *Parser) bool {
+        if (self.current.tag != .word) return false;
+        const text = self.tokenText(self.current);
+        for (text) |ch| {
+            if (ch == '\'' or ch == '"' or ch == '\\') return false;
+        }
+        return true;
+    }
+
+    fn tryAliasExpandWord(self: *Parser) void {
+        const env = self.env orelse return;
+        if (!self.isUnquotedWord()) return;
+        const word_text = self.tokenText(self.current);
+        const alias_val = env.getAlias(word_text) orelse return;
+        self.substituteInSource(self.current.start, self.current.end, alias_val);
+        self.lexer.pos = self.current.start;
+        self.current = self.lexer.next() catch return;
+    }
+
+    fn tryAliasExpand(self: *Parser) void {
+        self.expanding_alias_count = 0;
+        self.alias_depth = 0;
+
+        while (self.alias_depth < 16) {
+            const env = self.env orelse return;
+            if (!self.isUnquotedWord()) return;
+
+            const word_text = self.tokenText(self.current);
+            if (self.isAlreadyExpanding(word_text)) return;
+            const alias_val = env.getAlias(word_text) orelse return;
+
+            if (self.expanding_alias_count < 16) {
+                self.expanding_aliases[self.expanding_alias_count] = word_text;
+                self.expanding_alias_count += 1;
+            }
+            self.alias_depth += 1;
+
+            self.substituteInSource(self.current.start, self.current.end, alias_val);
+
+            if (alias_val.len > 0 and alias_val[alias_val.len - 1] == ' ') {
+                self.expandTrailingSpaceAliases(@as(u32, self.current.start) + @as(u32, @intCast(alias_val.len)));
+            }
+
+            self.lexer.pos = self.current.start;
+            self.lexer.reserved_word_context = true;
+            self.current = self.lexer.next() catch return;
+        }
+    }
+
+    fn substituteInSource(self: *Parser, start: u32, end: u32, replacement: []const u8) void {
+        var new_source: std.ArrayListUnmanaged(u8) = .empty;
+        new_source.appendSlice(self.alloc, self.source[0..start]) catch return;
+        new_source.appendSlice(self.alloc, replacement) catch return;
+        new_source.appendSlice(self.alloc, self.source[end..]) catch return;
+        const expanded = new_source.toOwnedSlice(self.alloc) catch return;
+        self.source = expanded;
+        self.lexer.source = expanded;
+    }
+
+    fn expandTrailingSpaceAliases(self: *Parser, start_pos: u32) void {
+        self.expandTrailingSpaceRecursive(start_pos, 0);
+    }
+
+    fn expandTrailingSpaceRecursive(self: *Parser, start_pos: u32, depth: u8) void {
+        if (depth >= 16) return;
+        var pos = start_pos;
+        while (pos < self.source.len) {
+            if (self.source[pos] == ' ' or self.source[pos] == '\t') {
+                pos += 1;
+            } else if (self.source[pos] == '\\' and pos + 1 < self.source.len and self.source[pos + 1] == '\n') {
+                pos += 2;
+            } else break;
+        }
+        const word_start = pos;
+        while (pos < self.source.len) {
+            const ch = self.source[pos];
+            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == ';' or ch == '|' or
+                ch == '&' or ch == '(' or ch == ')' or ch == '\'' or ch == '"' or
+                ch == '\\' or ch == '$' or ch == '`') break;
+            pos += 1;
+        }
+        if (pos == word_start) return;
+
+        const next_word = self.source[word_start..pos];
+        const env = self.env orelse return;
+        const next_alias_val = env.getAlias(next_word) orelse return;
+
+        self.substituteInSource(@intCast(word_start), @intCast(pos), next_alias_val);
+
+        if (next_alias_val.len > 0 and next_alias_val[next_alias_val.len - 1] == ' ') {
+            self.expandTrailingSpaceRecursive(@intCast(word_start + next_alias_val.len), depth + 1);
         }
     }
 
@@ -298,6 +480,9 @@ pub const Parser = struct {
                 const redir = try self.parseRedirect();
                 try redirects.append(self.alloc, redir);
             } else if (self.current.tag == .word or self.current.tag == .assignment_word) {
+                if (words.items.len == 0 and (assigns.items.len > 0 or redirects.items.len > 0)) {
+                    self.tryAliasExpandWord();
+                }
                 const word = try self.parseWordToken();
                 try words.append(self.alloc, word);
             } else {
@@ -327,6 +512,26 @@ pub const Parser = struct {
         const name = if (is_append) text[0 .. eq_idx - 1] else text[0..eq_idx];
         const value_text = text[eq_idx + 1 ..];
         try self.advance();
+
+        if (value_text.len == 0 and self.current.tag == .lparen) {
+            try self.advance();
+            var array_words: List(ast.Word) = .empty;
+            while (self.current.tag != .rparen and self.current.tag != .eof) {
+                if (self.current.tag == .newline) {
+                    try self.advance();
+                    continue;
+                }
+                const w = try self.parseWordToken();
+                try array_words.append(self.alloc, w);
+            }
+            if (self.current.tag == .rparen) try self.advance();
+            return .{
+                .name = name,
+                .value = .{ .parts = &.{} },
+                .append = is_append,
+                .array_values = try array_words.toOwnedSlice(self.alloc),
+            };
+        }
 
         const value = try self.buildWordAssign(value_text);
         return .{ .name = name, .value = value, .append = is_append };
@@ -565,10 +770,35 @@ pub const Parser = struct {
                 i.* += 1;
                 const start = i.*;
                 var depth: u32 = 1;
+                var case_depth: u32 = 0;
+                var case_entry_depths: [16]u32 = undefined;
                 while (i.* < text.len and depth > 0) {
-                    if (text[i.*] == '(') depth += 1;
-                    if (text[i.*] == ')') depth -= 1;
-                    if (depth > 0) i.* += 1;
+                    const ch = text[i.*];
+                    if (ch == '(') {
+                        depth += 1;
+                    } else if (ch == ')') {
+                        if (case_depth > 0 and depth <= case_entry_depths[case_depth - 1]) {
+                            i.* += 1;
+                            continue;
+                        }
+                        depth -= 1;
+                        if (depth == 0) break;
+                    } else if (ch == '\'' and i.* + 1 < text.len) {
+                        i.* += 1;
+                        while (i.* < text.len and text[i.*] != '\'') i.* += 1;
+                    } else if (ch == 'c' and case_depth < 16) {
+                        if (isKeywordAt(text, i.*, "case")) {
+                            case_entry_depths[case_depth] = depth;
+                            case_depth += 1;
+                            i.* += 3;
+                        }
+                    } else if (ch == 'e' and case_depth > 0) {
+                        if (isKeywordAt(text, i.*, "esac")) {
+                            case_depth -= 1;
+                            i.* += 3;
+                        }
+                    }
+                    i.* += 1;
                 }
                 const body = text[start..i.*];
                 if (i.* < text.len) i.* += 1;
@@ -766,6 +996,7 @@ pub const Parser = struct {
         if (i.* >= text.len) return .{ .literal = "${" };
 
         if (text[i.*] == '#') {
+            const hash_start = i.*;
             const after_hash = i.* + 1;
             if (after_hash >= text.len) {
                 i.* += 1;
@@ -781,14 +1012,34 @@ pub const Parser = struct {
                 }
             } else if (text[after_hash] == '%' or text[after_hash] == ':') {
                 // ${#%...} or ${#:...} → $# with operator, handled below
-            } else {
-                // ${#name} → length of name
+            } else if (std.ascii.isAlphabetic(text[after_hash]) or text[after_hash] == '_' or text[after_hash] == '@' or text[after_hash] == '*' or text[after_hash] == '?' or text[after_hash] == '-' or text[after_hash] == '$' or text[after_hash] == '!') {
                 i.* += 1;
                 const start = i.*;
-                while (i.* < text.len and text[i.*] != '}') : (i.* += 1) {}
-                const name = text[start..i.*];
-                if (i.* < text.len) i.* += 1;
-                return .{ .parameter = .{ .length = name } };
+                if (i.* < text.len and (text[i.*] == '@' or text[i.*] == '*' or text[i.*] == '?' or text[i.*] == '-' or text[i.*] == '$' or text[i.*] == '!')) {
+                    i.* += 1;
+                } else {
+                    while (i.* < text.len and (std.ascii.isAlphanumeric(text[i.*]) or text[i.*] == '_')) : (i.* += 1) {}
+                }
+                var name = text[start..i.*];
+                if (i.* < text.len and text[i.*] == '[') {
+                    i.* += 1;
+                    while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+                    if (i.* < text.len) i.* += 1;
+                    name = text[start..i.*];
+                }
+                if (i.* < text.len and text[i.*] == '}') {
+                    i.* += 1;
+                    return .{ .parameter = .{ .length = name } };
+                }
+                var depth: u32 = 1;
+                while (i.* < text.len and depth > 0) {
+                    if (text[i.*] == '{') depth += 1 else if (text[i.*] == '}') depth -= 1;
+                    if (depth > 0) i.* += 1;
+                }
+                const bad_text = text[hash_start..i.*];
+                if (i.* < text.len and text[i.*] == '}') i.* += 1;
+                const msg = std.fmt.allocPrint(self.alloc, "zigsh: ${{{s}}}: bad substitution\n", .{bad_text}) catch return error.OutOfMemory;
+                return .{ .parameter = .{ .bad_sub = msg } };
             }
         }
 
@@ -807,6 +1058,14 @@ pub const Parser = struct {
                     i.* += 1;
                     return .{ .parameter = .{ .indirect = indirect_name } };
                 }
+                if (i.* < text.len and (text[i.*] == '@' or text[i.*] == '*')) {
+                    const join = text[i.*] == '*';
+                    i.* += 1;
+                    if (i.* < text.len and text[i.*] == '}') {
+                        i.* += 1;
+                        return .{ .parameter = .{ .prefix_list = .{ .prefix = indirect_name, .join = join } } };
+                    }
+                }
                 i.* = after_bang - 1;
             }
         }
@@ -823,6 +1082,11 @@ pub const Parser = struct {
             }
         } else {
             while (i.* < text.len and (std.ascii.isAlphanumeric(text[i.*]) or text[i.*] == '_')) : (i.* += 1) {}
+        }
+        if (i.* < text.len and text[i.*] == '[') {
+            i.* += 1;
+            while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+            if (i.* < text.len) i.* += 1;
         }
         const name = text[name_start..i.*];
 
@@ -856,6 +1120,11 @@ pub const Parser = struct {
         if (i.* >= text.len) return .{ .parameter = .{ .simple = name } };
 
         if (colon and (i.* >= text.len or (text[i.*] != '-' and text[i.*] != '=' and text[i.*] != '?' and text[i.*] != '+'))) {
+            if (i.* < text.len and text[i.*] == '}') {
+                const msg = std.fmt.allocPrint(self.alloc, "zigsh: ${{{s}:}}: bad substitution\n", .{name}) catch return error.OutOfMemory;
+                i.* += 1;
+                return .{ .parameter = .{ .bad_sub = msg } };
+            }
             return try self.parseSubstring(text, i, name);
         }
 
@@ -1722,9 +1991,11 @@ pub const Parser = struct {
 
     fn isValidFunctionName(name: []const u8) bool {
         if (name.len == 0) return false;
-        if (name[0] != '_' and !std.ascii.isAlphabetic(name[0])) return false;
-        for (name[1..]) |ch| {
-            if (ch != '_' and !std.ascii.isAlphanumeric(ch)) return false;
+        for (name) |ch| {
+            switch (ch) {
+                ' ', '\t', '\n', '\r', '|', '&', ';', '(', ')', '<', '>', '$', '`', '"', '\'', '\\', '{', '}', 0 => return false,
+                else => {},
+            }
         }
         return true;
     }

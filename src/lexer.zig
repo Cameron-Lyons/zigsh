@@ -366,8 +366,29 @@ pub const Lexer = struct {
         }
     }
 
+    fn isWordBoundaryBefore(self: *Lexer, pos: u32) bool {
+        if (pos == 0) return true;
+        const ch = self.source[pos - 1];
+        return ch == ' ' or ch == '\t' or ch == '\n' or ch == ';' or ch == '|' or ch == '&' or ch == '(' or ch == ')' or ch == '$' or ch == '`';
+    }
+
+    fn isWordBoundaryAfter(self: *Lexer, pos: u32) bool {
+        if (pos >= self.source.len) return true;
+        const ch = self.source[pos];
+        return ch == ' ' or ch == '\t' or ch == '\n' or ch == ';' or ch == '|' or ch == '&' or ch == '(' or ch == ')' or ch == '$' or ch == '`';
+    }
+
+    fn matchKeywordAt(self: *Lexer, pos: u32, keyword: []const u8) bool {
+        if (pos + keyword.len > self.source.len) return false;
+        if (!std.mem.eql(u8, self.source[pos .. pos + @as(u32, @intCast(keyword.len))], keyword)) return false;
+        if (!self.isWordBoundaryBefore(pos)) return false;
+        return self.isWordBoundaryAfter(pos + @as(u32, @intCast(keyword.len)));
+    }
+
     fn skipNestedParens(self: *Lexer, initial_depth: u32) void {
         var depth = initial_depth;
+        var case_depth: u32 = 0;
+        var case_entry_depths: [16]u32 = undefined;
         while (self.pos < self.source.len and depth > 0) {
             switch (self.source[self.pos]) {
                 '(' => {
@@ -375,11 +396,15 @@ pub const Lexer = struct {
                     self.pos += 1;
                 },
                 ')' => {
-                    depth -= 1;
-                    if (depth > 0) self.pos += 1;
-                    if (depth == 0) {
+                    if (case_depth > 0 and depth <= case_entry_depths[case_depth - 1]) {
                         self.pos += 1;
-                        return;
+                    } else {
+                        depth -= 1;
+                        if (depth > 0) self.pos += 1;
+                        if (depth == 0) {
+                            self.pos += 1;
+                            return;
+                        }
                     }
                 },
                 '\'' => {
@@ -391,6 +416,23 @@ pub const Lexer = struct {
                 '\\' => {
                     self.pos += 1;
                     if (self.pos < self.source.len) self.pos += 1;
+                },
+                'c' => {
+                    if (self.matchKeywordAt(self.pos, "case") and case_depth < 16) {
+                        case_entry_depths[case_depth] = depth;
+                        case_depth += 1;
+                        self.pos += 4;
+                    } else {
+                        self.pos += 1;
+                    }
+                },
+                'e' => {
+                    if (self.matchKeywordAt(self.pos, "esac") and case_depth > 0) {
+                        case_depth -= 1;
+                        self.pos += 4;
+                    } else {
+                        self.pos += 1;
+                    }
                 },
                 else => self.pos += 1,
             }

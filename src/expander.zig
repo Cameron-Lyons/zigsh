@@ -67,15 +67,9 @@ pub const Expander = struct {
         var result: std.ArrayListUnmanaged(u8) = .empty;
         for (info.text, 0..) |ch, idx| {
             if (ch == 0x00) continue;
-            if (!info.globbable[idx] and (ch == '[' or ch == '*' or ch == '?' or ch == '\\')) {
-                if (ch == '\\') {
-                    try result.append(self.alloc, '\\');
-                    try result.append(self.alloc, '\\');
-                } else {
-                    try result.append(self.alloc, '[');
-                    try result.append(self.alloc, ch);
-                    try result.append(self.alloc, ']');
-                }
+            if (!info.globbable[idx] and (ch == '[' or ch == '*' or ch == '?' or ch == '\\' or ch == ']' or ch == '-')) {
+                try result.append(self.alloc, '\\');
+                try result.append(self.alloc, ch);
             } else {
                 try result.append(self.alloc, ch);
             }
@@ -123,20 +117,32 @@ pub const Expander = struct {
             }
             const split_result = try self.fieldSplitWithQuoting(ew.text, ew.splittable, ew.globbable);
             if (!self.env.options.noglob) {
+                const has_globignore = if (self.env.get("GLOBIGNORE")) |gi| gi.len > 0 else false;
                 for (split_result.fields, split_result.globbable, split_result.field_char_globbable) |field, can_glob, char_flags| {
                     if (!can_glob) {
                         try raw_fields.append(self.alloc, field);
                         continue;
                     }
                     const pattern = try self.buildGlobPattern(field, char_flags);
-                    const globbed = glob.expand(self.alloc, pattern) catch {
-                        if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
-                        continue;
-                    };
+                    const globbed = if (has_globignore)
+                        glob.expandDotglob(self.alloc, pattern) catch {
+                            if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
+                            continue;
+                        }
+                    else
+                        glob.expand(self.alloc, pattern) catch {
+                            if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
+                            continue;
+                        };
                     if (globbed.len == 1 and std.mem.eql(u8, globbed[0], pattern)) {
                         if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
                     } else {
-                        try raw_fields.appendSlice(self.alloc, globbed);
+                        const filtered = try self.filterGlobIgnore(globbed);
+                        if (filtered.len == 0) {
+                            if (!self.env.shopt.nullglob) try raw_fields.append(self.alloc, field);
+                        } else {
+                            try raw_fields.appendSlice(self.alloc, filtered);
+                        }
                     }
                 }
             } else {
@@ -206,11 +212,42 @@ pub const Expander = struct {
         }
     }
 
+    fn parseArraySubscript(name: []const u8) ?struct { base: []const u8, subscript: []const u8 } {
+        const bracket = std.mem.indexOfScalar(u8, name, '[') orelse return null;
+        if (name.len < bracket + 3 or name[name.len - 1] != ']') return null;
+        return .{ .base = name[0..bracket], .subscript = name[bracket + 1 .. name.len - 1] };
+    }
+
     fn getParamValue(self: *Expander, name: []const u8) ?[]const u8 {
         if (name.len > 0 and name[0] >= '0' and name[0] <= '9') {
             const n = std.fmt.parseInt(u32, name, 10) catch return null;
             if (n == 0) return self.env.shell_name;
             return self.env.getPositional(n);
+        }
+        if (parseArraySubscript(name)) |arr| {
+            if (std.mem.eql(u8, arr.subscript, "@") or std.mem.eql(u8, arr.subscript, "*")) {
+                if (self.env.getArray(arr.base)) |elems| {
+                    var result: std.ArrayListUnmanaged(u8) = .empty;
+                    for (elems, 0..) |e, i| {
+                        if (i > 0) result.append(self.alloc, ' ') catch {};
+                        result.appendSlice(self.alloc, e) catch {};
+                    }
+                    return result.toOwnedSlice(self.alloc) catch null;
+                }
+                return self.env.get(arr.base);
+            }
+            const idx = std.fmt.parseInt(i64, arr.subscript, 10) catch return self.env.get(arr.base);
+            if (self.env.getArray(arr.base)) |elems| {
+                const i: usize = if (idx < 0) blk: {
+                    const adj = @as(i64, @intCast(elems.len)) + idx;
+                    if (adj < 0) return null;
+                    break :blk @intCast(adj);
+                } else @intCast(idx);
+                if (i < elems.len) return elems[i];
+                return null;
+            }
+            if (idx == 0) return self.env.get(arr.base);
+            return null;
         }
         if (self.env.get(name)) |val| return val;
         if (std.mem.eql(u8, name, "@") or std.mem.eql(u8, name, "*")) {
@@ -275,6 +312,13 @@ pub const Expander = struct {
                 if (std.mem.eql(u8, name, "@") or std.mem.eql(u8, name, "*")) {
                     return try std.fmt.allocPrint(self.alloc, "{d}", .{self.env.positional_params.len});
                 }
+                if (parseArraySubscript(name)) |arr| {
+                    if (std.mem.eql(u8, arr.subscript, "@") or std.mem.eql(u8, arr.subscript, "*")) {
+                        if (self.env.getArray(arr.base)) |elems| {
+                            return try std.fmt.allocPrint(self.alloc, "{d}", .{elems.len});
+                        }
+                    }
+                }
                 if (std.mem.eql(u8, name, "#")) {
                     const count_str = try std.fmt.allocPrint(self.alloc, "{d}", .{self.env.positional_params.len});
                     defer self.alloc.free(count_str);
@@ -300,6 +344,17 @@ pub const Expander = struct {
                 return try self.alloc.dupe(u8, "0");
             },
             .default => |op| {
+                if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
+                    const params = self.env.positional_params;
+                    if (params.len == 0) return try self.expandWord(op.word);
+                    const sep = if (std.mem.eql(u8, op.name, "*")) self.getIfsSep() else " ";
+                    const joined = try self.joinPositionalParams(sep);
+                    if (op.colon and joined.len == 0) {
+                        self.alloc.free(joined);
+                        return try self.expandWord(op.word);
+                    }
+                    return joined;
+                }
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
                     return try self.expandWord(op.word);
@@ -336,13 +391,24 @@ pub const Expander = struct {
                     self.alloc.free(msg);
                     if (!self.env.options.interactive) {
                         self.env.should_exit = true;
-                        self.env.exit_value = 2;
+                        self.env.exit_value = 1;
                     }
                     return error.UnsetVariable;
                 }
                 return try self.alloc.dupe(u8, val.?);
             },
             .alternative => |op| {
+                if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
+                    const params = self.env.positional_params;
+                    if (params.len == 0) return try self.alloc.dupe(u8, "");
+                    if (op.colon) {
+                        const sep = if (std.mem.eql(u8, op.name, "*")) self.getIfsSep() else " ";
+                        const joined = try self.joinPositionalParams(sep);
+                        defer self.alloc.free(joined);
+                        if (joined.len == 0) return try self.alloc.dupe(u8, "");
+                    }
+                    return try self.expandWord(op.word);
+                }
                 const val = self.getParamValue(op.name);
                 if (val != null and (!op.colon or val.?.len > 0)) {
                     return try self.expandWord(op.word);
@@ -359,11 +425,16 @@ pub const Expander = struct {
             .indirect => |name| {
                 const var_name = self.env.get(name) orelse "";
                 if (var_name.len == 0) return try self.alloc.dupe(u8, "");
-                if (self.env.get(var_name)) |val| return try self.alloc.dupe(u8, val);
+                if (self.getParamValue(var_name)) |val| return try self.alloc.dupe(u8, val);
                 if (self.expandDynamic(var_name)) |val| return val;
                 return try self.alloc.dupe(u8, "");
             },
             .transform => |op| return try self.expandTransform(op),
+            .prefix_list => |op| return try self.expandPrefixList(op),
+            .bad_sub => |msg| {
+                posix.writeAll(2, msg);
+                return error.BadSubstitution;
+            },
         }
     }
 
@@ -442,6 +513,9 @@ pub const Expander = struct {
     }
 
     fn patternSub(self: *Expander, op: ast.PatternSubOp) ExpandError![]const u8 {
+        if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
+            return try self.patternSubPositionalParams(op);
+        }
         const val = self.getParamValue(op.name) orelse blk: {
             if (self.env.options.nounset) {
                 posix.writeAll(2, op.name);
@@ -456,8 +530,11 @@ pub const Expander = struct {
         if (pat.len == 0) return try self.alloc.dupe(u8, val);
         const rep = try self.expandWord(op.replacement);
         defer self.alloc.free(rep);
+        return self.patternSubStr(val, pat, rep, op.mode);
+    }
 
-        switch (op.mode) {
+    fn patternSubStr(self: *Expander, val: []const u8, pat: []const u8, rep: []const u8, mode: ast.PatSubMode) ExpandError![]const u8 {
+        switch (mode) {
             .prefix => {
                 var end: usize = val.len;
                 while (end > 0) : (end -= 1) {
@@ -497,6 +574,7 @@ pub const Expander = struct {
             .first, .all => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
                 var pos: usize = 0;
+                var prev_was_nonempty_match = false;
                 while (pos <= val.len) {
                     var matched = false;
                     var end: usize = val.len;
@@ -505,10 +583,11 @@ pub const Expander = struct {
                             try result.appendSlice(self.alloc, rep);
                             pos = end;
                             matched = true;
+                            prev_was_nonempty_match = true;
                             break;
                         }
                     }
-                    if (!matched) {
+                    if (!matched and !(prev_was_nonempty_match and pos == val.len)) {
                         if (glob.fnmatch(pat, val[pos..pos])) {
                             try result.appendSlice(self.alloc, rep);
                             if (pos < val.len) {
@@ -518,16 +597,18 @@ pub const Expander = struct {
                                 break;
                             }
                             matched = true;
+                            prev_was_nonempty_match = false;
                         }
                     }
                     if (!matched) {
+                        prev_was_nonempty_match = false;
                         if (pos < val.len) {
                             try result.append(self.alloc, val[pos]);
                             pos += 1;
                         } else {
                             break;
                         }
-                    } else if (op.mode == .first) {
+                    } else if (mode == .first) {
                         try result.appendSlice(self.alloc, val[pos..]);
                         return result.toOwnedSlice(self.alloc);
                     }
@@ -537,9 +618,39 @@ pub const Expander = struct {
         }
     }
 
+    fn patternSubPositionalParams(self: *Expander, op: ast.PatternSubOp) ExpandError![]const u8 {
+        const params = self.env.positional_params;
+        if (params.len == 0) return try self.alloc.dupe(u8, "");
+        const pat = try self.expandPattern(op.pattern);
+        defer self.alloc.free(pat);
+        const rep = try self.expandWord(op.replacement);
+        defer self.alloc.free(rep);
+        const sep: u8 = if (std.mem.eql(u8, op.name, "*")) blk: {
+            const ifs = self.env.get("IFS") orelse " \t\n";
+            break :blk if (ifs.len > 0) ifs[0] else 0;
+        } else ' ';
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        for (params, 0..) |param, idx| {
+            if (idx > 0 and sep != 0) try result.append(self.alloc, sep);
+            if (pat.len == 0) {
+                try result.appendSlice(self.alloc, param);
+            } else {
+                const substituted = try self.patternSubStr(param, pat, rep, op.mode);
+                defer self.alloc.free(substituted);
+                try result.appendSlice(self.alloc, substituted);
+            }
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
     fn expandSubstring(self: *Expander, op: ast.SubstringOp) ExpandError![]const u8 {
         if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
             return try self.substringPositionalParams(op);
+        }
+        if (parseArraySubscript(op.name)) |arr| {
+            if (std.mem.eql(u8, arr.subscript, "@") or std.mem.eql(u8, arr.subscript, "*")) {
+                return try self.substringArray(op, arr.base);
+            }
         }
 
         const val = self.getParamValue(op.name) orelse blk: {
@@ -582,7 +693,7 @@ pub const Expander = struct {
         const offset_str = try expanded_offset.toOwnedSlice(self.alloc);
         defer self.alloc.free(offset_str);
 
-        const raw_offset = Arithmetic.evaluate(offset_str, &lookup.f) catch return error.ArithmeticError;
+        const raw_offset = if (offset_str.len == 0) @as(i64, 0) else Arithmetic.evaluate(offset_str, &lookup.f) catch return error.ArithmeticError;
 
         var offset: i64 = raw_offset;
         if (offset < 0) {
@@ -614,7 +725,7 @@ pub const Expander = struct {
             const len_eval_str = try expanded_len.toOwnedSlice(self.alloc);
             defer self.alloc.free(len_eval_str);
 
-            const raw_len = Arithmetic.evaluate(len_eval_str, &lookup.f) catch return error.ArithmeticError;
+            const raw_len = if (len_eval_str.len == 0) @as(i64, 0) else Arithmetic.evaluate(len_eval_str, &lookup.f) catch return error.ArithmeticError;
             if (raw_len < 0) {
                 const end_from_end = @as(i64, @intCast(cp_len)) + raw_len;
                 if (end_from_end < offset) return error.BadSubstitution;
@@ -642,7 +753,7 @@ pub const Expander = struct {
         };
         lookup.env = env_ptr;
 
-        const raw_offset = Arithmetic.evaluate(op.offset, &lookup.f) catch return error.ArithmeticError;
+        const raw_offset = if (op.offset.len == 0) @as(i64, 0) else Arithmetic.evaluate(op.offset, &lookup.f) catch return error.ArithmeticError;
         const params = self.env.positional_params;
         const total: i64 = @intCast(params.len);
 
@@ -659,7 +770,7 @@ pub const Expander = struct {
 
         var end: i64 = total + 1;
         if (op.length) |len_str| {
-            const raw_len = Arithmetic.evaluate(len_str, &lookup.f) catch return error.ArithmeticError;
+            const raw_len = if (len_str.len == 0) @as(i64, 0) else Arithmetic.evaluate(len_str, &lookup.f) catch return error.ArithmeticError;
             if (raw_len < 0) {
                 end = total + 1 + raw_len;
             } else {
@@ -688,6 +799,67 @@ pub const Expander = struct {
         return result.toOwnedSlice(self.alloc);
     }
 
+    fn substringArray(self: *Expander, op: ast.SubstringOp, base_name: []const u8) ExpandError![]const u8 {
+        const elems = self.env.getArray(base_name) orelse return try self.alloc.dupe(u8, "");
+        const total: i64 = @intCast(elems.len);
+
+        const env_ptr = self.env;
+        const lookup = struct {
+            var env: *Environment = undefined;
+            fn f(name: []const u8) ?[]const u8 {
+                return env.get(name);
+            }
+        };
+        lookup.env = env_ptr;
+
+        const raw_offset = if (op.offset.len == 0) @as(i64, 0) else Arithmetic.evaluate(op.offset, &lookup.f) catch return error.ArithmeticError;
+        var start: i64 = raw_offset;
+        if (start < 0) {
+            start = total + start;
+            if (start < 0) start = 0;
+        }
+
+        var end: i64 = total;
+        if (op.length) |len_str| {
+            if (len_str.len == 0) {
+                end = start;
+            } else {
+                const raw_len = Arithmetic.evaluate(len_str, &lookup.f) catch return error.ArithmeticError;
+                if (raw_len < 0) {
+                    end = total + raw_len;
+                } else {
+                    end = start + raw_len;
+                }
+            }
+        }
+
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        var first = true;
+        var idx: i64 = start;
+        while (idx < end and idx < total) : (idx += 1) {
+            if (idx < 0) continue;
+            if (!first) result.append(self.alloc, ' ') catch {};
+            result.appendSlice(self.alloc, elems[@intCast(idx)]) catch {};
+            first = false;
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
+    fn getIfsSep(self: *Expander) []const u8 {
+        const ifs = self.env.get("IFS") orelse " \t\n";
+        if (ifs.len > 0) return ifs[0..1];
+        return "";
+    }
+
+    fn joinPositionalParams(self: *Expander, sep: []const u8) ExpandError![]const u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        for (self.env.positional_params, 0..) |p, i| {
+            if (i > 0) try result.appendSlice(self.alloc, sep);
+            try result.appendSlice(self.alloc, p);
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
     fn cpToByteOffset(s: []const u8, cp_target: usize) usize {
         var cp_count: usize = 0;
         var byte_idx: usize = 0;
@@ -712,6 +884,8 @@ pub const Expander = struct {
     fn expandCaseConv(self: *Expander, op: ast.CaseConvOp) ExpandError![]const u8 {
         const val = self.getParamValue(op.name) orelse "";
         if (val.len == 0) return try self.alloc.dupe(u8, val);
+        const pat = if (op.pattern) |p| try self.expandPattern(p) else null;
+        defer if (pat) |p| self.alloc.free(p);
         var result: std.ArrayListUnmanaged(u8) = .empty;
         var i: usize = 0;
         var first = true;
@@ -732,7 +906,17 @@ pub const Expander = struct {
                 .upper_first, .lower_first => first,
                 .upper_all, .lower_all => true,
             };
-            if (should_convert and byte_len == 1) {
+            const matches_pattern = if (pat) |p| blk: {
+                if (byte_len == 1) {
+                    const target_ch: [1]u8 = .{switch (op.mode) {
+                        .upper_first, .upper_all => std.ascii.toLower(val[i]),
+                        .lower_first, .lower_all => std.ascii.toUpper(val[i]),
+                    }};
+                    break :blk glob.fnmatch(p, &target_ch);
+                }
+                break :blk false;
+            } else true;
+            if (should_convert and byte_len == 1 and matches_pattern) {
                 switch (op.mode) {
                     .upper_first, .upper_all => try result.append(self.alloc, std.ascii.toUpper(val[i])),
                     .lower_first, .lower_all => try result.append(self.alloc, std.ascii.toLower(val[i])),
@@ -750,7 +934,11 @@ pub const Expander = struct {
         if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
             return self.expandTransformSpecial(op);
         }
-        const val = self.getParamValue(op.name) orelse "";
+        const maybe_val = self.getParamValue(op.name);
+        if (maybe_val == null and (op.operator == 'Q' or op.operator == 'a')) {
+            return try self.alloc.dupe(u8, "");
+        }
+        const val = maybe_val orelse "";
         switch (op.operator) {
             'P' => {
                 return self.expandPromptWithShellExpansion(val);
@@ -828,6 +1016,44 @@ pub const Expander = struct {
                 }
                 return result.toOwnedSlice(self.alloc);
             },
+            'u' => {
+                if (val.len == 0) return try self.alloc.dupe(u8, "");
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                const byte_len = std.unicode.utf8ByteSequenceLength(val[0]) catch 1;
+                const first_end = @min(byte_len, val.len);
+                if (first_end == 1) {
+                    try result.append(self.alloc, std.ascii.toUpper(val[0]));
+                } else {
+                    try result.appendSlice(self.alloc, val[0..first_end]);
+                }
+                if (first_end < val.len) try result.appendSlice(self.alloc, val[first_end..]);
+                return result.toOwnedSlice(self.alloc);
+            },
+            'U' => {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                for (val) |ch| {
+                    try result.append(self.alloc, std.ascii.toUpper(ch));
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
+            'L' => {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                for (val) |ch| {
+                    try result.append(self.alloc, std.ascii.toLower(ch));
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
+            'a' => {
+                var result: std.ArrayListUnmanaged(u8) = .empty;
+                if (self.env.vars.get(op.name)) |variable| {
+                    if (variable.exported) try result.append(self.alloc, 'x');
+                    if (variable.readonly) try result.append(self.alloc, 'r');
+                    if (variable.integer) try result.append(self.alloc, 'i');
+                    if (variable.lowercase) try result.append(self.alloc, 'l');
+                    if (variable.uppercase) try result.append(self.alloc, 'u');
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
             else => return try self.alloc.dupe(u8, val),
         }
     }
@@ -860,6 +1086,33 @@ pub const Expander = struct {
                 },
                 else => try result.appendSlice(self.alloc, param),
             }
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
+    fn expandPrefixList(self: *Expander, op: ast.PrefixListOp) ExpandError![]const u8 {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        var iter = self.env.vars.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, op.prefix)) {
+                try names.append(self.alloc, entry.key_ptr.*);
+            }
+        }
+        const items = names.items;
+        std.mem.sort([]const u8, items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        if (items.len == 0) return try self.alloc.dupe(u8, "");
+        const sep: []const u8 = if (op.join) blk: {
+            const ifs = self.env.get("IFS") orelse " \t\n";
+            break :blk if (ifs.len > 0) ifs[0..1] else "";
+        } else " ";
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        for (items, 0..) |name, idx| {
+            if (idx > 0) try result.appendSlice(self.alloc, sep);
+            try result.appendSlice(self.alloc, name);
         }
         return result.toOwnedSlice(self.alloc);
     }
@@ -1459,11 +1712,18 @@ pub const Expander = struct {
 
             var lexer = Lexer.init(cs.body);
             var parser = Parser.init(self.alloc, &lexer) catch posix.exit(2);
-            const program = parser.parseProgram() catch posix.exit(2);
+            parser.env = self.env;
 
             const Executor = @import("executor.zig").Executor;
             var executor = Executor.init(self.alloc, self.env, self.jobs);
-            const status = executor.executeProgram(program);
+            var status: u8 = 0;
+            while (true) {
+                const cmd = parser.parseOneCommand() catch posix.exit(2);
+                if (cmd == null) break;
+                status = executor.executeCompleteCommand(cmd.?);
+                self.env.last_exit_status = status;
+                if (self.env.should_exit) break;
+            }
             posix.exit(status);
         }
 
@@ -1690,6 +1950,17 @@ pub const Expander = struct {
     fn expandParameterWithSplitInfo(self: *Expander, param: ast.ParameterExp) ExpandError!SplitInfo {
         switch (param) {
             .default => |op| {
+                if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
+                    const params = self.env.positional_params;
+                    if (params.len == 0) return try self.expandWordWithSplitInfoParamContext(op.word);
+                    const sep = if (std.mem.eql(u8, op.name, "*")) self.getIfsSep() else " ";
+                    const joined = try self.joinPositionalParams(sep);
+                    if (op.colon and joined.len == 0) {
+                        self.alloc.free(joined);
+                        return try self.expandWordWithSplitInfoParamContext(op.word);
+                    }
+                    return self.makeSplitInfoUniform(joined, true, true);
+                }
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
                     return try self.expandWordWithSplitInfoParamContext(op.word);
@@ -1708,6 +1979,23 @@ pub const Expander = struct {
                 return self.makeSplitInfoUniform(v, true, true);
             },
             .alternative => |op| {
+                if (std.mem.eql(u8, op.name, "@") or std.mem.eql(u8, op.name, "*")) {
+                    const params = self.env.positional_params;
+                    if (params.len == 0) {
+                        const v = try self.alloc.dupe(u8, "");
+                        return self.makeSplitInfoUniform(v, true, true);
+                    }
+                    if (op.colon) {
+                        const sep = if (std.mem.eql(u8, op.name, "*")) self.getIfsSep() else " ";
+                        const joined = try self.joinPositionalParams(sep);
+                        defer self.alloc.free(joined);
+                        if (joined.len == 0) {
+                            const v = try self.alloc.dupe(u8, "");
+                            return self.makeSplitInfoUniform(v, true, true);
+                        }
+                    }
+                    return try self.expandWordWithSplitInfoParamContext(op.word);
+                }
                 const val = self.getParamValue(op.name);
                 if (val != null and (!op.colon or val.?.len > 0)) {
                     return try self.expandWordWithSplitInfoParamContext(op.word);
@@ -1873,6 +2161,38 @@ pub const Expander = struct {
         return pattern.toOwnedSlice(self.alloc);
     }
 
+    fn filterGlobIgnore(self: *Expander, results: []const []const u8) ExpandError![]const []const u8 {
+        const globignore = self.env.get("GLOBIGNORE") orelse return results;
+        if (globignore.len == 0) return results;
+        var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+        var start: usize = 0;
+        var in_bracket = false;
+        for (globignore, 0..) |ch, idx| {
+            if (ch == '[' and !in_bracket) {
+                in_bracket = true;
+            } else if (ch == ']' and in_bracket) {
+                in_bracket = false;
+            } else if (ch == ':' and !in_bracket) {
+                if (idx > start) try patterns.append(self.alloc, globignore[start..idx]);
+                start = idx + 1;
+            }
+        }
+        if (start < globignore.len) try patterns.append(self.alloc, globignore[start..]);
+
+        var filtered: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (results) |path| {
+            var ignored = false;
+            for (patterns.items) |pattern| {
+                if (glob.fnmatchPathname(pattern, path)) {
+                    ignored = true;
+                    break;
+                }
+            }
+            if (!ignored) try filtered.append(self.alloc, path);
+        }
+        return filtered.toOwnedSlice(self.alloc);
+    }
+
     fn isGlobSpecial(ch: u8) bool {
         return ch == '*' or ch == '?' or ch == '[' or ch == ']' or ch == '\\' or ch == '-' or ch == ':';
     }
@@ -1914,6 +2234,30 @@ pub const Expander = struct {
         inner_index: usize,
     };
 
+    fn isAtName(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "@")) return true;
+        if (parseArraySubscript(name)) |arr| {
+            return std.mem.eql(u8, arr.subscript, "@");
+        }
+        return false;
+    }
+
+    fn isParamAt(param: ast.ParameterExp) bool {
+        return switch (param) {
+            .special => |ch| ch == '@',
+            .simple => |name| isAtName(name),
+            .pattern_sub => |op| isAtName(op.name),
+            .substring => |op| isAtName(op.name),
+            .prefix_strip => |op| isAtName(op.name),
+            .prefix_strip_long => |op| isAtName(op.name),
+            .suffix_strip => |op| isAtName(op.name),
+            .suffix_strip_long => |op| isAtName(op.name),
+            .case_conv => |op| isAtName(op.name),
+            .transform => |op| isAtName(op.name),
+            else => false,
+        };
+    }
+
     fn findQuotedAt(word: ast.Word) ?QuotedAtInfo {
         for (word.parts, 0..) |part, pi| {
             switch (part) {
@@ -1921,12 +2265,7 @@ pub const Expander = struct {
                     for (inner_parts, 0..) |inner, ii| {
                         switch (inner) {
                             .parameter => |param| {
-                                switch (param) {
-                                    .special => |ch| {
-                                        if (ch == '@') return .{ .part_index = pi, .inner_index = ii };
-                                    },
-                                    else => {},
-                                }
+                                if (isParamAt(param)) return .{ .part_index = pi, .inner_index = ii };
                             },
                             else => {},
                         }
@@ -1939,9 +2278,6 @@ pub const Expander = struct {
     }
 
     fn expandQuotedAtWord(self: *Expander, word: ast.Word, at_info: QuotedAtInfo, fields: *std.ArrayListUnmanaged([]const u8)) ExpandError!void {
-        const params = self.env.positional_params;
-        if (params.len == 0) return;
-
         const dq_parts = word.parts[at_info.part_index].double_quoted;
 
         var prefix: std.ArrayListUnmanaged(u8) = .empty;
@@ -1964,13 +2300,220 @@ pub const Expander = struct {
             try suffix.appendSlice(self.alloc, expanded);
         }
 
-        for (params, 0..) |param, i| {
+        const at_param = dq_parts[at_info.inner_index].parameter;
+        const selected = try self.selectPositionalParams(at_param);
+        if (selected.len == 0) {
+            if (prefix.items.len > 0 or suffix.items.len > 0) {
+                var combined: std.ArrayListUnmanaged(u8) = .empty;
+                try combined.appendSlice(self.alloc, prefix.items);
+                try combined.appendSlice(self.alloc, suffix.items);
+                try fields.append(self.alloc, try combined.toOwnedSlice(self.alloc));
+            }
+            return;
+        }
+        for (selected, 0..) |param, i| {
             var field: std.ArrayListUnmanaged(u8) = .empty;
             if (i == 0) try field.appendSlice(self.alloc, prefix.items);
-            try field.appendSlice(self.alloc, param);
-            if (i == params.len - 1) try field.appendSlice(self.alloc, suffix.items);
+            const transformed = try self.applyParamOpToValue(at_param, param);
+            try field.appendSlice(self.alloc, transformed);
+            if (i == selected.len - 1) try field.appendSlice(self.alloc, suffix.items);
             try fields.append(self.alloc, try field.toOwnedSlice(self.alloc));
         }
+    }
+
+    fn selectPositionalParams(self: *Expander, param: ast.ParameterExp) ExpandError![]const []const u8 {
+        switch (param) {
+            .simple => |name| {
+                if (parseArraySubscript(name)) |arr| {
+                    return self.env.getArray(arr.base) orelse &.{};
+                }
+                return self.env.positional_params;
+            },
+            .substring => |op| {
+                if (parseArraySubscript(op.name)) |arr| {
+                    return try self.selectArraySlice(op, arr.base);
+                }
+
+                const env_ptr = self.env;
+                const lookup = struct {
+                    var env: *Environment = undefined;
+                    fn f(name: []const u8) ?[]const u8 {
+                        return env.get(name);
+                    }
+                };
+                lookup.env = env_ptr;
+
+                const raw_offset = Arithmetic.evaluate(op.offset, &lookup.f) catch return error.ArithmeticError;
+                const params = self.env.positional_params;
+                const total: i64 = @intCast(params.len);
+
+                var start: i64 = raw_offset;
+                var include_zero = false;
+                if (start <= 0) {
+                    include_zero = true;
+                    if (start < 0) {
+                        start = total + 1 + start;
+                        if (start < 0) start = 0;
+                        include_zero = false;
+                    }
+                }
+
+                var end: i64 = total + 1;
+                if (op.length) |len_str| {
+                    const raw_len = Arithmetic.evaluate(len_str, &lookup.f) catch return error.ArithmeticError;
+                    if (raw_len < 0) {
+                        end = total + 1 + raw_len;
+                    } else {
+                        end = start + raw_len;
+                    }
+                }
+
+                var result: std.ArrayListUnmanaged([]const u8) = .empty;
+                if (include_zero and start == 0) {
+                    if (end > 0) {
+                        try result.append(self.alloc, self.env.shell_name);
+                        start = 1;
+                    }
+                }
+                var idx: i64 = if (start < 1) 1 else start;
+                while (idx < end and idx <= total) : (idx += 1) {
+                    try result.append(self.alloc, params[@intCast(idx - 1)]);
+                }
+                return result.toOwnedSlice(self.alloc);
+            },
+            else => {
+                const name = switch (param) {
+                    .pattern_sub => |op| op.name,
+                    .prefix_strip => |op| op.name,
+                    .prefix_strip_long => |op| op.name,
+                    .suffix_strip => |op| op.name,
+                    .suffix_strip_long => |op| op.name,
+                    .case_conv => |op| op.name,
+                    else => return self.env.positional_params,
+                };
+                if (parseArraySubscript(name)) |arr| {
+                    return self.env.getArray(arr.base) orelse &.{};
+                }
+                return self.env.positional_params;
+            },
+        }
+    }
+
+    fn selectArraySlice(self: *Expander, op: ast.SubstringOp, base_name: []const u8) ExpandError![]const []const u8 {
+        const elems = self.env.getArray(base_name) orelse return &.{};
+        const total: i64 = @intCast(elems.len);
+
+        const env_ptr = self.env;
+        const lookup = struct {
+            var env: *Environment = undefined;
+            fn f(name: []const u8) ?[]const u8 {
+                return env.get(name);
+            }
+        };
+        lookup.env = env_ptr;
+
+        const raw_offset = if (op.offset.len == 0) @as(i64, 0) else Arithmetic.evaluate(op.offset, &lookup.f) catch return error.ArithmeticError;
+        var start: i64 = raw_offset;
+        if (start < 0) {
+            start = total + start;
+            if (start < 0) start = 0;
+        }
+
+        var end: i64 = total;
+        if (op.length) |len_str| {
+            if (len_str.len == 0) {
+                end = start;
+            } else {
+                const raw_len = Arithmetic.evaluate(len_str, &lookup.f) catch return error.ArithmeticError;
+                if (raw_len < 0) {
+                    end = total + raw_len;
+                } else {
+                    end = start + raw_len;
+                }
+            }
+        }
+
+        var result: std.ArrayListUnmanaged([]const u8) = .empty;
+        var idx: i64 = start;
+        while (idx < end and idx < total) : (idx += 1) {
+            if (idx < 0) continue;
+            try result.append(self.alloc, elems[@intCast(idx)]);
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
+    fn applyParamOpToValue(self: *Expander, param: ast.ParameterExp, val: []const u8) ExpandError![]const u8 {
+        switch (param) {
+            .special => return try self.alloc.dupe(u8, val),
+            .pattern_sub => |op| {
+                if (val.len == 0) return try self.alloc.dupe(u8, "");
+                const pat = try self.expandPattern(op.pattern);
+                defer self.alloc.free(pat);
+                if (pat.len == 0) return try self.alloc.dupe(u8, val);
+                const rep = try self.expandWord(op.replacement);
+                defer self.alloc.free(rep);
+                return self.patternSubStr(val, pat, rep, op.mode);
+            },
+            .prefix_strip => |op| return try self.stripStr(val, op.pattern, .prefix_short),
+            .prefix_strip_long => |op| return try self.stripStr(val, op.pattern, .prefix_long),
+            .suffix_strip => |op| return try self.stripStr(val, op.pattern, .suffix_short),
+            .suffix_strip_long => |op| return try self.stripStr(val, op.pattern, .suffix_long),
+            .case_conv => |op| return try self.caseConvStr(val, op.mode),
+            else => return try self.alloc.dupe(u8, val),
+        }
+    }
+
+    fn stripStr(self: *Expander, val: []const u8, pattern: ast.Word, mode: StripMode) ExpandError![]const u8 {
+        const pat = try self.expandPattern(pattern);
+        defer self.alloc.free(pat);
+        switch (mode) {
+            .prefix_short => {
+                var i: usize = 0;
+                while (i <= val.len) {
+                    if (glob.fnmatch(pat, val[0..i])) return try self.alloc.dupe(u8, val[i..]);
+                    if (i >= val.len) break;
+                    i += utf8SeqLen(val[i]);
+                }
+            },
+            .prefix_long => {
+                var i: usize = val.len;
+                while (true) {
+                    if (glob.fnmatch(pat, val[0..i])) return try self.alloc.dupe(u8, val[i..]);
+                    if (i == 0) break;
+                    i = prevUtf8Boundary(val, i);
+                }
+            },
+            .suffix_short => {
+                var i: usize = val.len;
+                while (true) {
+                    if (glob.fnmatch(pat, val[i..])) return try self.alloc.dupe(u8, val[0..i]);
+                    if (i == 0) break;
+                    i = prevUtf8Boundary(val, i);
+                }
+            },
+            .suffix_long => {
+                var i: usize = 0;
+                while (i <= val.len) {
+                    if (glob.fnmatch(pat, val[i..])) return try self.alloc.dupe(u8, val[0..i]);
+                    if (i >= val.len) break;
+                    i += utf8SeqLen(val[i]);
+                }
+            },
+        }
+        return try self.alloc.dupe(u8, val);
+    }
+
+    fn caseConvStr(self: *Expander, val: []const u8, mode: ast.CaseConvMode) ExpandError![]const u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        for (val, 0..) |ch, i| {
+            switch (mode) {
+                .lower_all => try result.append(self.alloc, std.ascii.toLower(ch)),
+                .upper_all => try result.append(self.alloc, std.ascii.toUpper(ch)),
+                .lower_first => try result.append(self.alloc, if (i == 0) std.ascii.toLower(ch) else ch),
+                .upper_first => try result.append(self.alloc, if (i == 0) std.ascii.toUpper(ch) else ch),
+            }
+        }
+        return result.toOwnedSlice(self.alloc);
     }
 
     const UnquotedAtInfo = struct {
@@ -1981,12 +2524,7 @@ pub const Expander = struct {
         for (word.parts, 0..) |part, pi| {
             switch (part) {
                 .parameter => |param| {
-                    switch (param) {
-                        .special => |ch| {
-                            if (ch == '@' or ch == '*') return .{ .part_index = pi };
-                        },
-                        else => {},
-                    }
+                    if (isParamAt(param)) return .{ .part_index = pi };
                 },
                 else => {},
             }
@@ -1995,7 +2533,8 @@ pub const Expander = struct {
     }
 
     fn expandUnquotedAtWord(self: *Expander, word: ast.Word, info: UnquotedAtInfo, fields: *std.ArrayListUnmanaged([]const u8)) ExpandError!void {
-        const params = self.env.positional_params;
+        const at_param = word.parts[info.part_index].parameter;
+        const params = self.selectPositionalParams(at_param) catch self.env.positional_params;
 
         var prefix: std.ArrayListUnmanaged(u8) = .empty;
         for (word.parts[0..info.part_index]) |part| {
@@ -2040,15 +2579,27 @@ pub const Expander = struct {
             }
 
             if (!self.env.options.noglob) {
+                const has_globignore2 = if (self.env.get("GLOBIGNORE")) |gi| gi.len > 0 else false;
                 for (split_fields) |sf| {
-                    const globbed = glob.expand(self.alloc, sf) catch {
-                        try fields.append(self.alloc, sf);
-                        continue;
-                    };
+                    const globbed = if (has_globignore2)
+                        glob.expandDotglob(self.alloc, sf) catch {
+                            try fields.append(self.alloc, sf);
+                            continue;
+                        }
+                    else
+                        glob.expand(self.alloc, sf) catch {
+                            try fields.append(self.alloc, sf);
+                            continue;
+                        };
                     if (globbed.len == 1 and std.mem.eql(u8, globbed[0], sf)) {
                         try fields.append(self.alloc, sf);
                     } else {
-                        try fields.appendSlice(self.alloc, globbed);
+                        const filtered = try self.filterGlobIgnore(globbed);
+                        if (filtered.len == 0) {
+                            if (!self.env.shopt.nullglob) try fields.append(self.alloc, sf);
+                        } else {
+                            try fields.appendSlice(self.alloc, filtered);
+                        }
                     }
                 }
             } else {

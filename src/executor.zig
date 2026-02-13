@@ -314,14 +314,28 @@ pub const Executor = struct {
 
         const saved_exit = self.env.last_exit_status;
         for (simple.assigns) |assign| {
+            if (assign.array_values) |arr_words| {
+                if (simple.words.len == 0) {
+                    var elems: std.ArrayListUnmanaged([]const u8) = .empty;
+                    for (arr_words) |w| {
+                        const expanded = expander.expandWordsToFields(&.{w}) catch continue;
+                        for (expanded) |field| {
+                            elems.append(self.alloc, field) catch {};
+                        }
+                    }
+                    const elements = elems.toOwnedSlice(self.alloc) catch continue;
+                    self.env.setArray(assign.name, elements) catch {};
+                }
+                continue;
+            }
             const value = expander.expandWord(assign.value) catch |err| {
                 if (err == error.UnsetVariable and self.env.options.nounset) {
                     self.env.abort_line = self.current_line;
                     if (!self.env.options.interactive) {
                         self.env.should_exit = true;
-                        self.env.exit_value = 2;
+                        self.env.exit_value = 1;
                     }
-                    return 2;
+                    return 1;
                 }
                 continue;
             };
@@ -385,10 +399,10 @@ pub const Executor = struct {
                         self.env.abort_line = self.current_line;
                         if (!self.env.options.interactive) {
                             self.env.should_exit = true;
-                            self.env.exit_value = 2;
+                            self.env.exit_value = 1;
                         }
                     }
-                    return 2;
+                    return 1;
                 } else if (err == error.ArithmeticError) {
                     posix.writeAll(2, "zigsh: arithmetic syntax error\n");
                     if (!self.env.options.interactive) {
@@ -409,17 +423,6 @@ pub const Executor = struct {
                 }
             }
             return self.env.last_exit_status;
-        }
-
-        if (self.env.getAlias(fields[0])) |alias_val| {
-            var alias_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer alias_buf.deinit(self.alloc);
-            alias_buf.appendSlice(self.alloc, alias_val) catch return 1;
-            for (fields[1..]) |f| {
-                alias_buf.append(self.alloc, ' ') catch return 1;
-                alias_buf.appendSlice(self.alloc, f) catch return 1;
-            }
-            return self.executeInline(alias_buf.items);
         }
 
         if (self.env.options.xtrace) {
@@ -501,67 +504,38 @@ pub const Executor = struct {
         } else if (std.mem.eql(u8, cmd_name, "fc")) {
             status = self.executeFcBuiltin(fields);
         } else if (self.env.functions.get(cmd_name) != null and !isSpecialBuiltin(cmd_name)) {
-            var func_saved: [16]struct { name: []const u8, old_val: ?[]const u8, was_exported: bool } = undefined;
-            var func_n_saved: usize = 0;
-            if (simple.assigns.len > 0) {
+            const has_temp_assigns = simple.assigns.len > 0;
+            if (has_temp_assigns) {
+                self.env.pushScope() catch {};
                 for (simple.assigns) |assign| {
                     const value = expander.expandWord(assign.value) catch "";
-                    if (func_n_saved < 16) {
-                        const existing = self.env.vars.get(assign.name);
-                        func_saved[func_n_saved] = .{
-                            .name = assign.name,
-                            .old_val = if (existing) |e| e.value else null,
-                            .was_exported = if (existing) |e| e.exported else false,
-                        };
-                        func_n_saved += 1;
-                    }
+                    self.env.declareLocal(assign.name) catch {};
                     self.env.set(assign.name, value, false) catch {};
                 }
             }
             status = self.executeFunction(cmd_name, fields);
-            var ri: usize = func_n_saved;
-            while (ri > 0) {
-                ri -= 1;
-                if (func_saved[ri].old_val) |old| {
-                    self.env.set(func_saved[ri].name, old, func_saved[ri].was_exported) catch {};
-                } else {
-                    _ = self.env.unset(func_saved[ri].name);
-                }
+            if (has_temp_assigns) {
+                self.env.popScope();
             }
         } else if (builtins.lookup(cmd_name)) |builtin_fn| {
-            var saved_vars: [16]struct { name: []const u8, old_val: ?[]const u8, was_exported: bool } = undefined;
-            var n_saved: usize = 0;
             const is_special = isSpecialBuiltin(cmd_name);
-            if (simple.assigns.len > 0 and simple.words.len > 0) {
+            const has_temp = simple.assigns.len > 0 and simple.words.len > 0 and !is_special;
+            if (has_temp) {
+                self.env.pushScope() catch {};
                 for (simple.assigns) |assign| {
                     const value = expander.expandWord(assign.value) catch "";
-                    if (!is_special and n_saved < 16) {
-                        const existing = self.env.vars.get(assign.name);
-                        saved_vars[n_saved] = .{
-                            .name = assign.name,
-                            .old_val = if (existing) |e| e.value else null,
-                            .was_exported = if (existing) |e| e.exported else false,
-                        };
-                        n_saved += 1;
-                    }
+                    self.env.declareLocal(assign.name) catch {};
+                    self.env.set(assign.name, value, false) catch {};
+                }
+            } else if (simple.assigns.len > 0 and simple.words.len > 0) {
+                for (simple.assigns) |assign| {
+                    const value = expander.expandWord(assign.value) catch "";
                     self.env.set(assign.name, value, false) catch {};
                 }
             }
             status = builtin_fn(fields, self.env);
-            if (!is_special) {
-                var i: usize = n_saved;
-                while (i > 0) {
-                    i -= 1;
-                    if (saved_vars[i].old_val) |old| {
-                        self.env.set(saved_vars[i].name, old, saved_vars[i].was_exported) catch {};
-                    } else {
-                        _ = self.env.unset(saved_vars[i].name);
-                    }
-                }
-            }
-            if (status != 0 and is_special and !self.env.options.interactive and !std.mem.eql(u8, cmd_name, "unset")) {
-                self.env.should_exit = true;
-                self.env.exit_value = status;
+            if (has_temp) {
+                self.env.popScope();
             }
         } else {
             status = self.executeExternal(fields, simple.assigns, &expander);
@@ -619,7 +593,27 @@ pub const Executor = struct {
                 return 2;
             }
         }
-        const source = self.env.alloc.dupe(u8, fd.source) catch return 1;
+        var has_heredoc = false;
+        for (fd.body.redirects) |redir| {
+            if (redir.op == .heredoc or redir.op == .heredoc_strip) {
+                has_heredoc = true;
+                break;
+            }
+        }
+        const source = if (has_heredoc) blk: {
+            var src: std.ArrayListUnmanaged(u8) = .empty;
+            src.appendSlice(self.env.alloc, fd.source) catch return 1;
+            for (fd.body.redirects) |redir| {
+                if (redir.op == .heredoc or redir.op == .heredoc_strip) {
+                    const hd = redir.target.heredoc;
+                    src.append(self.env.alloc, '\n') catch return 1;
+                    src.appendSlice(self.env.alloc, hd.body_ptr.*) catch return 1;
+                    src.appendSlice(self.env.alloc, hd.delimiter) catch return 1;
+                    src.append(self.env.alloc, '\n') catch return 1;
+                }
+            }
+            break :blk src.toOwnedSlice(self.env.alloc) catch return 1;
+        } else self.env.alloc.dupe(u8, fd.source) catch return 1;
         const name = self.env.alloc.dupe(u8, fd.name) catch {
             self.env.alloc.free(source);
             return 1;
@@ -858,7 +852,7 @@ pub const Executor = struct {
                     posix.writeAll(2, name);
                     posix.writeAll(2, ": unbound variable\n");
                     env.should_exit = true;
-                    env.exit_value = 2;
+                    env.exit_value = 1;
                 }
                 return null;
             }
@@ -905,12 +899,15 @@ pub const Executor = struct {
                 const lhs = expander.expandWord(t.lhs) catch "";
                 if (std.mem.eql(u8, t.op, "==") or std.mem.eql(u8, t.op, "!=") or std.mem.eql(u8, t.op, "=")) {
                     const rhs = expander.expandPattern(t.rhs) catch "";
-                    const matches = glob.fnmatch(rhs, lhs);
+                    const matches = if (self.env.shopt.nocasematch) glob.fnmatchNoCase(rhs, lhs) else glob.fnmatch(rhs, lhs);
                     if (std.mem.eql(u8, t.op, "!=")) return !matches;
                     return matches;
                 }
                 if (std.mem.eql(u8, t.op, "=~")) {
                     const rhs = expander.expandWord(t.rhs) catch "";
+                    if (self.env.shopt.nocasematch) {
+                        return self.evalRegexMatchNoCase(lhs, rhs);
+                    }
                     return self.evalRegexMatch(lhs, rhs);
                 }
                 const rhs = expander.expandWord(t.rhs) catch "";
@@ -1087,6 +1084,14 @@ pub const Executor = struct {
         return regexMatch(str, pattern);
     }
 
+    fn evalRegexMatchNoCase(self: *Executor, str: []const u8, pattern: []const u8) bool {
+        const lower_str = self.alloc.alloc(u8, str.len) catch return false;
+        const lower_pat = self.alloc.alloc(u8, pattern.len) catch return false;
+        for (str, 0..) |ch, i| lower_str[i] = std.ascii.toLower(ch);
+        for (pattern, 0..) |ch, i| lower_pat[i] = std.ascii.toLower(ch);
+        return regexMatch(lower_str, lower_pat);
+    }
+
     fn regexMatch(str: []const u8, pattern: []const u8) bool {
         if (std.mem.eql(u8, str, pattern)) return true;
         if (pattern.len == 0) return str.len == 0;
@@ -1180,7 +1185,8 @@ pub const Executor = struct {
             if (!matched) {
                 for (item.patterns) |pattern| {
                     const pat_val = expander.expandPattern(pattern) catch continue;
-                    if (glob.fnmatch(pat_val, word_val)) {
+                    const case_match = if (self.env.shopt.nocasematch) glob.fnmatchNoCase(pat_val, word_val) else glob.fnmatch(pat_val, word_val);
+                    if (case_match) {
                         matched = true;
                         break;
                     }
@@ -1210,16 +1216,22 @@ pub const Executor = struct {
     fn executeFunction(self: *Executor, name: []const u8, fields: []const []const u8) u8 {
         const func = self.env.functions.get(name) orelse return 127;
 
+        self.env.pushScope() catch return 1;
+        defer self.env.popScope();
+
         self.env.pushPositionalParams(fields[1..]) catch return 1;
         defer self.env.popPositionalParams();
 
         var lexer = Lexer.init(func.source);
         var parser = Parser.init(self.alloc, &lexer) catch return 2;
-        const program = parser.parseProgram() catch return 2;
+        parser.env = self.env;
 
         var status: u8 = 0;
-        for (program.commands) |cmd| {
-            status = self.executeCompleteCommand(cmd);
+        while (true) {
+            const cmd = parser.parseOneCommand() catch return 2;
+            if (cmd == null) break;
+            status = self.executeCompleteCommand(cmd.?);
+            self.env.last_exit_status = status;
             if (self.env.should_return) {
                 status = self.env.return_value;
                 self.env.should_return = false;
@@ -1495,6 +1507,14 @@ pub const Executor = struct {
         var arg_start: usize = 1;
         if (arg_start < fields.len and std.mem.eql(u8, fields[arg_start], "--")) {
             arg_start += 1;
+        } else if (arg_start < fields.len and fields[arg_start].len > 1 and fields[arg_start][0] == '-' and fields[arg_start][1] != '-') {
+            const opt = fields[arg_start];
+            if (opt.len == 1 or !std.ascii.isDigit(opt[1])) {
+                posix.writeAll(2, "zigsh: eval: ");
+                posix.writeAll(2, opt);
+                posix.writeAll(2, ": invalid option\n");
+                return 2;
+            }
         }
         if (arg_start >= fields.len) return 0;
 
@@ -1613,7 +1633,7 @@ pub const Executor = struct {
                         status = 1;
                     }
                 } else {
-                    status = 127;
+                    status = 1;
                 }
             }
             return status;
@@ -1624,9 +1644,9 @@ pub const Executor = struct {
             for (fields[start..]) |name| {
                 if (self.env.getAlias(name)) |alias_val| {
                     posix.writeAll(1, name);
-                    posix.writeAll(1, " is an alias for ");
+                    posix.writeAll(1, " is an alias for \"");
                     posix.writeAll(1, alias_val);
-                    posix.writeAll(1, "\n");
+                    posix.writeAll(1, "\"\n");
                 } else if (token.reserved_words.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a shell keyword\n");
@@ -1642,9 +1662,9 @@ pub const Executor = struct {
                     posix.writeAll(1, std.mem.sliceTo(path, 0));
                     posix.writeAll(1, "\n");
                 } else {
-                    posix.writeAll(1, name);
-                    posix.writeAll(1, ": not found\n");
-                    status = 127;
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": not found\n");
+                    status = 1;
                 }
             }
             return status;
@@ -1800,21 +1820,63 @@ pub const Executor = struct {
     }
 
     fn executeInline(self: *Executor, source: []const u8) u8 {
-        var lexer = Lexer.init(source);
-        var parser = Parser.init(self.alloc, &lexer) catch return 2;
-        const program = parser.parseProgram() catch return 2;
-        return self.executeProgram(program);
+        return self.executeInlineInterleaved(source);
     }
 
     fn executeInlineSpecial(self: *Executor, source: []const u8) u8 {
+        return self.executeInlineInterleaved(source);
+    }
+
+    fn executeInlineInterleaved(self: *Executor, source: []const u8) u8 {
         var lexer = Lexer.init(source);
-        var parser = Parser.init(self.alloc, &lexer) catch {
-            return 2;
-        };
-        const program = parser.parseProgram() catch {
-            return 2;
-        };
-        return self.executeProgram(program);
+        var parser = Parser.init(self.alloc, &lexer) catch return 2;
+        parser.env = self.env;
+        var status: u8 = 0;
+        while (true) {
+            const cmd = parser.parseOneCommand() catch return 2;
+            if (cmd == null) break;
+            status = self.executeCompleteCommand(cmd.?);
+            self.env.last_exit_status = status;
+            if (self.env.should_exit or self.env.should_return) break;
+        }
+        return status;
+    }
+
+    fn expandTildesInAssignValue(self: *Executor, expanded: []const u8, val_start: usize) ![]const u8 {
+        const val = expanded[val_start..];
+        var need_expand = false;
+        if (val.len > 0 and val[0] == '~') need_expand = true;
+        if (!need_expand) {
+            if (std.mem.indexOf(u8, val, ":~") != null) need_expand = true;
+        }
+        if (!need_expand) return expanded;
+
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        try result.appendSlice(self.alloc, expanded[0..val_start]);
+
+        var i: usize = 0;
+        while (i < val.len) {
+            const at_tilde = (i == 0 or val[i - 1] == ':') and val[i] == '~';
+            if (at_tilde) {
+                var end = i + 1;
+                while (end < val.len and val[end] != '/' and val[end] != ':') : (end += 1) {}
+                const tilde_text = val[i..end];
+                if (tilde_text.len == 1) {
+                    if (self.env.get("HOME")) |home| {
+                        try result.appendSlice(self.alloc, home);
+                    } else {
+                        try result.append(self.alloc, '~');
+                    }
+                } else {
+                    try result.appendSlice(self.alloc, tilde_text);
+                }
+                i = end;
+            } else {
+                try result.append(self.alloc, val[i]);
+                i += 1;
+            }
+        }
+        return result.toOwnedSlice(self.alloc);
     }
 
     fn expandAssignBuiltinArgs(self: *Executor, expander: *Expander, words: []const ast.Word) ExpandError![]const []const u8 {
@@ -1839,23 +1901,7 @@ pub const Executor = struct {
             if (is_assign) {
                 var expanded = try expander.expandWord(word);
                 if (std.mem.indexOf(u8, expanded, "=")) |eq_pos| {
-                    const val = expanded[eq_pos + 1 ..];
-                    if (val.len > 0 and val[0] == '~') {
-                        const slash_pos = std.mem.indexOfScalar(u8, val, '/') orelse val.len;
-                        const tilde_prefix = val[0..slash_pos];
-                        const suffix = val[slash_pos..];
-                        var home: ?[]const u8 = null;
-                        if (tilde_prefix.len == 1) {
-                            home = self.env.get("HOME");
-                        }
-                        if (home) |h| {
-                            const new = try self.alloc.alloc(u8, eq_pos + 1 + h.len + suffix.len);
-                            @memcpy(new[0 .. eq_pos + 1], expanded[0 .. eq_pos + 1]);
-                            @memcpy(new[eq_pos + 1 .. eq_pos + 1 + h.len], h);
-                            @memcpy(new[eq_pos + 1 + h.len ..], suffix);
-                            expanded = new;
-                        }
-                    }
+                    expanded = try self.expandTildesInAssignValue(expanded, eq_pos + 1);
                 }
                 try fields.append(self.alloc, expanded);
             } else {
