@@ -475,13 +475,34 @@ pub const Parser = struct {
             try assigns.append(self.alloc, assign);
         }
 
+        var is_declare = false;
         while (true) {
             if (self.current.tag == .io_number or self.current.tag.isRedirectionOp()) {
                 const redir = try self.parseRedirect();
                 try redirects.append(self.alloc, redir);
+            } else if (self.current.tag == .assignment_word and is_declare) {
+                const text = self.tokenText(self.current);
+                const eq_idx = std.mem.indexOfScalar(u8, text, '=').?;
+                const value_text = text[eq_idx + 1 ..];
+                if (value_text.len == 0) {
+                    const assign = try self.parseAssignment();
+                    if (assign.array_values != null) {
+                        try assigns.append(self.alloc, assign);
+                    } else {
+                        const word = try self.buildWord(text);
+                        try words.append(self.alloc, word);
+                    }
+                } else {
+                    const word = try self.parseWordToken();
+                    try words.append(self.alloc, word);
+                }
             } else if (self.current.tag == .word or self.current.tag == .assignment_word) {
                 if (words.items.len == 0 and (assigns.items.len > 0 or redirects.items.len > 0)) {
                     self.tryAliasExpandWord();
+                }
+                if (words.items.len == 0) {
+                    const text = self.tokenText(self.current);
+                    is_declare = isDeclareBuiltin(text);
                 }
                 const word = try self.parseWordToken();
                 try words.append(self.alloc, word);
@@ -535,6 +556,12 @@ pub const Parser = struct {
 
         const value = try self.buildWordAssign(value_text);
         return .{ .name = name, .value = value, .append = is_append };
+    }
+
+    fn isDeclareBuiltin(name: []const u8) bool {
+        return std.mem.eql(u8, name, "declare") or std.mem.eql(u8, name, "typeset") or
+            std.mem.eql(u8, name, "local") or std.mem.eql(u8, name, "export") or
+            std.mem.eql(u8, name, "readonly");
     }
 
     fn parseWordToken(self: *Parser) ParseError!ast.Word {
@@ -1044,16 +1071,57 @@ pub const Parser = struct {
         }
 
         if (i.* < text.len and text[i.*] == '!') {
+            const bang_pos = i.*;
             const after_bang = i.* + 1;
             if (after_bang < text.len and text[after_bang] == '}') {
                 i.* = after_bang + 1;
                 return .{ .parameter = .{ .special = '!' } };
+            }
+            if (after_bang < text.len and text[after_bang] >= '0' and text[after_bang] <= '9') {
+                i.* = after_bang;
+                while (i.* < text.len and text[i.*] >= '0' and text[i.*] <= '9') : (i.* += 1) {}
+                const indirect_name = text[after_bang..i.*];
+                if (i.* < text.len and text[i.*] == '}') {
+                    i.* += 1;
+                    return .{ .parameter = .{ .indirect = indirect_name } };
+                }
+                if (i.* < text.len and text[i.*] == '[') {
+                    i.* += 1;
+                    while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+                    if (i.* < text.len) i.* += 1;
+                    const name_with_sub = text[after_bang..i.*];
+                    if (i.* < text.len and text[i.*] == '}') {
+                        i.* += 1;
+                        return .{ .parameter = .{ .indirect = name_with_sub } };
+                    }
+                }
+                posix.writeAll(2, "zigsh: bad substitution\n");
+                return error.UnexpectedToken;
+            }
+            if (after_bang < text.len and !std.ascii.isAlphabetic(text[after_bang]) and text[after_bang] != '_') {
+                posix.writeAll(2, "zigsh: bad substitution\n");
+                return error.UnexpectedToken;
             }
             if (after_bang < text.len and (std.ascii.isAlphabetic(text[after_bang]) or text[after_bang] == '_')) {
                 i.* = after_bang;
                 const name_s = i.*;
                 while (i.* < text.len and (std.ascii.isAlphanumeric(text[i.*]) or text[i.*] == '_')) : (i.* += 1) {}
                 const indirect_name = text[name_s..i.*];
+                if (i.* < text.len and text[i.*] == '[') {
+                    i.* += 1;
+                    while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+                    if (i.* < text.len) i.* += 1;
+                    const name_with_sub = text[name_s..i.*];
+                    if (i.* < text.len and text[i.*] == '}') {
+                        i.* += 1;
+                        const bracket_start = std.mem.indexOfScalar(u8, name_with_sub, '[').?;
+                        const subscript = name_with_sub[bracket_start + 1 .. name_with_sub.len - 1];
+                        if (std.mem.eql(u8, subscript, "@") or std.mem.eql(u8, subscript, "*")) {
+                            return .{ .parameter = .{ .array_keys = .{ .prefix = indirect_name, .join = std.mem.eql(u8, subscript, "*") } } };
+                        }
+                        return .{ .parameter = .{ .indirect = name_with_sub } };
+                    }
+                }
                 if (i.* < text.len and text[i.*] == '}') {
                     i.* += 1;
                     return .{ .parameter = .{ .indirect = indirect_name } };
@@ -1065,8 +1133,128 @@ pub const Parser = struct {
                         i.* += 1;
                         return .{ .parameter = .{ .prefix_list = .{ .prefix = indirect_name, .join = join } } };
                     }
+                    i.* -= 1;
                 }
-                i.* = after_bang - 1;
+                {
+                    const name = text[bang_pos..i.*];
+                    if (i.* >= text.len) return .{ .parameter = .{ .simple = name } };
+                    if (text[i.*] == '}') {
+                        i.* += 1;
+                        return .{ .parameter = .{ .simple = name } };
+                    }
+                    if (text[i.*] == '^' or text[i.*] == ',')
+                        return try self.parseCaseConv(text, i, name, in_dquote);
+                    if (text[i.*] == '@' and i.* + 1 < text.len) {
+                        const op_char = text[i.* + 1];
+                        if (i.* + 2 >= text.len or text[i.* + 2] == '}') {
+                            i.* += 2;
+                            if (i.* < text.len and text[i.*] == '}') i.* += 1;
+                            return .{ .parameter = .{ .transform = .{ .name = name, .operator = op_char } } };
+                        }
+                    }
+                    if (text[i.*] == '/')
+                        return try self.parsePatternSub(text, i, name, in_dquote);
+                    const colon = text[i.*] == ':';
+                    if (colon) i.* += 1;
+                    if (i.* >= text.len) return .{ .parameter = .{ .simple = name } };
+                    if (colon and (i.* >= text.len or (text[i.*] != '-' and text[i.*] != '=' and text[i.*] != '?' and text[i.*] != '+'))) {
+                        if (i.* < text.len and text[i.*] == '}') {
+                            const msg = std.fmt.allocPrint(self.alloc, "zigsh: ${{{s}:}}: bad substitution\n", .{name}) catch return error.OutOfMemory;
+                            i.* += 1;
+                            return .{ .parameter = .{ .bad_sub = msg } };
+                        }
+                        return try self.parseSubstring(text, i, name);
+                    }
+                    const op_char = text[i.*];
+                    i.* += 1;
+                    const word_start = i.*;
+                    var depth: u32 = 1;
+                    while (i.* < text.len and depth > 0) {
+                        switch (text[i.*]) {
+                            '}' => {
+                                depth -= 1;
+                                if (depth == 0) break;
+                                i.* += 1;
+                            },
+                            '{' => {
+                                depth += 1;
+                                i.* += 1;
+                            },
+                            '\\' => {
+                                i.* += 1;
+                                if (i.* < text.len) i.* += 1;
+                            },
+                            '\'' => {
+                                if (!in_dquote or op_char == '#' or op_char == '%') {
+                                    i.* += 1;
+                                    while (i.* < text.len and text[i.*] != '\'') : (i.* += 1) {}
+                                    if (i.* < text.len) i.* += 1;
+                                } else {
+                                    i.* += 1;
+                                }
+                            },
+                            '"' => {
+                                i.* += 1;
+                                while (i.* < text.len and text[i.*] != '"') {
+                                    if (text[i.*] == '\\' and i.* + 1 < text.len) i.* += 1;
+                                    i.* += 1;
+                                }
+                                if (i.* < text.len) i.* += 1;
+                            },
+                            '$' => {
+                                i.* += 1;
+                                if (i.* < text.len and text[i.*] == '{') {
+                                    depth += 1;
+                                    i.* += 1;
+                                }
+                            },
+                            else => i.* += 1,
+                        }
+                    }
+                    const word_text = text[word_start..i.*];
+                    if (i.* < text.len) i.* += 1;
+                    return switch (op_char) {
+                        '-' => blk: {
+                            const word = try self.buildWordParamExp(word_text, in_dquote);
+                            break :blk .{ .parameter = .{ .default = .{ .name = name, .colon = colon, .word = word } } };
+                        },
+                        '=' => blk: {
+                            const word = try self.buildWordParamExp(word_text, in_dquote);
+                            break :blk .{ .parameter = .{ .assign = .{ .name = name, .colon = colon, .word = word } } };
+                        },
+                        '?' => blk: {
+                            const word = try self.buildWordParamExp(word_text, in_dquote);
+                            break :blk .{ .parameter = .{ .error_msg = .{ .name = name, .colon = colon, .word = word } } };
+                        },
+                        '+' => blk: {
+                            const word = try self.buildWordParamExp(word_text, in_dquote);
+                            break :blk .{ .parameter = .{ .alternative = .{ .name = name, .colon = colon, .word = word } } };
+                        },
+                        '#' => blk: {
+                            const pat_word = try self.buildWordParamExp(word_text, false);
+                            if (word_text.len > 0 and word_text[0] == '#') {
+                                const inner_word = try self.buildWordParamExp(word_text[1..], false);
+                                break :blk .{ .parameter = .{ .prefix_strip_long = .{ .name = name, .pattern = inner_word } } };
+                            }
+                            break :blk .{ .parameter = .{ .prefix_strip = .{ .name = name, .pattern = pat_word } } };
+                        },
+                        '%' => blk: {
+                            const pat_word = try self.buildWordParamExp(word_text, false);
+                            if (word_text.len > 0 and word_text[0] == '%') {
+                                const inner_word = try self.buildWordParamExp(word_text[1..], false);
+                                break :blk .{ .parameter = .{ .suffix_strip_long = .{ .name = name, .pattern = inner_word } } };
+                            }
+                            break :blk .{ .parameter = .{ .suffix_strip = .{ .name = name, .pattern = pat_word } } };
+                        },
+                        else => blk: {
+                            if (!std.ascii.isAlphanumeric(op_char) and op_char != '_') {
+                                posix.writeAll(2, "zigsh: bad substitution\n");
+                                return error.UnexpectedToken;
+                            }
+                            break :blk .{ .parameter = .{ .simple = name } };
+                        },
+                    };
+                }
             }
         }
 

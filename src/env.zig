@@ -37,6 +37,7 @@ pub const Environment = struct {
     dir_stack: std.ArrayListUnmanaged([]const u8),
     scope_stack: std.ArrayListUnmanaged(ScopeFrame),
     arrays: std.StringHashMap([]const []const u8),
+    function_name_stack: std.ArrayListUnmanaged([]const u8),
 
     pub const Variable = struct {
         value: []const u8,
@@ -184,6 +185,7 @@ pub const Environment = struct {
             .dir_stack = .empty,
             .scope_stack = .empty,
             .arrays = std.StringHashMap([]const []const u8).init(alloc),
+            .function_name_stack = .empty,
         };
 
         env.importEnviron();
@@ -380,6 +382,42 @@ pub const Environment = struct {
         try self.arrays.put(owned_name, owned_elems);
         const scalar = if (elements.len > 0) elements[0] else "";
         self.set(name, scalar, false) catch {};
+    }
+
+    pub fn setArrayElement(self: *Environment, name: []const u8, index: usize, value: []const u8) !void {
+        const owned_value = try self.alloc.dupe(u8, value);
+        if (self.arrays.getPtr(name)) |elems_ptr| {
+            var elems = elems_ptr.*;
+            if (index < elems.len) {
+                @constCast(elems)[index] = owned_value;
+            } else {
+                var new_elems = try self.alloc.alloc([]const u8, index + 1);
+                for (0..new_elems.len) |i| {
+                    if (i < elems.len) {
+                        new_elems[i] = elems[i];
+                    } else if (i == index) {
+                        new_elems[i] = owned_value;
+                    } else {
+                        new_elems[i] = "";
+                    }
+                }
+                elems_ptr.* = new_elems;
+            }
+            if (index == 0) self.set(name, owned_value, false) catch {};
+        } else {
+            var new_elems = try self.alloc.alloc([]const u8, index + 1);
+            for (0..new_elems.len) |i| {
+                if (i == index) {
+                    new_elems[i] = owned_value;
+                } else {
+                    new_elems[i] = "";
+                }
+            }
+            const owned_name = try self.alloc.dupe(u8, name);
+            try self.arrays.put(owned_name, new_elems);
+            const scalar = new_elems[0];
+            self.set(name, scalar, false) catch {};
+        }
     }
 
     pub fn getArray(self: *const Environment, name: []const u8) ?[]const []const u8 {

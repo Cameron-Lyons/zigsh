@@ -218,7 +218,13 @@ pub const Expander = struct {
         return .{ .base = name[0..bracket], .subscript = name[bracket + 1 .. name.len - 1] };
     }
 
-    fn getParamValue(self: *Expander, name: []const u8) ?[]const u8 {
+    fn getParamValue(self: *Expander, raw_name: []const u8) ?[]const u8 {
+        const name = if (raw_name.len > 1 and raw_name[0] == '!') blk: {
+            const ref = raw_name[1..];
+            const target = self.env.get(ref) orelse return null;
+            if (target.len == 0) return null;
+            break :blk target;
+        } else raw_name;
         if (name.len > 0 and name[0] >= '0' and name[0] <= '9') {
             const n = std.fmt.parseInt(u32, name, 10) catch return null;
             if (n == 0) return self.env.shell_name;
@@ -236,7 +242,7 @@ pub const Expander = struct {
                 }
                 return self.env.get(arr.base);
             }
-            const idx = std.fmt.parseInt(i64, arr.subscript, 10) catch return self.env.get(arr.base);
+            const idx = self.evalSubscript(arr.subscript) orelse return self.env.get(arr.base);
             if (self.env.getArray(arr.base)) |elems| {
                 const i: usize = if (idx < 0) blk: {
                     const adj = @as(i64, @intCast(elems.len)) + idx;
@@ -284,9 +290,11 @@ pub const Expander = struct {
                     }
                     return try self.alloc.dupe(u8, "");
                 }
-                if (self.env.get(name)) |val| return try self.alloc.dupe(u8, val);
+                if (self.getParamValue(name)) |val| return try self.alloc.dupe(u8, val);
                 if (self.expandDynamic(name)) |val| return val;
                 if (self.env.options.nounset) {
+                    const base = if (parseArraySubscript(name)) |arr| arr.base else name;
+                    if (self.env.getArray(base) != null or self.env.get(base) != null) return try self.alloc.dupe(u8, "");
                     const msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter not set\n", .{name}) catch return error.OutOfMemory;
                     _ = std.c.write(2, msg.ptr, msg.len);
                     self.alloc.free(msg);
@@ -355,6 +363,7 @@ pub const Expander = struct {
                     }
                     return joined;
                 }
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
                     return try self.expandWord(op.word);
@@ -362,27 +371,37 @@ pub const Expander = struct {
                 return try self.alloc.dupe(u8, val.?);
             },
             .assign => |op| {
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
+                    const target = if (op.name.len > 1 and op.name[0] == '!')
+                        self.env.get(op.name[1..]) orelse op.name
+                    else
+                        op.name;
                     const new_val = try self.expandWord(op.word);
-                    self.env.set(op.name, new_val, false) catch {};
+                    self.env.set(target, new_val, false) catch {};
                     return new_val;
                 }
                 return try self.alloc.dupe(u8, val.?);
             },
             .error_msg => |op| {
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
+                    const display_name = if (op.name.len > 1 and op.name[0] == '!')
+                        self.env.get(op.name[1..]) orelse op.name
+                    else
+                        op.name;
                     const msg = try self.expandWord(op.word);
                     if (msg.len > 0) {
-                        const err_msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: {s}\n", .{ op.name, msg }) catch {
+                        const err_msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: {s}\n", .{ display_name, msg }) catch {
                             self.alloc.free(msg);
                             return error.OutOfMemory;
                         };
                         _ = std.c.write(2, err_msg.ptr, err_msg.len);
                         self.alloc.free(err_msg);
                     } else {
-                        const err_msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter null or not set\n", .{op.name}) catch {
+                        const err_msg = std.fmt.allocPrint(self.alloc, "zigsh: {s}: parameter null or not set\n", .{display_name}) catch {
                             return error.OutOfMemory;
                         };
                         _ = std.c.write(2, err_msg.ptr, err_msg.len);
@@ -409,6 +428,7 @@ pub const Expander = struct {
                     }
                     return try self.expandWord(op.word);
                 }
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val != null and (!op.colon or val.?.len > 0)) {
                     return try self.expandWord(op.word);
@@ -422,13 +442,8 @@ pub const Expander = struct {
             .pattern_sub => |op| return try self.patternSub(op),
             .substring => |op| return try self.expandSubstring(op),
             .case_conv => |op| return try self.expandCaseConv(op),
-            .indirect => |name| {
-                const var_name = self.env.get(name) orelse "";
-                if (var_name.len == 0) return try self.alloc.dupe(u8, "");
-                if (self.getParamValue(var_name)) |val| return try self.alloc.dupe(u8, val);
-                if (self.expandDynamic(var_name)) |val| return val;
-                return try self.alloc.dupe(u8, "");
-            },
+            .indirect => |name| return try self.expandIndirect(name),
+            .array_keys => |op| return try self.expandArrayKeys(op),
             .transform => |op| return try self.expandTransform(op),
             .prefix_list => |op| return try self.expandPrefixList(op),
             .bad_sub => |msg| {
@@ -436,6 +451,132 @@ pub const Expander = struct {
                 return error.BadSubstitution;
             },
         }
+    }
+
+    fn expandIndirect(self: *Expander, name: []const u8) ExpandError![]const u8 {
+        const var_name = if (std.mem.indexOfScalar(u8, name, '[') != null) blk: {
+            const val = self.getParamValue(name) orelse {
+                return try self.alloc.dupe(u8, "");
+            };
+            break :blk val;
+        } else if (name.len > 0 and name[0] >= '0' and name[0] <= '9') blk: {
+            const n = std.fmt.parseInt(u32, name, 10) catch {
+                return try self.alloc.dupe(u8, "");
+            };
+            if (n == 0) break :blk self.env.shell_name;
+            break :blk self.env.getPositional(n) orelse {
+                return try self.alloc.dupe(u8, "");
+            };
+        } else blk: {
+            break :blk self.env.get(name) orelse {
+                if (self.env.options.nounset) {
+                    posix.writeAll(2, "zigsh: ");
+                    posix.writeAll(2, name);
+                    posix.writeAll(2, ": unbound variable\n");
+                    return error.UnsetVariable;
+                }
+                return error.BadSubstitution;
+            };
+        };
+        if (var_name.len == 0) return try self.alloc.dupe(u8, "");
+        return self.resolveIndirectValue(var_name);
+    }
+
+    fn resolveIndirectValue(self: *Expander, var_name: []const u8) ExpandError![]const u8 {
+        if (var_name.len == 1) {
+            const ch = var_name[0];
+            if (ch == '@' or ch == '*' or ch == '?' or ch == '#' or
+                ch == '-' or ch == '$' or ch == '!')
+                return try self.expandSpecial(ch);
+            if (ch >= '0' and ch <= '9') {
+                const idx = ch - '0';
+                if (idx == 0) return try self.alloc.dupe(u8, self.env.shell_name);
+                if (self.env.getPositional(idx)) |val| return try self.alloc.dupe(u8, val);
+                return try self.alloc.dupe(u8, "");
+            }
+        }
+        if (var_name.len > 0 and var_name[0] >= '0' and var_name[0] <= '9') {
+            const n = std.fmt.parseInt(u32, var_name, 10) catch
+                return try self.alloc.dupe(u8, "");
+            if (n == 0) return try self.alloc.dupe(u8, self.env.shell_name);
+            if (self.env.getPositional(n)) |val| return try self.alloc.dupe(u8, val);
+            return try self.alloc.dupe(u8, "");
+        }
+        if (std.mem.indexOfScalar(u8, var_name, '[')) |_| {
+            if (self.getParamValue(var_name)) |val| return try self.alloc.dupe(u8, val);
+            return try self.alloc.dupe(u8, "");
+        }
+        if (!isValidVarName(var_name)) {
+            posix.writeAll(2, "zigsh: ");
+            posix.writeAll(2, var_name);
+            posix.writeAll(2, ": invalid variable name\n");
+            return error.BadSubstitution;
+        }
+        if (self.getParamValue(var_name)) |val| return try self.alloc.dupe(u8, val);
+        if (self.expandDynamic(var_name)) |val| return val;
+        return try self.alloc.dupe(u8, "");
+    }
+
+    fn checkIndirectRef(self: *Expander, name: []const u8) ExpandError!void {
+        if (name.len > 1 and name[0] == '!') {
+            if (self.env.get(name[1..]) == null) return error.BadSubstitution;
+        }
+    }
+
+    fn resolveIndirectName(self: *Expander, name: []const u8) ?[]const u8 {
+        if (name.len > 1 and name[0] == '!') {
+            const ref_name = name[1..];
+            return self.env.get(ref_name);
+        }
+        return name;
+    }
+
+    fn expandArrayKeys(self: *Expander, op: ast.PrefixListOp) ExpandError![]const u8 {
+        if (self.env.getArray(op.prefix)) |elems| {
+            var result: std.ArrayListUnmanaged(u8) = .empty;
+            for (0..elems.len) |idx| {
+                if (idx > 0) {
+                    const sep = if (op.join) self.getIfsSep() else " ";
+                    try result.appendSlice(self.alloc, sep);
+                }
+                const num = std.fmt.allocPrint(self.alloc, "{d}", .{idx}) catch return error.OutOfMemory;
+                try result.appendSlice(self.alloc, num);
+                self.alloc.free(num);
+            }
+            return result.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
+        }
+        return try self.alloc.dupe(u8, "");
+    }
+
+    fn isIndirectToAtExpansion(self: *Expander, name: []const u8) bool {
+        const var_name = if (name.len > 0 and name[0] >= '0' and name[0] <= '9') blk: {
+            const n = std.fmt.parseInt(u32, name, 10) catch return false;
+            if (n == 0) break :blk self.env.shell_name;
+            break :blk self.env.getPositional(n) orelse return false;
+        } else if (std.mem.indexOfScalar(u8, name, '[') != null)
+            self.getParamValue(name) orelse return false
+        else
+            self.env.get(name) orelse return false;
+        if (std.mem.eql(u8, var_name, "@")) return true;
+        if (parseArraySubscript(var_name)) |arr| {
+            if (std.mem.eql(u8, arr.subscript, "@")) return true;
+        }
+        return false;
+    }
+
+    fn evalSubscript(self: *Expander, subscript: []const u8) ?i64 {
+        if (std.fmt.parseInt(i64, subscript, 10) catch null) |val| return val;
+        const expanded = self.expandArithmetic(subscript) catch return null;
+        return std.fmt.parseInt(i64, expanded, 10) catch null;
+    }
+
+    fn isValidVarName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
+        for (name[1..]) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+        }
+        return true;
     }
 
     const StripMode = enum { prefix_short, prefix_long, suffix_short, suffix_long };
@@ -1045,7 +1186,9 @@ pub const Expander = struct {
             },
             'a' => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
-                if (self.env.vars.get(op.name)) |variable| {
+                const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
+                if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
+                if (self.env.vars.get(base_name)) |variable| {
                     if (variable.exported) try result.append(self.alloc, 'x');
                     if (variable.readonly) try result.append(self.alloc, 'r');
                     if (variable.integer) try result.append(self.alloc, 'i');
@@ -1424,6 +1567,11 @@ pub const Expander = struct {
             var ts: std.c.timespec = undefined;
             _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
             return std.fmt.allocPrint(self.alloc, "{d}", .{ts.sec}) catch null;
+        }
+        if (std.mem.eql(u8, name, "FUNCNAME")) {
+            const stack = self.env.function_name_stack.items;
+            if (stack.len > 0) return self.alloc.dupe(u8, stack[stack.len - 1]) catch null;
+            return null;
         }
         if (std.mem.eql(u8, name, "EPOCHREALTIME")) {
             var ts: std.c.timespec = undefined;
@@ -1927,8 +2075,18 @@ pub const Expander = struct {
                 for (parts) |inner| {
                     const info = try self.expandPartWithSplitInfo(inner);
                     try text.appendSlice(self.alloc, info.text);
+                    const is_at_like = switch (inner) {
+                        .parameter => |p| switch (p) {
+                            .special => |ch| ch == '@',
+                            .array_keys => |op| !op.join,
+                            .prefix_list => |op| !op.join,
+                            .indirect => |ind_name| self.isIndirectToAtExpansion(ind_name),
+                            else => false,
+                        },
+                        else => false,
+                    };
                     for (info.splittable) |_| {
-                        try splittable.append(self.alloc, false);
+                        try splittable.append(self.alloc, is_at_like);
                     }
                     for (info.globbable) |_| {
                         try globbable.append(self.alloc, false);
@@ -1961,6 +2119,7 @@ pub const Expander = struct {
                     }
                     return self.makeSplitInfoUniform(joined, true, true);
                 }
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
                     return try self.expandWordWithSplitInfoParamContext(op.word);
@@ -1969,10 +2128,15 @@ pub const Expander = struct {
                 return self.makeSplitInfoUniform(v, true, true);
             },
             .assign => |op| {
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val == null or (op.colon and val.?.len == 0)) {
+                    const target = if (op.name.len > 1 and op.name[0] == '!')
+                        self.env.get(op.name[1..]) orelse op.name
+                    else
+                        op.name;
                     const info = try self.expandWordWithSplitInfoParamContext(op.word);
-                    self.env.set(op.name, info.text, false) catch {};
+                    self.env.set(target, info.text, false) catch {};
                     return info;
                 }
                 const v = try self.alloc.dupe(u8, val.?);
@@ -1996,6 +2160,7 @@ pub const Expander = struct {
                     }
                     return try self.expandWordWithSplitInfoParamContext(op.word);
                 }
+                try self.checkIndirectRef(op.name);
                 const val = self.getParamValue(op.name);
                 if (val != null and (!op.colon or val.?.len > 0)) {
                     return try self.expandWordWithSplitInfoParamContext(op.word);
@@ -2026,6 +2191,9 @@ pub const Expander = struct {
                     const is_expansion = switch (inner) {
                         .parameter => |p| switch (p) {
                             .special => |ch| ch == '@' or ch == '*',
+                            .indirect => |ind_name| self.isIndirectToAtExpansion(ind_name),
+                            .array_keys => |op| !op.join,
+                            .prefix_list => |op| !op.join,
                             else => false,
                         },
                         else => false,
