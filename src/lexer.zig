@@ -512,8 +512,18 @@ pub const Lexer = struct {
             if (name.len == 0) return false;
         }
         if (name[0] != '_' and !std.ascii.isAlphabetic(name[0])) return false;
-        for (name[1..]) |c| {
-            if (c != '_' and !std.ascii.isAlphanumeric(c)) return false;
+        var i: usize = 1;
+        while (i < name.len) : (i += 1) {
+            if (name[i] == '[') {
+                var depth: usize = 1;
+                i += 1;
+                while (i < name.len and depth > 0) : (i += 1) {
+                    if (name[i] == '[') depth += 1 else if (name[i] == ']') depth -= 1;
+                }
+                if (depth != 0) return false;
+                break;
+            }
+            if (name[i] != '_' and !std.ascii.isAlphanumeric(name[i])) return false;
         }
         return true;
     }

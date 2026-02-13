@@ -315,7 +315,7 @@ pub const Executor = struct {
         const saved_exit = self.env.last_exit_status;
         for (simple.assigns) |assign| {
             if (assign.array_values) |arr_words| {
-                if (simple.words.len == 0) {
+                {
                     var elems: std.ArrayListUnmanaged([]const u8) = .empty;
                     for (arr_words) |w| {
                         const expanded = expander.expandWordsToFields(&.{w}) catch continue;
@@ -340,22 +340,46 @@ pub const Executor = struct {
                 continue;
             };
             if (simple.words.len == 0) {
-                const final_value = if (assign.append) blk: {
-                    const existing = self.env.get(assign.name) orelse "";
-                    break :blk std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
-                } else value;
-                self.env.set(assign.name, final_value, false) catch |err| {
-                    if (err == error.ReadonlyVariable) {
-                        posix.writeAll(2, "zigsh: ");
-                        posix.writeAll(2, assign.name);
-                        posix.writeAll(2, ": readonly variable\n");
-                        if (!self.env.options.interactive) {
-                            self.env.should_exit = true;
-                            self.env.exit_value = 1;
+                if (std.mem.indexOfScalar(u8, assign.name, '[')) |bracket_idx| {
+                    const base = assign.name[0..bracket_idx];
+                    const rest = assign.name[bracket_idx + 1 ..];
+                    const close = std.mem.indexOfScalar(u8, rest, ']') orelse rest.len;
+                    const subscript = rest[0..close];
+                    const idx: usize = blk: {
+                        const n = std.fmt.parseInt(i64, subscript, 10) catch {
+                            const arith_result = expander.expandArithmetic(subscript) catch break :blk 0;
+                            break :blk @intCast(std.fmt.parseInt(i64, arith_result, 10) catch 0);
+                        };
+                        break :blk if (n < 0) 0 else @intCast(n);
+                    };
+                    if (assign.append) {
+                        var existing: []const u8 = "";
+                        if (self.env.getArray(base)) |elems| {
+                            if (idx < elems.len) existing = elems[idx];
                         }
-                        return 1;
+                        const appended = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
+                        self.env.setArrayElement(base, idx, appended) catch {};
+                    } else {
+                        self.env.setArrayElement(base, idx, value) catch {};
                     }
-                };
+                } else {
+                    const final_value = if (assign.append) blk: {
+                        const existing = self.env.get(assign.name) orelse "";
+                        break :blk std.fmt.allocPrint(self.alloc, "{s}{s}", .{ existing, value }) catch value;
+                    } else value;
+                    self.env.set(assign.name, final_value, false) catch |err| {
+                        if (err == error.ReadonlyVariable) {
+                            posix.writeAll(2, "zigsh: ");
+                            posix.writeAll(2, assign.name);
+                            posix.writeAll(2, ": readonly variable\n");
+                            if (!self.env.options.interactive) {
+                                self.env.should_exit = true;
+                                self.env.exit_value = 1;
+                            }
+                            return 1;
+                        }
+                    };
+                }
             }
         }
 
@@ -1218,6 +1242,9 @@ pub const Executor = struct {
 
         self.env.pushScope() catch return 1;
         defer self.env.popScope();
+
+        self.env.function_name_stack.append(self.alloc, name) catch {};
+        defer _ = self.env.function_name_stack.pop();
 
         self.env.pushPositionalParams(fields[1..]) catch return 1;
         defer self.env.popPositionalParams();

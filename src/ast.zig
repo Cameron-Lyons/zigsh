@@ -111,6 +111,7 @@ pub const ParameterExp = union(enum) {
     substring: SubstringOp,
     case_conv: CaseConvOp,
     indirect: []const u8,
+    array_keys: PrefixListOp,
     transform: TransformOp,
     prefix_list: PrefixListOp,
     bad_sub: []const u8,

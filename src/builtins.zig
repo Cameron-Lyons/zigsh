@@ -397,9 +397,8 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
                     posix.writeAll(2, "zigsh: unset: ");
                     posix.writeAll(2, name);
                     posix.writeAll(2, ": readonly variable\n");
-                    env.should_exit = true;
-                    env.exit_value = 2;
-                    return 2;
+                    status = 1;
+                    continue;
                 }
             } else {
                 _ = env.unsetFunction(name);
