@@ -317,6 +317,13 @@ pub const Executor = struct {
             if (assign.array_values) |arr_words| {
                 {
                     var elems: std.ArrayListUnmanaged([]const u8) = .empty;
+                    if (assign.append) {
+                        if (self.env.getArray(assign.name)) |existing| {
+                            elems.appendSlice(self.alloc, existing) catch {};
+                        } else if (self.env.get(assign.name)) |scalar| {
+                            elems.append(self.alloc, scalar) catch {};
+                        }
+                    }
                     for (arr_words) |w| {
                         const expanded = expander.expandWordsToFields(&.{w}) catch continue;
                         for (expanded) |field| {
@@ -343,14 +350,29 @@ pub const Executor = struct {
                 if (std.mem.indexOfScalar(u8, assign.name, '[')) |bracket_idx| {
                     const base = assign.name[0..bracket_idx];
                     const rest = assign.name[bracket_idx + 1 ..];
-                    const close = std.mem.indexOfScalar(u8, rest, ']') orelse rest.len;
+                    const close = blk: {
+                        var depth: u32 = 0;
+                        for (rest, 0..) |rc, ri| {
+                            if (rc == '[') depth += 1;
+                            if (rc == ']') {
+                                if (depth == 0) break :blk ri;
+                                depth -= 1;
+                            }
+                        }
+                        break :blk rest.len;
+                    };
                     const subscript = rest[0..close];
                     const idx: usize = blk: {
                         const n = std.fmt.parseInt(i64, subscript, 10) catch {
                             const arith_result = expander.expandArithmetic(subscript) catch break :blk 0;
                             break :blk @intCast(std.fmt.parseInt(i64, arith_result, 10) catch 0);
                         };
-                        break :blk if (n < 0) 0 else @intCast(n);
+                        if (n < 0) {
+                            const arr_len = if (self.env.getArray(base)) |elems| elems.len else 0;
+                            const neg: usize = @intCast(-n);
+                            break :blk if (neg <= arr_len) arr_len - neg else 0;
+                        }
+                        break :blk @intCast(n);
                     };
                     if (assign.append) {
                         var existing: []const u8 = "";
@@ -414,7 +436,7 @@ pub const Executor = struct {
             break :blk false;
         };
 
-        const fields = if (is_assign_builtin)
+        var fields = if (is_assign_builtin)
             self.expandAssignBuiltinArgs(&expander, simple.words) catch return 1
         else
             expander.expandWordsToFields(simple.words) catch |err| {
@@ -439,6 +461,22 @@ pub const Executor = struct {
                 }
                 return 1;
             };
+        if (is_assign_builtin and simple.assigns.len > 0) {
+            var extra_names: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (simple.assigns) |assign| {
+                if (assign.array_values != null) {
+                    extra_names.append(self.alloc, assign.name) catch {};
+                }
+            }
+            if (extra_names.items.len > 0) {
+                var extended: std.ArrayListUnmanaged([]const u8) = .empty;
+                extended.ensureTotalCapacity(self.alloc, fields.len + extra_names.items.len) catch {};
+                extended.appendSlice(self.alloc, fields) catch {};
+                extended.appendSlice(self.alloc, extra_names.items) catch {};
+                fields = extended.items;
+            }
+        }
+
         if (fields.len == 0) {
             if (simple.assigns.len > 0 and simple.words.len > 0) {
                 for (simple.assigns) |assign| {
@@ -543,7 +581,7 @@ pub const Executor = struct {
             }
         } else if (builtins.lookup(cmd_name)) |builtin_fn| {
             const is_special = isSpecialBuiltin(cmd_name);
-            const has_temp = simple.assigns.len > 0 and simple.words.len > 0 and !is_special;
+            const has_temp = simple.assigns.len > 0 and simple.words.len > 0 and !is_special and !is_assign_builtin;
             if (has_temp) {
                 self.env.pushScope() catch {};
                 for (simple.assigns) |assign| {
@@ -943,7 +981,33 @@ pub const Executor = struct {
     fn evalDbUnary(self: *Executor, op: []const u8, val: []const u8) bool {
         if (std.mem.eql(u8, op, "-n")) return val.len > 0;
         if (std.mem.eql(u8, op, "-z")) return val.len == 0;
-        if (std.mem.eql(u8, op, "-v")) return self.env.get(val) != null;
+        if (std.mem.eql(u8, op, "-v")) {
+            if (std.mem.indexOfScalar(u8, val, '[')) |bracket| {
+                if (val.len > bracket + 2 and val[val.len - 1] == ']') {
+                    const base = val[0..bracket];
+                    const subscript = val[bracket + 1 .. val.len - 1];
+                    if (std.mem.eql(u8, subscript, "@") or std.mem.eql(u8, subscript, "*")) {
+                        return self.env.getArray(base) != null;
+                    }
+                    const lookup = struct {
+                        var e: *Environment = undefined;
+                        fn f(name: []const u8) ?[]const u8 {
+                            return e.get(name);
+                        }
+                    };
+                    lookup.e = self.env;
+                    const idx = Arithmetic.evaluate(subscript, &lookup.f) catch return false;
+                    const elems = self.env.getArray(base) orelse return false;
+                    const effective_idx: usize = if (idx < 0) blk: {
+                        const neg: usize = @intCast(-idx);
+                        if (neg > elems.len) break :blk elems.len;
+                        break :blk elems.len - neg;
+                    } else @intCast(idx);
+                    return effective_idx < elems.len;
+                }
+            }
+            return self.env.get(val) != null;
+        }
         if (std.mem.eql(u8, op, "-o")) {
             if (std.mem.eql(u8, val, "errexit")) return self.env.options.errexit;
             if (std.mem.eql(u8, val, "nounset")) return self.env.options.nounset;

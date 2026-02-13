@@ -2165,7 +2165,41 @@ pub const Parser = struct {
         var saved_pending_heredocs: [16]Lexer.HeredocPending = undefined;
         @memcpy(saved_pending_heredocs[0..saved_pending_count], self.lexer.pending_heredocs[0..saved_pending_count]);
 
-        const name = self.tokenText(self.current);
+        const first_word = self.tokenText(self.current);
+
+        if (std.mem.eql(u8, first_word, "function")) {
+            try self.advance();
+            if (self.current.tag == .word or self.current.tag == .lbrace) {
+                const name = self.tokenText(self.current);
+                if (self.current.tag == .lbrace) {
+                    self.restoreState(saved_pos, saved_current, saved_rwc, saved_pending_count, &saved_pending_heredocs);
+                    return null;
+                }
+                try self.advance();
+                if (self.current.tag == .lparen) {
+                    try self.advance();
+                    if (self.current.tag != .rparen) {
+                        self.restoreState(saved_pos, saved_current, saved_rwc, saved_pending_count, &saved_pending_heredocs);
+                        return null;
+                    }
+                    try self.advance();
+                }
+                try self.skipNewlines();
+                const body_start = self.current.start;
+                self.lexer.reserved_word_context = true;
+                const body_cmd = try self.parseCommand();
+                const body_end = self.lexer.pos;
+                const compound = switch (body_cmd) {
+                    .compound => |cp| cp,
+                    else => return error.UnexpectedToken,
+                };
+                return .{ .name = name, .body = compound, .source = self.lexer.source[body_start..body_end] };
+            }
+            self.restoreState(saved_pos, saved_current, saved_rwc, saved_pending_count, &saved_pending_heredocs);
+            return null;
+        }
+
+        const name = first_word;
 
         try self.advance();
 
@@ -2191,6 +2225,11 @@ pub const Parser = struct {
             }
         }
 
+        self.restoreState(saved_pos, saved_current, saved_rwc, saved_pending_count, &saved_pending_heredocs);
+        return null;
+    }
+
+    fn restoreState(self: *Parser, saved_pos: u32, saved_current: Token, saved_rwc: bool, saved_pending_count: u8, saved_pending_heredocs: *[16]Lexer.HeredocPending) void {
         self.lexer.pos = saved_pos;
         self.current = saved_current;
         self.lexer.reserved_word_context = saved_rwc;
@@ -2198,7 +2237,6 @@ pub const Parser = struct {
             self.lexer.pending_heredoc_count = saved_pending_count;
             @memcpy(self.lexer.pending_heredocs[0..saved_pending_count], saved_pending_heredocs[0..saved_pending_count]);
         }
-        return null;
     }
 
     fn isValidFunctionName(name: []const u8) bool {
