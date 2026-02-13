@@ -1050,7 +1050,13 @@ pub const Parser = struct {
                 var name = text[start..i.*];
                 if (i.* < text.len and text[i.*] == '[') {
                     i.* += 1;
-                    while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+                    {
+                        var bdepth: u32 = 1;
+                        while (i.* < text.len and bdepth > 0) : (i.* += 1) {
+                            if (text[i.*] == '[') bdepth += 1 else if (text[i.*] == ']') bdepth -= 1;
+                        }
+                        if (bdepth == 0) i.* -= 1;
+                    }
                     if (i.* < text.len) i.* += 1;
                     name = text[start..i.*];
                 }
@@ -1087,7 +1093,13 @@ pub const Parser = struct {
                 }
                 if (i.* < text.len and text[i.*] == '[') {
                     i.* += 1;
-                    while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+                    {
+                        var bdepth: u32 = 1;
+                        while (i.* < text.len and bdepth > 0) : (i.* += 1) {
+                            if (text[i.*] == '[') bdepth += 1 else if (text[i.*] == ']') bdepth -= 1;
+                        }
+                        if (bdepth == 0) i.* -= 1;
+                    }
                     if (i.* < text.len) i.* += 1;
                     const name_with_sub = text[after_bang..i.*];
                     if (i.* < text.len and text[i.*] == '}') {
@@ -1109,7 +1121,13 @@ pub const Parser = struct {
                 const indirect_name = text[name_s..i.*];
                 if (i.* < text.len and text[i.*] == '[') {
                     i.* += 1;
-                    while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+                    {
+                        var bdepth: u32 = 1;
+                        while (i.* < text.len and bdepth > 0) : (i.* += 1) {
+                            if (text[i.*] == '[') bdepth += 1 else if (text[i.*] == ']') bdepth -= 1;
+                        }
+                        if (bdepth == 0) i.* -= 1;
+                    }
                     if (i.* < text.len) i.* += 1;
                     const name_with_sub = text[name_s..i.*];
                     if (i.* < text.len and text[i.*] == '}') {
@@ -1273,7 +1291,13 @@ pub const Parser = struct {
         }
         if (i.* < text.len and text[i.*] == '[') {
             i.* += 1;
-            while (i.* < text.len and text[i.*] != ']') : (i.* += 1) {}
+            {
+                var bdepth: u32 = 1;
+                while (i.* < text.len and bdepth > 0) : (i.* += 1) {
+                    if (text[i.*] == '[') bdepth += 1 else if (text[i.*] == ']') bdepth -= 1;
+                }
+                if (bdepth == 0) i.* -= 1;
+            }
             if (i.* < text.len) i.* += 1;
         }
         const name = text[name_start..i.*];

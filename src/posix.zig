@@ -177,11 +177,16 @@ pub fn write(fd: fd_t, data: []const u8) !usize {
     return @intCast(result);
 }
 
+pub var stdout_write_error: bool = false;
+
 pub fn writeAll(fd: fd_t, data: []const u8) void {
     var written: usize = 0;
     while (written < data.len) {
         const result = c.write(fd, data[written..].ptr, data[written..].len);
-        if (result < 0) return;
+        if (result < 0) {
+            if (fd == 1) stdout_write_error = true;
+            return;
+        }
         written += @intCast(result);
     }
 }

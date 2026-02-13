@@ -287,6 +287,40 @@ pub const Environment = struct {
         return null;
     }
 
+    pub fn getSubscripted(self: *const Environment, name: []const u8) ?[]const u8 {
+        if (std.mem.indexOf(u8, name, "[")) |bracket| {
+            if (name.len > 0 and name[name.len - 1] == ']') {
+                const base = name[0..bracket];
+                const subscript = name[bracket + 1 .. name.len - 1];
+                const idx = std.fmt.parseInt(i64, subscript, 10) catch return self.get(base);
+                if (self.getArray(base)) |elems| {
+                    const i: usize = if (idx < 0) blk: {
+                        const adj = @as(i64, @intCast(elems.len)) + idx;
+                        if (adj < 0) return null;
+                        break :blk @intCast(adj);
+                    } else @intCast(idx);
+                    if (i < elems.len) return elems[i];
+                    return null;
+                }
+                if (idx == 0) return self.get(base);
+                return null;
+            }
+        }
+        return self.get(name);
+    }
+
+    pub fn setSubscripted(self: *Environment, name: []const u8, value: []const u8) !void {
+        if (std.mem.indexOf(u8, name, "[")) |bracket| {
+            if (name.len > 0 and name[name.len - 1] == ']') {
+                const base = name[0..bracket];
+                const subscript = name[bracket + 1 .. name.len - 1];
+                const idx = std.fmt.parseInt(usize, subscript, 10) catch return self.set(name, value, false);
+                return self.setArrayElement(base, idx, value);
+            }
+        }
+        return self.set(name, value, false);
+    }
+
     pub fn set(self: *Environment, name: []const u8, value: []const u8, exported: bool) !void {
         if (self.vars.get(name)) |existing| {
             if (existing.readonly) return error.ReadonlyVariable;

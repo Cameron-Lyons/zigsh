@@ -1189,11 +1189,11 @@ pub const Expander = struct {
                 const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
                 if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
                 if (self.env.vars.get(base_name)) |variable| {
-                    if (variable.exported) try result.append(self.alloc, 'x');
-                    if (variable.readonly) try result.append(self.alloc, 'r');
                     if (variable.integer) try result.append(self.alloc, 'i');
                     if (variable.lowercase) try result.append(self.alloc, 'l');
+                    if (variable.readonly) try result.append(self.alloc, 'r');
                     if (variable.uppercase) try result.append(self.alloc, 'u');
+                    if (variable.exported) try result.append(self.alloc, 'x');
                 }
                 return result.toOwnedSlice(self.alloc);
             },
@@ -2017,7 +2017,7 @@ pub const Expander = struct {
         const lookup = struct {
             var env: *Environment = undefined;
             fn f(name: []const u8) ?[]const u8 {
-                if (env.get(name)) |v| return v;
+                if (env.getSubscripted(name)) |v| return v;
                 if (env.options.nounset) {
                     posix.writeAll(2, "zigsh: ");
                     posix.writeAll(2, name);
@@ -2030,7 +2030,7 @@ pub const Expander = struct {
             fn setter(name: []const u8, val: i64) void {
                 var buf: [32]u8 = undefined;
                 const val_str = std.fmt.bufPrint(&buf, "{d}", .{val}) catch return;
-                env.set(name, val_str, false) catch {};
+                env.setSubscripted(name, val_str) catch {};
             }
         };
         lookup.env = env_ptr;
@@ -2493,7 +2493,13 @@ pub const Expander = struct {
         switch (param) {
             .simple => |name| {
                 if (parseArraySubscript(name)) |arr| {
-                    return self.env.getArray(arr.base) orelse &.{};
+                    if (self.env.getArray(arr.base)) |elems| return elems;
+                    if (self.env.get(arr.base)) |val| {
+                        const slice = self.alloc.alloc([]const u8, 1) catch return &.{};
+                        slice[0] = val;
+                        return slice;
+                    }
+                    return &.{};
                 }
                 return self.env.positional_params;
             },
@@ -2560,7 +2566,13 @@ pub const Expander = struct {
                     else => return self.env.positional_params,
                 };
                 if (parseArraySubscript(name)) |arr| {
-                    return self.env.getArray(arr.base) orelse &.{};
+                    if (self.env.getArray(arr.base)) |elems| return elems;
+                    if (self.env.get(arr.base)) |val| {
+                        const slice = self.alloc.alloc([]const u8, 1) catch return &.{};
+                        slice[0] = val;
+                        return slice;
+                    }
+                    return &.{};
                 }
                 return self.env.positional_params;
             },
