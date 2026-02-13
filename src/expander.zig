@@ -2520,11 +2520,18 @@ pub const Expander = struct {
         part_index: usize,
     };
 
+    fn isParamAtOrStar(param: ast.ParameterExp) bool {
+        return switch (param) {
+            .special => |ch| ch == '@' or ch == '*',
+            else => isParamAt(param),
+        };
+    }
+
     fn findUnquotedAtOrStar(word: ast.Word) ?UnquotedAtInfo {
         for (word.parts, 0..) |part, pi| {
             switch (part) {
                 .parameter => |param| {
-                    if (isParamAt(param)) return .{ .part_index = pi };
+                    if (isParamAtOrStar(param)) return .{ .part_index = pi };
                 },
                 else => {},
             }
