@@ -163,8 +163,13 @@ pub fn write(fd: fd_t, data: []const u8) !usize {
 }
 
 pub var stdout_write_error: bool = false;
+pub const WriteHook = *const fn (fd: fd_t, data: []const u8) bool;
+pub var write_hook: ?WriteHook = null;
 
 pub fn writeAll(fd: fd_t, data: []const u8) void {
+    if (write_hook) |hook| {
+        if (hook(fd, data)) return;
+    }
     var written: usize = 0;
     while (written < data.len) {
         const result = c.write(fd, data[written..].ptr, data[written..].len);
