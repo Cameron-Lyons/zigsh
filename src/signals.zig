@@ -1,101 +1,75 @@
 const std = @import("std");
 const posix = @import("posix.zig");
 
-const linux = std.os.linux;
 const c = std.c;
 
-const SIG = linux.SIG;
-const Sigaction = linux.Sigaction;
+const SIG = c.SIG;
+const Sigaction = c.Sigaction;
 
-pub const SIGINT: u6 = 2;
-pub const SIGQUIT: u6 = 3;
-pub const SIGTSTP: u6 = 20;
-pub const SIGTTIN: u6 = 21;
-pub const SIGTTOU: u6 = 22;
-pub const SIGCHLD: u6 = 17;
-pub const SIGCONT: u6 = 18;
-pub const SIGTERM: u6 = 15;
-pub const SIGHUP: u6 = 1;
-pub const SIGPIPE: u6 = 13;
-pub const SIGUSR1: u6 = 10;
-pub const SIGUSR2: u6 = 12;
-pub const SIGABRT: u6 = 6;
-pub const SIGALRM: u6 = 14;
-pub const SIGKILL: u6 = 9;
-pub const SIGSTOP: u6 = 19;
+fn sigNum(sig: SIG) u6 {
+    return @intCast(@intFromEnum(sig));
+}
+
+pub const SIGINT: u6 = sigNum(SIG.INT);
+pub const SIGQUIT: u6 = sigNum(SIG.QUIT);
+pub const SIGTSTP: u6 = sigNum(SIG.TSTP);
+pub const SIGTTIN: u6 = sigNum(SIG.TTIN);
+pub const SIGTTOU: u6 = sigNum(SIG.TTOU);
+pub const SIGCHLD: u6 = sigNum(SIG.CHLD);
+pub const SIGCONT: u6 = sigNum(SIG.CONT);
+pub const SIGTERM: u6 = sigNum(SIG.TERM);
+pub const SIGHUP: u6 = sigNum(SIG.HUP);
+pub const SIGPIPE: u6 = sigNum(SIG.PIPE);
+pub const SIGUSR1: u6 = sigNum(SIG.USR1);
+pub const SIGUSR2: u6 = sigNum(SIG.USR2);
+pub const SIGABRT: u6 = sigNum(SIG.ABRT);
+pub const SIGALRM: u6 = sigNum(SIG.ALRM);
+pub const SIGKILL: u6 = sigNum(SIG.KILL);
+pub const SIGSTOP: u6 = sigNum(SIG.STOP);
+pub const SIGURG: u6 = sigNum(SIG.URG);
 
 pub fn sigNameFromNum(signum: u6) ?[]const u8 {
-    return switch (signum) {
-        0 => "EXIT",
-        1 => "HUP",
-        2 => "INT",
-        3 => "QUIT",
-        4 => "ILL",
-        5 => "TRAP",
-        6 => "ABRT",
-        7 => "BUS",
-        8 => "FPE",
-        9 => "KILL",
-        10 => "USR1",
-        11 => "SEGV",
-        12 => "USR2",
-        13 => "PIPE",
-        14 => "ALRM",
-        15 => "TERM",
-        17 => "CHLD",
-        18 => "CONT",
-        19 => "STOP",
-        20 => "TSTP",
-        21 => "TTIN",
-        22 => "TTOU",
-        23 => "URG",
-        24 => "XCPU",
-        25 => "XFSZ",
-        26 => "VTALRM",
-        27 => "PROF",
-        28 => "WINCH",
-        29 => "IO",
-        30 => "PWR",
-        31 => "SYS",
-        else => null,
-    };
+    if (signum == 0) return "EXIT";
+    if (signum == SIGHUP) return "HUP";
+    if (signum == SIGINT) return "INT";
+    if (signum == SIGQUIT) return "QUIT";
+    if (signum == SIGABRT) return "ABRT";
+    if (signum == SIGALRM) return "ALRM";
+    if (signum == SIGTERM) return "TERM";
+    if (signum == SIGKILL) return "KILL";
+    if (signum == SIGSTOP) return "STOP";
+    if (signum == SIGCHLD) return "CHLD";
+    if (signum == SIGCONT) return "CONT";
+    if (signum == SIGTSTP) return "TSTP";
+    if (signum == SIGTTIN) return "TTIN";
+    if (signum == SIGTTOU) return "TTOU";
+    if (signum == SIGPIPE) return "PIPE";
+    if (signum == SIGUSR1) return "USR1";
+    if (signum == SIGUSR2) return "USR2";
+    if (signum == SIGURG) return "URG";
+    return null;
 }
 
 pub fn sigFullName(signum: u6) ?[]const u8 {
-    return switch (signum) {
-        0 => "EXIT",
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        4 => "SIGILL",
-        5 => "SIGTRAP",
-        6 => "SIGABRT",
-        7 => "SIGBUS",
-        8 => "SIGFPE",
-        9 => "SIGKILL",
-        10 => "SIGUSR1",
-        11 => "SIGSEGV",
-        12 => "SIGUSR2",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
-        17 => "SIGCHLD",
-        18 => "SIGCONT",
-        19 => "SIGSTOP",
-        20 => "SIGTSTP",
-        21 => "SIGTTIN",
-        22 => "SIGTTOU",
-        23 => "SIGURG",
-        24 => "SIGXCPU",
-        25 => "SIGXFSZ",
-        26 => "SIGVTALRM",
-        27 => "SIGPROF",
-        28 => "SIGWINCH",
-        29 => "SIGIO",
-        30 => "SIGPWR",
-        31 => "SIGSYS",
-        else => null,
-    };
+    if (signum == 0) return "EXIT";
+    if (signum == SIGHUP) return "SIGHUP";
+    if (signum == SIGINT) return "SIGINT";
+    if (signum == SIGQUIT) return "SIGQUIT";
+    if (signum == SIGABRT) return "SIGABRT";
+    if (signum == SIGALRM) return "SIGALRM";
+    if (signum == SIGTERM) return "SIGTERM";
+    if (signum == SIGKILL) return "SIGKILL";
+    if (signum == SIGSTOP) return "SIGSTOP";
+    if (signum == SIGCHLD) return "SIGCHLD";
+    if (signum == SIGCONT) return "SIGCONT";
+    if (signum == SIGTSTP) return "SIGTSTP";
+    if (signum == SIGTTIN) return "SIGTTIN";
+    if (signum == SIGTTOU) return "SIGTTOU";
+    if (signum == SIGPIPE) return "SIGPIPE";
+    if (signum == SIGUSR1) return "SIGUSR1";
+    if (signum == SIGUSR2) return "SIGUSR2";
+    if (signum == SIGURG) return "SIGURG";
+    return null;
 }
 
 pub const TRAP_EXIT: usize = 0;
@@ -119,28 +93,28 @@ fn toSIG(signum: u6) SIG {
 pub fn installHandler(signum: u6) void {
     const sa = Sigaction{
         .handler = .{ .handler = &signalHandler },
-        .mask = std.mem.zeroes(linux.sigset_t),
+        .mask = std.mem.zeroes(c.sigset_t),
         .flags = 0,
     };
-    _ = linux.sigaction(toSIG(signum), &sa, null);
+    _ = c.sigaction(toSIG(signum), &sa, null);
 }
 
 pub fn ignoreSignal(signum: u6) void {
     const sa = Sigaction{
         .handler = .{ .handler = SIG.IGN },
-        .mask = std.mem.zeroes(linux.sigset_t),
+        .mask = std.mem.zeroes(c.sigset_t),
         .flags = 0,
     };
-    _ = linux.sigaction(toSIG(signum), &sa, null);
+    _ = c.sigaction(toSIG(signum), &sa, null);
 }
 
 pub fn defaultSignal(signum: u6) void {
     const sa = Sigaction{
         .handler = .{ .handler = SIG.DFL },
-        .mask = std.mem.zeroes(linux.sigset_t),
+        .mask = std.mem.zeroes(c.sigset_t),
         .flags = 0,
     };
-    _ = linux.sigaction(toSIG(signum), &sa, null);
+    _ = c.sigaction(toSIG(signum), &sa, null);
 }
 
 pub fn setupInteractiveSignals() void {

@@ -16,6 +16,24 @@ Run tests:
 zig build test
 ```
 
+Run Oil spec tests (POSIX-focused subset):
+
+```sh
+tools/oil-spec.sh
+```
+
+Run specific Oil spec files:
+
+```sh
+tools/oil-spec.sh smoke builtin-read builtin-printf
+```
+
+The runner writes logs and per-file stats to:
+
+```sh
+_tmp/oil-spec-results/
+```
+
 ## Usage
 
 ```sh

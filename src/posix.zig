@@ -1,10 +1,9 @@
 const std = @import("std");
-const linux = std.os.linux;
 const c = std.c;
 
 pub const fd_t = i32;
 pub const pid_t = i32;
-pub const mode_t = u32;
+pub const mode_t = c.mode_t;
 pub const WNOHANG: u32 = 1;
 
 pub fn pipe() ![2]fd_t {
@@ -107,52 +106,38 @@ pub const StatResult = struct {
     gid: u32,
 };
 
-pub fn stat(path: [*:0]const u8) !StatResult {
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(
-        @as(i32, -100),
-        path,
-        0,
-        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true, .UID = true, .GID = true },
-        &stx,
-    );
-    const signed: isize = @bitCast(rc);
-    if (signed < 0) return error.StatFailed;
+fn statResultFromC(st: c.Stat) StatResult {
+    const mt = st.mtime();
     return .{
-        .mode = stx.mode,
-        .size = stx.size,
-        .mtime_sec = stx.mtime.sec,
-        .mtime_nsec = stx.mtime.nsec,
-        .dev_major = stx.dev_major,
-        .dev_minor = stx.dev_minor,
-        .ino = stx.ino,
-        .uid = stx.uid,
-        .gid = stx.gid,
+        .mode = @intCast(st.mode),
+        .size = @intCast(st.size),
+        .mtime_sec = @intCast(mt.sec),
+        .mtime_nsec = @intCast(mt.nsec),
+        .dev_major = @intCast(@as(u64, @intCast(st.dev)) & 0xffff_ffff),
+        .dev_minor = 0,
+        .ino = @intCast(st.ino),
+        .uid = @intCast(st.uid),
+        .gid = @intCast(st.gid),
     };
 }
 
+pub fn stat(path: [*:0]const u8) !StatResult {
+    var st: c.Stat = undefined;
+    const rc = c.fstatat(@as(c.fd_t, @intCast(c.AT.FDCWD)), path, &st, 0);
+    if (rc < 0) return error.StatFailed;
+    return statResultFromC(st);
+}
+
 pub fn lstat(path: [*:0]const u8) !StatResult {
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(
-        @as(i32, -100),
+    var st: c.Stat = undefined;
+    const rc = c.fstatat(
+        @as(c.fd_t, @intCast(c.AT.FDCWD)),
         path,
-        linux.AT.SYMLINK_NOFOLLOW,
-        .{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true, .INO = true, .UID = true, .GID = true },
-        &stx,
+        &st,
+        @as(u32, c.AT.SYMLINK_NOFOLLOW),
     );
-    const signed: isize = @bitCast(rc);
-    if (signed < 0) return error.StatFailed;
-    return .{
-        .mode = stx.mode,
-        .size = stx.size,
-        .mtime_sec = stx.mtime.sec,
-        .mtime_nsec = stx.mtime.nsec,
-        .dev_major = stx.dev_major,
-        .dev_minor = stx.dev_minor,
-        .ino = stx.ino,
-        .uid = stx.uid,
-        .gid = stx.gid,
-    };
+    if (rc < 0) return error.StatFailed;
+    return statResultFromC(st);
 }
 
 pub fn access(path: [*:0]const u8, mode: c_uint) bool {
@@ -330,9 +315,8 @@ pub fn setpgid(pid: pid_t, pgid: pid_t) !void {
 }
 
 pub fn killpg(pgrp: pid_t, sig: u6) !void {
-    const rc = linux.kill(-pgrp, @enumFromInt(sig));
-    const signed: isize = @bitCast(rc);
-    if (signed < 0) return error.KillFailed;
+    const rc = c.kill(-pgrp, @enumFromInt(sig));
+    if (rc < 0) return error.KillFailed;
 }
 
 pub fn exit(status: u8) noreturn {
