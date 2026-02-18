@@ -27,6 +27,13 @@ fn expectExitCode(cmd: []const u8, code: u8) !void {
     try testing.expectEqual(process.Child.Term{ .exited = code }, result.term);
 }
 
+fn expectedPhysicalTmpPath() ![]u8 {
+    const result = try runShell("cd /tmp; /bin/pwd -P");
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+    return result.stdout;
+}
+
 // --- Arithmetic assignment operators ---
 
 test "arithmetic simple assignment" {
@@ -207,7 +214,9 @@ test "times format contains m and s" {
 // --- cd -L/-P ---
 
 test "cd -P resolves to physical path" {
-    try expectOutput("cd -P /tmp; echo $PWD", "/tmp\n");
+    const expected = try expectedPhysicalTmpPath();
+    defer testing.allocator.free(expected);
+    try expectOutput("cd -P /tmp; echo $PWD", expected);
 }
 
 test "cd -L is default logical" {
@@ -215,7 +224,9 @@ test "cd -L is default logical" {
 }
 
 test "cd -P after -L, last wins" {
-    try expectOutput("cd -L -P /tmp; echo $PWD", "/tmp\n");
+    const expected = try expectedPhysicalTmpPath();
+    defer testing.allocator.free(expected);
+    try expectOutput("cd -L -P /tmp; echo $PWD", expected);
 }
 
 // --- test -nt/-ot/-ef ---
@@ -321,7 +332,13 @@ test "readonly with no args shows readonly vars" {
 // --- hash -d/-t ---
 
 test "hash -t prints cached path" {
-    try expectOutput("hash ls; hash -t ls", "/usr/bin/ls\n");
+    const result = try runShell("hash ls; hash -t ls");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(result.stdout.len > "/ls\n".len);
+    try testing.expect(result.stdout[0] == '/');
+    try testing.expect(std.mem.endsWith(u8, result.stdout, "/ls\n"));
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
 }
 
 test "hash -d removes cached entry" {
@@ -453,7 +470,9 @@ test "umask symbolic input restrictive" {
 // --- pwd -L/-P ---
 
 test "pwd -P shows physical path" {
-    try expectOutput("cd /tmp; pwd -P", "/tmp\n");
+    const expected = try expectedPhysicalTmpPath();
+    defer testing.allocator.free(expected);
+    try expectOutput("cd /tmp; pwd -P", expected);
 }
 
 test "pwd -L shows logical path" {

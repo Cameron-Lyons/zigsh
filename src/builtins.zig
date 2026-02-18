@@ -6,6 +6,29 @@ const signals = @import("signals.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
 const libc = std.c;
+const printf_time = struct {
+    extern "c" fn time(tloc: ?*time_t) time_t;
+    extern "c" fn localtime_r(timer: *const time_t, result: *Tm) ?*Tm;
+    extern "c" fn strftime(buf: [*]u8, maxsize: usize, format: [*:0]const u8, tp: *const Tm) usize;
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    extern "c" fn tzset() void;
+
+    const time_t = i64;
+    const Tm = extern struct {
+        sec: c_int,
+        min: c_int,
+        hour: c_int,
+        mday: c_int,
+        mon: c_int,
+        year: c_int,
+        wday: c_int,
+        yday: c_int,
+        isdst: c_int,
+        gmtoff: c_long,
+        zone: ?[*:0]const u8,
+    };
+};
 
 pub const BuiltinFn = *const fn (args: []const []const u8, env: *Environment) u8;
 
@@ -131,6 +154,10 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         }
     }
 
+    if (env.shopt.strict_arg_parse and arg_start + 1 < args.len) {
+        return 1;
+    }
+
     const target = if (arg_start < args.len)
         args[arg_start]
     else
@@ -146,6 +173,10 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         !std.mem.eql(u8, target, "-");
 
     var cdpath_hit = false;
+    var cdpath_saved_buf: [4096]u8 = undefined;
+    var cdpath_saved: ?[]const u8 = null;
+    var cd_dash_saved_buf: [4096]u8 = undefined;
+    var cd_dash_saved: ?[]const u8 = null;
     if (is_relative) {
         if (env.get("CDPATH")) |cdpath| {
             var cditer = std.mem.splitScalar(u8, cdpath, ':');
@@ -154,6 +185,10 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
                 const try_path = std.fmt.bufPrint(&try_buf, "{s}/{s}", .{ dir, target }) catch continue;
                 if (posix.chdir(try_path)) {
                     cdpath_hit = true;
+                    if (try_path.len <= cdpath_saved_buf.len) {
+                        @memcpy(cdpath_saved_buf[0..try_path.len], try_path);
+                        cdpath_saved = cdpath_saved_buf[0..try_path.len];
+                    }
                     break;
                 } else |_| {}
             }
@@ -166,15 +201,26 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
                 posix.writeAll(2, "cd: OLDPWD not set\n");
                 return 1;
             };
+            if (oldpwd.len <= cd_dash_saved_buf.len) {
+                @memcpy(cd_dash_saved_buf[0..oldpwd.len], oldpwd);
+                cd_dash_saved = cd_dash_saved_buf[0..oldpwd.len];
+            } else {
+                cd_dash_saved = oldpwd;
+            }
             posix.chdir(oldpwd) catch {
                 posix.writeAll(2, "cd: ");
                 posix.writeAll(2, oldpwd);
                 posix.writeAll(2, ": No such file or directory\n");
                 return 1;
             };
-            var cd_dash_buf: [4096]u8 = undefined;
-            const cd_dash_pwd = posix.getcwd(&cd_dash_buf) catch null;
-            if (cd_dash_pwd) |p| {
+            if (physical) {
+                var cd_dash_buf: [4096]u8 = undefined;
+                const cd_dash_pwd = posix.getcwd(&cd_dash_buf) catch null;
+                if (cd_dash_pwd) |p| {
+                    posix.writeAll(1, p);
+                    posix.writeAll(1, "\n");
+                }
+            } else if (cd_dash_saved) |p| {
                 posix.writeAll(1, p);
                 posix.writeAll(1, "\n");
             }
@@ -187,7 +233,8 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
                 return 1;
             };
             if (!physical) {
-                const logical_path = buildLogicalPath(env, target) catch null;
+                var logical_buf: [4096]u8 = undefined;
+                const logical_path = buildLogicalPath(env, target, &logical_buf) catch null;
                 if (logical_path) |lp| {
                     posix.chdir(lp) catch {};
                 }
@@ -205,35 +252,54 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
         if (cwd) |cwd_str| {
             const cwd_z = std.posix.toPosixPath(cwd_str) catch {
                 env.set("PWD", cwd_str, true) catch {};
+                env.setLogicalPwd(cwd_str) catch {};
                 return 0;
             };
             var real_buf: [4096]u8 = undefined;
             if (posix.realpath(&cwd_z, &real_buf)) |resolved| {
                 env.set("PWD", resolved, true) catch {};
+                env.setLogicalPwd(resolved) catch {};
             } else {
                 env.set("PWD", cwd_str, true) catch {};
+                env.setLogicalPwd(cwd_str) catch {};
             }
         }
     } else {
-        if (cdpath_hit) {
-            var new_buf: [4096]u8 = undefined;
-            const new_pwd = posix.getcwd(&new_buf) catch null;
-            if (new_pwd) |pwd| {
+        if (cd_dash_saved) |dash_pwd| {
+            env.set("PWD", dash_pwd, true) catch {};
+            env.setLogicalPwd(dash_pwd) catch {};
+        } else if (cdpath_hit) {
+            if (cdpath_saved) |pwd| {
                 env.set("PWD", pwd, true) catch {};
+                env.setLogicalPwd(pwd) catch {};
                 if (is_relative) {
                     posix.writeAll(1, pwd);
                     posix.writeAll(1, "\n");
                 }
-            }
-        } else {
-            const logical_pwd = buildLogicalPath(env, target) catch null;
-            if (logical_pwd) |pwd| {
-                env.set("PWD", pwd, true) catch {};
             } else {
                 var new_buf: [4096]u8 = undefined;
                 const new_pwd = posix.getcwd(&new_buf) catch null;
                 if (new_pwd) |pwd| {
                     env.set("PWD", pwd, true) catch {};
+                    env.setLogicalPwd(pwd) catch {};
+                    if (is_relative) {
+                        posix.writeAll(1, pwd);
+                        posix.writeAll(1, "\n");
+                    }
+                }
+            }
+        } else {
+            var logical_buf: [4096]u8 = undefined;
+            const logical_pwd = buildLogicalPath(env, target, &logical_buf) catch null;
+            if (logical_pwd) |pwd| {
+                env.set("PWD", pwd, true) catch {};
+                env.setLogicalPwd(pwd) catch {};
+            } else {
+                var new_buf: [4096]u8 = undefined;
+                const new_pwd = posix.getcwd(&new_buf) catch null;
+                if (new_pwd) |pwd| {
+                    env.set("PWD", pwd, true) catch {};
+                    env.setLogicalPwd(pwd) catch {};
                 }
             }
         }
@@ -242,18 +308,19 @@ fn builtinCd(args: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
-fn buildLogicalPath(env: *Environment, target: []const u8) ![]const u8 {
-    var path_buf: [4096]u8 = undefined;
+fn buildLogicalPath(env: *Environment, target: []const u8, out_buf: []u8) ![]const u8 {
     var len: usize = 0;
 
     if (target.len > 0 and target[0] == '/') {
-        path_buf[0] = '/';
+        if (out_buf.len == 0) return error.PathTooLong;
+        out_buf[0] = '/';
         len = 1;
     } else {
-        const pwd = env.get("PWD") orelse return error.NoPwd;
+        const pwd = env.getLogicalPwd() orelse env.get("PWD") orelse return error.NoPwd;
         if (pwd.len == 0 or pwd[0] != '/') return error.NoPwd;
         const pwd_len = if (pwd.len > 1 and pwd[pwd.len - 1] == '/') pwd.len - 1 else pwd.len;
-        @memcpy(path_buf[0..pwd_len], pwd[0..pwd_len]);
+        if (pwd_len > out_buf.len) return error.PathTooLong;
+        @memcpy(out_buf[0..pwd_len], pwd[0..pwd_len]);
         len = pwd_len;
     }
 
@@ -263,22 +330,22 @@ fn buildLogicalPath(env: *Environment, target: []const u8) ![]const u8 {
         if (std.mem.eql(u8, component, "..")) {
             if (len > 1) {
                 len -= 1;
-                while (len > 0 and path_buf[len - 1] != '/') len -= 1;
+                while (len > 0 and out_buf[len - 1] != '/') len -= 1;
                 if (len == 0) len = 1;
             }
         } else {
             if (len > 1) {
-                path_buf[len] = '/';
+                out_buf[len] = '/';
                 len += 1;
             }
-            if (len + component.len > path_buf.len) return error.PathTooLong;
-            @memcpy(path_buf[len .. len + component.len], component);
+            if (len + component.len > out_buf.len) return error.PathTooLong;
+            @memcpy(out_buf[len .. len + component.len], component);
             len += component.len;
         }
     }
 
-    if (len > 1 and path_buf[len - 1] == '/') len -= 1;
-    return env.alloc.dupe(u8, path_buf[0..len]) catch return error.OutOfMemory;
+    if (len > 1 and out_buf[len - 1] == '/') len -= 1;
+    return out_buf[0..len];
 }
 
 fn builtinPwd(args: []const []const u8, env: *Environment) u8 {
@@ -292,8 +359,12 @@ fn builtinPwd(args: []const []const u8, env: *Environment) u8 {
         } else break;
     }
 
+    if (env.shopt.strict_arg_parse and i < args.len) {
+        return 1;
+    }
+
     if (!physical) {
-        if (env.get("PWD")) |pwd| {
+        if (env.getLogicalPwd()) |pwd| {
             if (pwd.len > 0 and pwd[0] == '/') {
                 posix.writeAll(1, pwd);
                 posix.writeAll(1, "\n");
@@ -317,10 +388,10 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
         var it = env.vars.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.exported) continue;
-            posix.writeAll(1, "declare -x ");
+            posix.writeAll(1, "export ");
             posix.writeAll(1, entry.key_ptr.*);
             posix.writeAll(1, "=");
-            declareWriteQuotedValue(entry.value_ptr.value);
+            writeReinputDoubleQuotedValue(entry.value_ptr.value);
             posix.writeAll(1, "\n");
         }
         return 0;
@@ -329,8 +400,13 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
     var start_idx: usize = 1;
     var unexport = false;
     while (start_idx < args.len and args[start_idx].len > 0 and args[start_idx][0] == '-') {
-        if (std.mem.eql(u8, args[start_idx], "--")) { start_idx += 1; break; }
-        if (std.mem.eql(u8, args[start_idx], "-n")) { unexport = true; }
+        if (std.mem.eql(u8, args[start_idx], "--")) {
+            start_idx += 1;
+            break;
+        }
+        if (std.mem.eql(u8, args[start_idx], "-n")) {
+            unexport = true;
+        }
         if (std.mem.eql(u8, args[start_idx], "-p")) {}
         start_idx += 1;
     }
@@ -577,7 +653,6 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
         if (std.mem.eql(u8, arg, "--")) {
             i += 1;
             env.positional_params = args[i..];
-            env.set("OPTIND", "1", false) catch {};
             env.set("OPTPOS", "0", false) catch {};
             return 0;
         }
@@ -585,9 +660,8 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
             env.options.xtrace = false;
             env.options.verbose = false;
             i += 1;
-            if (i <= args.len) {
+            if (i < args.len) {
                 env.positional_params = args[i..];
-                env.set("OPTIND", "1", false) catch {};
                 env.set("OPTPOS", "0", false) catch {};
             }
             return 0;
@@ -631,24 +705,35 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
 
     if (i < args.len) {
         env.positional_params = args[i..];
+        env.set("OPTPOS", "0", false) catch {};
     }
     return 0;
 }
 
 fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable: bool) bool {
-    if (std.mem.eql(u8, name, "errexit")) { options.errexit = enable; }
-    else if (std.mem.eql(u8, name, "nounset")) { options.nounset = enable; }
-    else if (std.mem.eql(u8, name, "xtrace")) { options.xtrace = enable; }
-    else if (std.mem.eql(u8, name, "noglob")) { options.noglob = enable; }
-    else if (std.mem.eql(u8, name, "noexec")) { options.noexec = enable; }
-    else if (std.mem.eql(u8, name, "allexport")) { options.allexport = enable; }
-    else if (std.mem.eql(u8, name, "monitor")) { options.monitor = enable; }
-    else if (std.mem.eql(u8, name, "noclobber")) { options.noclobber = enable; }
-    else if (std.mem.eql(u8, name, "verbose")) { options.verbose = enable; }
-    else if (std.mem.eql(u8, name, "pipefail")) { options.pipefail = enable; }
-    else if (std.mem.eql(u8, name, "history")) { options.history = enable; }
-    else if (std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "interactive") or std.mem.eql(u8, name, "hashall") or std.mem.eql(u8, name, "braceexpand") or std.mem.eql(u8, name, "vi") or std.mem.eql(u8, name, "emacs")) {}
-    else {
+    if (std.mem.eql(u8, name, "errexit")) {
+        options.errexit = enable;
+    } else if (std.mem.eql(u8, name, "nounset")) {
+        options.nounset = enable;
+    } else if (std.mem.eql(u8, name, "xtrace")) {
+        options.xtrace = enable;
+    } else if (std.mem.eql(u8, name, "noglob")) {
+        options.noglob = enable;
+    } else if (std.mem.eql(u8, name, "noexec")) {
+        options.noexec = enable;
+    } else if (std.mem.eql(u8, name, "allexport")) {
+        options.allexport = enable;
+    } else if (std.mem.eql(u8, name, "monitor")) {
+        options.monitor = enable;
+    } else if (std.mem.eql(u8, name, "noclobber")) {
+        options.noclobber = enable;
+    } else if (std.mem.eql(u8, name, "verbose")) {
+        options.verbose = enable;
+    } else if (std.mem.eql(u8, name, "pipefail")) {
+        options.pipefail = enable;
+    } else if (std.mem.eql(u8, name, "history")) {
+        options.history = enable;
+    } else if (std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "interactive") or std.mem.eql(u8, name, "hashall") or std.mem.eql(u8, name, "braceexpand") or std.mem.eql(u8, name, "vi") or std.mem.eql(u8, name, "emacs")) {} else {
         posix.writeAll(2, "set: unknown option: ");
         posix.writeAll(2, name);
         posix.writeAll(2, "\n");
@@ -1063,8 +1148,7 @@ fn testParsePrimary(targs: []const []const u8, pos: *usize, test_env: *Environme
 fn isTestUnaryOp(op: []const u8) bool {
     const ops = [_][]const u8{
         "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-n", "-p",
-        "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-z",
-        "-G", "-O", "-v", "-o",
+        "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-z", "-G", "-O", "-v", "-o",
     };
     for (ops) |o| {
         if (std.mem.eql(u8, op, o)) return true;
@@ -1074,7 +1158,7 @@ fn isTestUnaryOp(op: []const u8) bool {
 
 fn isTestBinaryOp(op: []const u8) bool {
     const ops = [_][]const u8{
-        "=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+        "=",   "==",  "!=",  "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
         "-nt", "-ot", "-ef",
     };
     for (ops) |o| {
@@ -1682,10 +1766,10 @@ fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
         var it = env.vars.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.readonly) continue;
-            posix.writeAll(1, "declare -r ");
+            posix.writeAll(1, "readonly ");
             posix.writeAll(1, entry.key_ptr.*);
             posix.writeAll(1, "=");
-            declareWriteQuotedValue(entry.value_ptr.value);
+            writeReinputDoubleQuotedValue(entry.value_ptr.value);
             posix.writeAll(1, "\n");
         }
         return 0;
@@ -1747,6 +1831,7 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     var use_nul_delim = false;
     var nchars: ?usize = null;
     var nchars_exact = false;
+    var timeout_zero_probe = false;
     var read_fd: types.Fd = types.STDIN;
     var array_var: ?[]const u8 = null;
     var arg_start: usize = 1;
@@ -1821,13 +1906,7 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
                         const tval = std.fmt.parseFloat(f64, ts) catch 0;
                         if (tval < 0) return 2;
                         if (tval == 0) {
-                            var poll_fds = [_]std.posix.pollfd{.{
-                                .fd = read_fd,
-                                .events = 1,
-                                .revents = 0,
-                            }};
-                            const poll_result = std.posix.poll(&poll_fds, 0) catch return 1;
-                            if (poll_result == 0) return 1;
+                            timeout_zero_probe = true;
                         }
                     }
                     break;
@@ -1861,8 +1940,12 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
     const default_reply: []const []const u8 = &.{"REPLY"};
     const effective_names: []const []const u8 = if (var_names.len == 0) default_reply else var_names;
 
+    if (timeout_zero_probe) {
+        return 0;
+    }
+
     if (prompt) |p| {
-        posix.writeAll(2, p);
+        if (posix.isatty(read_fd)) posix.writeAll(2, p);
     }
 
     var buf: [4096]u8 = undefined;
@@ -1959,34 +2042,43 @@ fn builtinRead(args: []const []const u8, env: *Environment) u8 {
         var fields: [256][]const u8 = undefined;
         var field_count: usize = 0;
         var pos: usize = 0;
-        while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+        while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
         if (pos < line.len) {
             while (pos < line.len) {
                 const field_start = pos;
-                while (pos < line.len and !isIfsChar(line[pos], ifs)) : (pos += 1) {}
+                while (pos < line.len and (escaped[pos] or !isIfsChar(line[pos], ifs))) : (pos += 1) {}
                 if (field_count < fields.len) {
                     fields[field_count] = line[field_start..pos];
                     field_count += 1;
                 }
                 if (pos >= line.len) break;
-                while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
                 if (pos >= line.len) break;
-                if (isIfsNonWhitespace(line[pos], ifs)) {
+                if (!escaped[pos] and isIfsNonWhitespace(line[pos], ifs)) {
                     pos += 1;
-                    while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
-                    while (pos < line.len and isIfsNonWhitespace(line[pos], ifs)) {
+                    while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                    while (pos < line.len and !escaped[pos] and isIfsNonWhitespace(line[pos], ifs)) {
                         if (field_count < fields.len) {
                             fields[field_count] = "";
                             field_count += 1;
                         }
                         pos += 1;
-                        while (pos < line.len and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
+                        while (pos < line.len and !escaped[pos] and isIfsWhitespace(line[pos], ifs)) : (pos += 1) {}
                     }
                     if (pos >= line.len) break;
                 }
             }
         }
         env.setArray(av, fields[0..field_count]) catch return 1;
+        return if (hit_eof) 1 else 0;
+    }
+
+    if (nchars_exact and effective_names.len > 1) {
+        env.set(effective_names[0], line, false) catch return 1;
+        var i: usize = 1;
+        while (i < effective_names.len) : (i += 1) {
+            env.set(effective_names[i], "", false) catch return 1;
+        }
         return if (hit_eof) 1 else 0;
     }
 
@@ -2083,10 +2175,14 @@ fn builtinMapfile(args: []const []const u8, env: *Environment) u8 {
     var line_count: usize = 0;
     var line_buf: [65536]u8 = undefined;
     var line_pos: usize = 0;
+    var had_read_error = false;
 
     while (true) {
         var byte_buf: [1]u8 = undefined;
-        const n = posix.read(types.STDIN, &byte_buf) catch break;
+        const n = posix.read(types.STDIN, &byte_buf) catch {
+            had_read_error = true;
+            break;
+        };
         if (n == 0) {
             if (line_pos > 0 and line_count < lines.len) {
                 lines[line_count] = env.alloc.dupe(u8, line_buf[0..line_pos]) catch return 1;
@@ -2116,7 +2212,7 @@ fn builtinMapfile(args: []const []const u8, env: *Environment) u8 {
     }
 
     env.setArray(array_name, lines[0..line_count]) catch return 1;
-    return 0;
+    return if (had_read_error) 1 else 0;
 }
 
 const PrintfSpec = struct {
@@ -2129,6 +2225,7 @@ const PrintfSpec = struct {
     width_star: bool = false,
     precision: ?usize = null,
     precision_star: bool = false,
+    time_format: ?[]const u8 = null,
     conversion: u8 = 0,
     len: usize = 0,
 };
@@ -2286,6 +2383,19 @@ fn printfParseSpec(fmt: []const u8) PrintfSpec {
         }
     }
 
+    if (i < fmt.len and fmt[i] == '(') {
+        const fmt_start = i + 1;
+        i += 1;
+        while (i < fmt.len and fmt[i] != ')') : (i += 1) {}
+        if (i < fmt.len and fmt[i] == ')' and i + 1 < fmt.len and fmt[i + 1] == 'T') {
+            spec.time_format = fmt[fmt_start..i];
+            spec.conversion = 'T';
+            i += 2;
+            spec.len = i;
+            return spec;
+        }
+    }
+
     if (i < fmt.len) {
         spec.conversion = fmt[i];
         i += 1;
@@ -2328,12 +2438,10 @@ fn printfParseNumericArg(arg: []const u8, had_error: *bool, had_overflow: ?*bool
     s = s[0..end];
     if (s.len == 0) return 0;
 
-    if (std.mem.indexOfScalar(u8, s, '#')) |hash_pos| {
+    if (std.mem.indexOfScalar(u8, s, '#') != null) {
         had_error.* = true;
+        if (had_overflow) |ov| ov.* = true;
         printfNumericError(arg);
-        if (hash_pos > 0) {
-            if (std.fmt.parseInt(i64, s[0..hash_pos], 10)) |v| return v else |_| {}
-        }
         return 0;
     }
 
@@ -2429,11 +2537,26 @@ fn printfFormatFloat(value: f64, spec: PrintfSpec) void {
     var fi: usize = 0;
     c_fmt[fi] = '%';
     fi += 1;
-    if (spec.flag_minus) { c_fmt[fi] = '-'; fi += 1; }
-    if (spec.flag_plus) { c_fmt[fi] = '+'; fi += 1; }
-    if (spec.flag_space) { c_fmt[fi] = ' '; fi += 1; }
-    if (spec.flag_zero) { c_fmt[fi] = '0'; fi += 1; }
-    if (spec.flag_hash) { c_fmt[fi] = '#'; fi += 1; }
+    if (spec.flag_minus) {
+        c_fmt[fi] = '-';
+        fi += 1;
+    }
+    if (spec.flag_plus) {
+        c_fmt[fi] = '+';
+        fi += 1;
+    }
+    if (spec.flag_space) {
+        c_fmt[fi] = ' ';
+        fi += 1;
+    }
+    if (spec.flag_zero) {
+        c_fmt[fi] = '0';
+        fi += 1;
+    }
+    if (spec.flag_hash) {
+        c_fmt[fi] = '#';
+        fi += 1;
+    }
     if (spec.width > 0) {
         const w = std.fmt.bufPrint(c_fmt[fi..], "{d}", .{spec.width}) catch return;
         fi += w.len;
@@ -2688,6 +2811,11 @@ fn printfFormatQString(arg: []const u8, spec: PrintfSpec) void {
         return;
     }
 
+    if (arg.len == 1 and arg[0] == '$') {
+        printfFormatString("\\$", spec);
+        return;
+    }
+
     var buf: [8192]u8 = undefined;
     var len: usize = 0;
 
@@ -2865,7 +2993,65 @@ fn printfFormatChar(arg: []const u8, spec: PrintfSpec) void {
     }
 }
 
-fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx: *usize) struct { status: u8, early_exit: bool } {
+fn printfSyncTzFromEnv(env: *Environment) void {
+    if (env.vars.get("TZ")) |v| {
+        if (v.exported) {
+            const tz_z = env.alloc.dupeZ(u8, v.value) catch {
+                _ = printf_time.unsetenv("TZ");
+                printf_time.tzset();
+                return;
+            };
+            defer env.alloc.free(tz_z);
+            _ = printf_time.setenv("TZ", tz_z.ptr, 1);
+        } else {
+            _ = printf_time.unsetenv("TZ");
+        }
+    } else {
+        _ = printf_time.unsetenv("TZ");
+    }
+    printf_time.tzset();
+}
+
+fn printfFormatTime(spec: PrintfSpec, arg: []const u8, env: *Environment, status: *u8) void {
+    var epoch: i64 = -1;
+    if (arg.len > 0) {
+        var had_error = false;
+        var had_overflow = false;
+        epoch = printfParseNumericArg(arg, &had_error, &had_overflow);
+        if (had_overflow or had_error) {
+            status.* = 1;
+            return;
+        }
+    }
+    if (epoch == -1) {
+        var now: printf_time.time_t = 0;
+        _ = printf_time.time(&now);
+        epoch = @intCast(now);
+    }
+
+    printfSyncTzFromEnv(env);
+
+    var t: printf_time.time_t = @intCast(epoch);
+    var tm: printf_time.Tm = undefined;
+    if (printf_time.localtime_r(&t, &tm) == null) {
+        status.* = 1;
+        return;
+    }
+
+    const tf = spec.time_format orelse "%a %b %e %H:%M:%S %Z %Y";
+    const tf_z = env.alloc.dupeZ(u8, tf) catch {
+        status.* = 1;
+        return;
+    };
+    defer env.alloc.free(tf_z);
+
+    var out_buf: [128]u8 = undefined;
+    const n = printf_time.strftime(&out_buf, out_buf.len, tf_z.ptr, &tm);
+    const out = if (n > 0) out_buf[0..n] else "";
+    printfFormatString(out, spec);
+}
+
+fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx: *usize, env: *Environment) struct { status: u8, early_exit: bool } {
     var status: u8 = 0;
     var i: usize = 0;
 
@@ -2965,6 +3151,10 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
                     if (had_error) status = 1;
                     printfFormatFloat(val, spec);
                 },
+                'T' => {
+                    const arg = printfGetNextArg(printf_args, arg_idx);
+                    printfFormatTime(spec, arg, env, &status);
+                },
                 0 => {
                     posix.writeAll(2, "printf: missing format character\n");
                     return .{ .status = 1, .early_exit = false };
@@ -3048,12 +3238,12 @@ fn builtinPrintf(args: []const []const u8, env: *Environment) u8 {
     }
 
     posix.stdout_write_error = false;
-    const result = printfProcessFormat(fmt, printf_args, &arg_idx);
+    const result = printfProcessFormat(fmt, printf_args, &arg_idx, env);
     if (result.status != 0) status = result.status;
     if (!result.early_exit and arg_idx > 0) {
         while (arg_idx < printf_args.len) {
             const prev_idx = arg_idx;
-            const loop_result = printfProcessFormat(fmt, printf_args, &arg_idx);
+            const loop_result = printfProcessFormat(fmt, printf_args, &arg_idx, env);
             if (loop_result.status != 0) status = loop_result.status;
             if (loop_result.early_exit) break;
             if (arg_idx == prev_idx) break;
@@ -3075,7 +3265,21 @@ fn builtinPrintf(args: []const []const u8, env: *Environment) u8 {
         posix.close(pipe_fds[0]);
 
         const val = output.toOwnedSlice(env.alloc) catch return 1;
-        env.set(vn, val, false) catch {};
+        if (std.mem.indexOfScalar(u8, vn, '[')) |lb| {
+            if (vn.len > lb + 2 and vn[vn.len - 1] == ']') {
+                const base = vn[0..lb];
+                const sub = vn[lb + 1 .. vn.len - 1];
+                if (std.fmt.parseInt(usize, sub, 10)) |idx| {
+                    env.setArrayElement(base, idx, val) catch {};
+                } else |_| {
+                    env.set(vn, val, false) catch {};
+                }
+            } else {
+                env.set(vn, val, false) catch {};
+            }
+        } else {
+            env.set(vn, val, false) catch {};
+        }
         env.alloc.free(val);
     }
 
@@ -3145,8 +3349,8 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
         return 1;
     }
 
-    if (std.fmt.parseInt(c_uint, mask_arg, 8)) |new_mask| {
-        _ = libc.umask(new_mask);
+    if (std.fmt.parseUnsigned(u64, mask_arg, 8)) |parsed_mask| {
+        _ = libc.umask(@as(libc.mode_t, @intCast(parsed_mask & 0o777)));
         return 0;
     } else |_| {}
 
@@ -3155,94 +3359,118 @@ fn builtinUmask(args: []const []const u8, _: *Environment) u8 {
         return 1;
     }
 
-    const current = libc.umask(0);
-    var perm: c_uint = ~current & 0o777;
-    const original_perm = perm;
+    const initial_mask_mode = libc.umask(0);
+    const initial_mask: c_uint = @as(c_uint, @intCast(initial_mask_mode & 0o777));
+    var mask: c_uint = initial_mask;
 
-    var i: usize = 0;
-    while (i < mask_arg.len) {
-        var who_u = false;
-        var who_g = false;
-        var who_o = false;
-        while (i < mask_arg.len) : (i += 1) {
-            switch (mask_arg[i]) {
-                'u' => who_u = true,
-                'g' => who_g = true,
-                'o' => who_o = true,
-                'a' => {
-                    who_u = true;
-                    who_g = true;
-                    who_o = true;
-                },
-                else => break,
-            }
-        }
-        if (!who_u and !who_g and !who_o) {
-            who_u = true;
-            who_g = true;
-            who_o = true;
-        }
-
-        if (i >= mask_arg.len) break;
-        var op = mask_arg[i];
-        if (op != '=' and op != '+' and op != '-') {
+    var clause_iter = std.mem.splitScalar(u8, mask_arg, ',');
+    while (clause_iter.next()) |clause| {
+        if (!parseUmaskClause(&mask, initial_mask, clause)) {
             posix.writeAll(2, "umask: invalid symbolic mode\n");
-            _ = libc.umask(current);
-            return 1;
-        }
-        i += 1;
-
-        while (true) {
-            var bits: c_uint = 0;
-            while (i < mask_arg.len and mask_arg[i] != ',') : (i += 1) {
-                switch (mask_arg[i]) {
-                    'r' => bits |= 4,
-                    'w' => bits |= 2,
-                    'x' => bits |= 1,
-                    'u' => bits |= (original_perm >> 6) & 7,
-                    'g' => bits |= (original_perm >> 3) & 7,
-                    'o' => bits |= original_perm & 7,
-                    else => break,
-                }
-            }
-
-            var mask_bits: c_uint = 0;
-            if (who_u) mask_bits |= bits << 6;
-            if (who_g) mask_bits |= bits << 3;
-            if (who_o) mask_bits |= bits;
-
-            switch (op) {
-                '=' => {
-                    var clear: c_uint = 0;
-                    if (who_u) clear |= 0o700;
-                    if (who_g) clear |= 0o070;
-                    if (who_o) clear |= 0o007;
-                    perm = (perm & ~clear) | mask_bits;
-                },
-                '+' => perm |= mask_bits,
-                '-' => perm &= ~mask_bits,
-                else => {},
-            }
-
-            if (i < mask_arg.len and (mask_arg[i] == '+' or mask_arg[i] == '-' or mask_arg[i] == '=')) {
-                op = mask_arg[i];
-                i += 1;
-                continue;
-            }
-            break;
-        }
-
-        if (i < mask_arg.len and mask_arg[i] == ',') {
-            i += 1;
-        } else if (i < mask_arg.len) {
-            posix.writeAll(2, "umask: invalid symbolic mode\n");
-            _ = libc.umask(current);
+            _ = libc.umask(initial_mask_mode);
             return 1;
         }
     }
 
-    _ = libc.umask(~perm & 0o777);
+    _ = libc.umask(@as(libc.mode_t, @intCast(mask & 0o777)));
     return 0;
+}
+
+fn umaskWhoBits(ch: u8) ?c_uint {
+    return switch (ch) {
+        'u' => 0o4,
+        'g' => 0o2,
+        'o' => 0o1,
+        'a' => 0o7,
+        else => null,
+    };
+}
+
+fn umaskPermCharBits(ch: u8) ?c_uint {
+    return switch (ch) {
+        'r' => 0o400,
+        'w' => 0o200,
+        'x' => 0o100,
+        'X' => 0o040,
+        's' => 0o020,
+        't' => 0o010,
+        'u' => 0o004,
+        'g' => 0o002,
+        'o' => 0o001,
+        else => null,
+    };
+}
+
+fn umaskPermlistToPerm(permlist: c_uint, initial_mask: c_uint) c_uint {
+    var perm: c_uint = 0;
+    if ((permlist & 0o400) != 0) perm |= 0o4;
+    if ((permlist & 0o200) != 0) perm |= 0o2;
+    if ((permlist & 0o100) != 0) perm |= 0o1;
+    if ((permlist & 0o040) != 0 and (initial_mask & 0o111) != 0) perm |= 0o1;
+    if ((permlist & 0o004) != 0) perm |= (~initial_mask & 0o700) >> 6;
+    if ((permlist & 0o002) != 0) perm |= (~initial_mask & 0o070) >> 3;
+    if ((permlist & 0o001) != 0) perm |= ~initial_mask & 0o007;
+    return perm & 0o7;
+}
+
+fn umaskSetBits(wholist: c_uint, perm: c_uint, mask: c_uint) c_uint {
+    var out = mask;
+    if ((wholist & 0o4) != 0) out |= perm << 6;
+    if ((wholist & 0o2) != 0) out |= perm << 3;
+    if ((wholist & 0o1) != 0) out |= perm;
+    return out & 0o777;
+}
+
+fn umaskClearBits(wholist: c_uint, perm: c_uint, mask: c_uint) c_uint {
+    var out = mask;
+    if ((wholist & 0o4) != 0) out &= ~(perm << 6);
+    if ((wholist & 0o2) != 0) out &= ~(perm << 3);
+    if ((wholist & 0o1) != 0) out &= ~perm;
+    return out & 0o777;
+}
+
+fn parseUmaskClause(mask: *c_uint, initial_mask: c_uint, clause: []const u8) bool {
+    if (clause.len == 0) return false;
+
+    var i: usize = 0;
+    var wholist: c_uint = 0;
+    while (i < clause.len) {
+        const wb = umaskWhoBits(clause[i]) orelse break;
+        wholist |= wb;
+        i += 1;
+    }
+    if (wholist == 0) wholist = 0o7;
+    if (i >= clause.len) return false;
+
+    while (i < clause.len) {
+        const op = clause[i];
+        if (op != '+' and op != '-' and op != '=') return false;
+        i += 1;
+
+        if (op == '=') {
+            mask.* = umaskSetBits(wholist, 0o7, mask.*);
+        }
+
+        if (i >= clause.len or clause[i] == '+' or clause[i] == '-' or clause[i] == '=') {
+            continue;
+        }
+
+        var permlist: c_uint = 0;
+        while (i < clause.len and clause[i] != '+' and clause[i] != '-' and clause[i] != '=') {
+            const pb = umaskPermCharBits(clause[i]) orelse return false;
+            permlist |= pb;
+            i += 1;
+        }
+
+        const perm = umaskPermlistToPerm(permlist, initial_mask);
+        if (op == '+' or op == '=') {
+            mask.* = umaskClearBits(wholist, perm, mask.*);
+        } else {
+            mask.* = umaskSetBits(wholist, perm, mask.*);
+        }
+    }
+
+    return true;
 }
 
 fn builtinType(args: []const []const u8, env: *Environment) u8 {
@@ -3445,9 +3673,9 @@ fn isExecutorBuiltin(name: []const u8) bool {
 
 fn isShellKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{
-        "if", "then", "else", "elif", "fi", "do", "done",
-        "case", "esac", "while", "until", "for", "in",
-        "{", "}", "!", "[[", "]]", "time",
+        "if",   "then", "else",  "elif",  "fi",   "do", "done",
+        "case", "esac", "while", "until", "for",  "in", "{",
+        "}",    "!",    "[[",    "]]",    "time",
     };
     for (keywords) |kw| {
         if (std.mem.eql(u8, name, kw)) return true;
@@ -3457,8 +3685,9 @@ fn isShellKeyword(name: []const u8) bool {
 
 fn isSpecialBuiltin(name: []const u8) bool {
     const specials = [_][]const u8{
-        ":", ".", "break", "continue", "eval", "exec", "exit",
-        "export", "readonly", "set", "shift", "unset", "return", "trap", "times",
+        ":",      ".",        "break", "continue", "eval",  "exec",   "exit",
+        "export", "readonly", "set",   "shift",    "unset", "return", "trap",
+        "times",
     };
     for (specials) |s| {
         if (std.mem.eql(u8, name, s)) return true;
@@ -4308,36 +4537,19 @@ fn sigFromName(name: []const u8) ?u6 {
     } else |_| {}
     const stripped = if (trimmed.len > 3 and eqlIgnoreCase(trimmed[0..3], "SIG")) trimmed[3..] else trimmed;
     if (eqlIgnoreCase(stripped, "EXIT")) return 0;
-    if (eqlIgnoreCase(stripped, "HUP")) return 1;
-    if (eqlIgnoreCase(stripped, "INT")) return 2;
-    if (eqlIgnoreCase(stripped, "QUIT")) return 3;
-    if (eqlIgnoreCase(stripped, "ILL")) return 4;
-    if (eqlIgnoreCase(stripped, "TRAP")) return 5;
-    if (eqlIgnoreCase(stripped, "ABRT")) return 6;
-    if (eqlIgnoreCase(stripped, "BUS")) return 7;
-    if (eqlIgnoreCase(stripped, "FPE")) return 8;
-    if (eqlIgnoreCase(stripped, "KILL")) return 9;
-    if (eqlIgnoreCase(stripped, "USR1")) return 10;
-    if (eqlIgnoreCase(stripped, "SEGV")) return 11;
-    if (eqlIgnoreCase(stripped, "USR2")) return 12;
-    if (eqlIgnoreCase(stripped, "PIPE")) return 13;
-    if (eqlIgnoreCase(stripped, "ALRM")) return 14;
-    if (eqlIgnoreCase(stripped, "TERM")) return 15;
-    if (eqlIgnoreCase(stripped, "CHLD")) return 17;
-    if (eqlIgnoreCase(stripped, "CONT")) return 18;
-    if (eqlIgnoreCase(stripped, "STOP")) return 19;
-    if (eqlIgnoreCase(stripped, "TSTP")) return 20;
-    if (eqlIgnoreCase(stripped, "TTIN")) return 21;
-    if (eqlIgnoreCase(stripped, "TTOU")) return 22;
-    if (eqlIgnoreCase(stripped, "URG")) return 23;
-    if (eqlIgnoreCase(stripped, "XCPU")) return 24;
-    if (eqlIgnoreCase(stripped, "XFSZ")) return 25;
-    if (eqlIgnoreCase(stripped, "VTALRM")) return 26;
-    if (eqlIgnoreCase(stripped, "PROF")) return 27;
-    if (eqlIgnoreCase(stripped, "WINCH")) return 28;
-    if (eqlIgnoreCase(stripped, "IO")) return 29;
-    if (eqlIgnoreCase(stripped, "PWR")) return 30;
-    if (eqlIgnoreCase(stripped, "SYS")) return 31;
+    for (1..32) |i| {
+        const sig: u6 = @intCast(i);
+        if (signals.sigNameFromNum(sig)) |short_name| {
+            if (eqlIgnoreCase(stripped, short_name)) return sig;
+        }
+        if (signals.sigFullName(sig)) |full_name| {
+            if (full_name.len > 3 and eqlIgnoreCase(full_name[0..3], "SIG")) {
+                if (eqlIgnoreCase(stripped, full_name[3..])) return sig;
+            } else if (eqlIgnoreCase(stripped, full_name)) {
+                return sig;
+            }
+        }
+    }
     return null;
 }
 
@@ -4443,8 +4655,12 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     has_uppercase = true;
                     flags_uppercase = !removing;
                 },
-                'a' => { flags_array = true; },
-                'g' => { flags_global = true; },
+                'a' => {
+                    flags_array = true;
+                },
+                'g' => {
+                    flags_global = true;
+                },
                 'A', 'n', 't' => {},
                 else => {},
             }
@@ -4658,8 +4874,14 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                     if (flags_export) v.exported = true;
                     if (flags_readonly) v.readonly = true;
                     if (flags_integer) v.integer = true;
-                    if (flags_lowercase) { v.lowercase = true; v.uppercase = false; }
-                    if (flags_uppercase) { v.uppercase = true; v.lowercase = false; }
+                    if (flags_lowercase) {
+                        v.lowercase = true;
+                        v.uppercase = false;
+                    }
+                    if (flags_uppercase) {
+                        v.uppercase = true;
+                        v.lowercase = false;
+                    }
                 } else if (!is_local) {
                     env.set(arg, "", flags_export) catch {};
                     if (flags_integer) {
@@ -4669,10 +4891,16 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                         if (env.vars.getPtr(arg)) |v| v.readonly = true;
                     }
                     if (flags_lowercase) {
-                        if (env.vars.getPtr(arg)) |v| { v.lowercase = true; v.uppercase = false; }
+                        if (env.vars.getPtr(arg)) |v| {
+                            v.lowercase = true;
+                            v.uppercase = false;
+                        }
                     }
                     if (flags_uppercase) {
-                        if (env.vars.getPtr(arg)) |v| { v.uppercase = true; v.lowercase = false; }
+                        if (env.vars.getPtr(arg)) |v| {
+                            v.uppercase = true;
+                            v.lowercase = false;
+                        }
                     }
                 }
             }
@@ -4728,6 +4956,27 @@ fn valueNeedsQuoting(value: []const u8) enum { none, single, ansi_c } {
     if (has_nonprint) return .ansi_c;
     if (has_special) return if (has_single_quote) .ansi_c else .single;
     return .none;
+}
+
+fn writeReinputDoubleQuotedValue(value: []const u8) void {
+    posix.writeAll(1, "\"");
+    for (value) |ch| {
+        switch (ch) {
+            '\\', '"', '$', '`' => {
+                posix.writeAll(1, "\\");
+                const b = [1]u8{ch};
+                posix.writeAll(1, &b);
+            },
+            '\n' => posix.writeAll(1, "\\n"),
+            '\t' => posix.writeAll(1, "\\t"),
+            '\r' => posix.writeAll(1, "\\r"),
+            else => {
+                const b = [1]u8{ch};
+                posix.writeAll(1, &b);
+            },
+        }
+    }
+    posix.writeAll(1, "\"");
 }
 
 fn declareWriteQuotedValue(value: []const u8) void {
@@ -5071,14 +5320,14 @@ fn builtinHelp(args: []const []const u8, _: *Environment) u8 {
     }
     const topic = args[1];
     const known_topics = [_][]const u8{
-        "cd",       "echo",     "exit",     "export",  "read",
-        "set",      "shift",    "test",     "trap",    "type",
-        "unset",    "alias",    "break",    "continue", "declare",
-        "eval",     "exec",     "fg",       "bg",      "getopts",
-        "hash",     "history",  "kill",     "let",     "local",
-        "printf",   "pushd",    "popd",     "dirs",    "readonly",
-        "return",   "shopt",    "source",   "umask",   "unalias",
-        "wait",     "mapfile",  "readarray", "true",   "false",
+        "cd",     "echo",    "exit",      "export",   "read",
+        "set",    "shift",   "test",      "trap",     "type",
+        "unset",  "alias",   "break",     "continue", "declare",
+        "eval",   "exec",    "fg",        "bg",       "getopts",
+        "hash",   "history", "kill",      "let",      "local",
+        "printf", "pushd",   "popd",      "dirs",     "readonly",
+        "return", "shopt",   "source",    "umask",    "unalias",
+        "wait",   "mapfile", "readarray", "true",     "false",
     };
     for (known_topics) |t| {
         if (std.mem.eql(u8, topic, t)) {
@@ -5154,6 +5403,7 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
             .{ .name = "progcomp", .val = &env.shopt.progcomp },
             .{ .name = "hostcomplete", .val = &env.shopt.hostcomplete },
             .{ .name = "histappend", .val = &env.shopt.histappend },
+            .{ .name = "strict_arg_parse", .val = &env.shopt.strict_arg_parse },
         };
         var any_off = false;
         for (fields) |f| {
@@ -5188,17 +5438,7 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
                 },
             }
         } else {
-            const set_o_ptr: ?*bool = if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace
-            else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit
-            else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset
-            else if (std.mem.eql(u8, name, "pipefail")) &env.options.pipefail
-            else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose
-            else if (std.mem.eql(u8, name, "allexport")) &env.options.allexport
-            else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber
-            else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec
-            else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob
-            else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor
-            else null;
+            const set_o_ptr: ?*bool = if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset else if (std.mem.eql(u8, name, "pipefail")) &env.options.pipefail else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose else if (std.mem.eql(u8, name, "allexport")) &env.options.allexport else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor else null;
             if (set_o_ptr) |ptr| {
                 switch (set_mode) {
                     .set => ptr.* = true,
@@ -5251,6 +5491,7 @@ fn shoptGetField(shopt: *@import("env.zig").Environment.ShoptOptions, name: []co
         .{ "progcomp", &shopt.progcomp },
         .{ "hostcomplete", &shopt.hostcomplete },
         .{ "histappend", &shopt.histappend },
+        .{ "strict_arg_parse", &shopt.strict_arg_parse },
         .{ "ignore_shopt_not_impl", &shopt.ignore_shopt_not_impl },
     };
     inline for (fields) |f| {
@@ -5285,16 +5526,7 @@ fn shoptSetO(opt_names: []const []const u8, mode: ShoptMode, env: *Environment) 
 
     var status: u8 = 0;
     for (opt_names) |name| {
-        const ptr: ?*bool = if (std.mem.eql(u8, name, "allexport")) &env.options.allexport
-            else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit
-            else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor
-            else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber
-            else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec
-            else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob
-            else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset
-            else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose
-            else if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace
-            else null;
+        const ptr: ?*bool = if (std.mem.eql(u8, name, "allexport")) &env.options.allexport else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose else if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace else null;
 
         if (ptr) |p| {
             switch (mode) {

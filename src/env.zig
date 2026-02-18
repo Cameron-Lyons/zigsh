@@ -12,6 +12,7 @@ pub const Environment = struct {
     shell_pid: posix.pid_t,
     last_bg_pid: ?posix.pid_t,
     ifs: []const u8,
+    logical_pwd: ?[]const u8,
 
     alloc: std.mem.Allocator,
 
@@ -110,6 +111,7 @@ pub const Environment = struct {
         progcomp: bool = true,
         hostcomplete: bool = true,
         histappend: bool = false,
+        strict_arg_parse: bool = false,
         ignore_shopt_not_impl: bool = false,
     };
 
@@ -154,6 +156,7 @@ pub const Environment = struct {
         else if (std.mem.eql(u8, name, "nocaseglob")) { self.shopt.nocaseglob = enable; }
         else if (std.mem.eql(u8, name, "nocasematch")) { self.shopt.nocasematch = enable; }
         else if (std.mem.eql(u8, name, "inherit_errexit")) { self.shopt.inherit_errexit = enable; }
+        else if (std.mem.eql(u8, name, "strict_arg_parse")) { self.shopt.strict_arg_parse = enable; }
     }
 
     pub fn init(alloc: std.mem.Allocator) Environment {
@@ -166,6 +169,7 @@ pub const Environment = struct {
             .shell_pid = posix.getpid(),
             .last_bg_pid = null,
             .ifs = " \t\n",
+            .logical_pwd = null,
             .alloc = alloc,
             .options = .{},
             .shopt = .{},
@@ -217,13 +221,21 @@ pub const Environment = struct {
             const cwd = posix.getcwd(&cwd_buf) catch null;
             if (cwd) |c_pwd| {
                 env.set("PWD", c_pwd, true) catch {};
+                env.setLogicalPwd(c_pwd) catch {};
             }
+        } else if (env.get("PWD")) |pwd| {
+            env.setLogicalPwd(pwd) catch {};
         }
 
         return env;
     }
 
     pub fn deinit(self: *Environment) void {
+        if (self.logical_pwd) |pwd| {
+            self.alloc.free(pwd);
+            self.logical_pwd = null;
+        }
+
         var it = self.vars.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -288,6 +300,18 @@ pub const Environment = struct {
     pub fn get(self: *const Environment, name: []const u8) ?[]const u8 {
         if (self.vars.get(name)) |v| return v.value;
         return null;
+    }
+
+    pub fn getLogicalPwd(self: *const Environment) ?[]const u8 {
+        return self.logical_pwd;
+    }
+
+    pub fn setLogicalPwd(self: *Environment, pwd: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, pwd);
+        if (self.logical_pwd) |old| {
+            self.alloc.free(old);
+        }
+        self.logical_pwd = owned;
     }
 
     pub fn getSubscripted(self: *const Environment, name: []const u8) ?[]const u8 {

@@ -729,9 +729,9 @@ pub const Executor = struct {
 
     fn executeFunctionDef(self: *Executor, fd: ast.FunctionDef) u8 {
         const special_builtins = [_][]const u8{
-            "break", ":", "continue", ".", "eval", "exec", "exit",
-            "export", "readonly", "return", "set", "shift", "times",
-            "trap", "unset",
+            "break",  ":",        "continue", ".",   "eval",  "exec",  "exit",
+            "export", "readonly", "return",   "set", "shift", "times", "trap",
+            "unset",
         };
         for (special_builtins) |sb| {
             if (std.mem.eql(u8, fd.name, sb)) {
@@ -1245,12 +1245,7 @@ pub const Executor = struct {
                     const digits = str[hash_idx + 1 ..];
                     var result: i64 = 0;
                     for (digits) |ch| {
-                        const d: i64 = if (ch >= '0' and ch <= '9') ch - '0'
-                        else if (ch >= 'a' and ch <= 'z') ch - 'a' + 10
-                        else if (ch >= 'A' and ch <= 'Z') ch - 'A' + 36
-                        else if (ch == '@') 62
-                        else if (ch == '_') 63
-                        else return 0;
+                        const d: i64 = if (ch >= '0' and ch <= '9') ch - '0' else if (ch >= 'a' and ch <= 'z') ch - 'a' + 10 else if (ch >= 'A' and ch <= 'Z') ch - 'A' + 36 else if (ch == '@') 62 else if (ch == '_') 63 else return 0;
                         if (d >= base_val) return 0;
                         result = result * base_val + d;
                     }
@@ -1548,7 +1543,7 @@ pub const Executor = struct {
                     posix.close(pipe_fds[1]);
                     try state.save(fd);
                     posix.dup2(pipe_fds[0], fd) catch return error.RedirectionFailed;
-                    posix.close(pipe_fds[0]);
+                    if (pipe_fds[0] != fd) posix.close(pipe_fds[0]);
                 },
                 else => {},
             }
@@ -1603,7 +1598,7 @@ pub const Executor = struct {
                 posix.close(pipe_fds[1]);
                 try state.save(fd);
                 posix.dup2(pipe_fds[0], fd) catch return error.RedirectionFailed;
-                posix.close(pipe_fds[0]);
+                if (pipe_fds[0] != fd) posix.close(pipe_fds[0]);
             },
         }
     }
@@ -2110,8 +2105,8 @@ pub const Executor = struct {
 
 fn isSpecialBuiltin(name: []const u8) bool {
     const specials = [_][]const u8{
-        ":", ".", "break", "continue", "eval", "exec", "exit",
-        "export", "readonly", "set", "shift", "unset",
+        ":",      ".",        "break", "continue", "eval",  "exec", "exit",
+        "export", "readonly", "set",   "shift",    "unset",
     };
     for (specials) |s| {
         if (std.mem.eql(u8, name, s)) return true;

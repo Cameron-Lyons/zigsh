@@ -2,7 +2,6 @@ const std = @import("std");
 const testing = std.testing;
 const process = std.process;
 const Io = std.Io;
-const ArrayList = std.ArrayList;
 
 const zigsh_argv_prefix = [_][]const u8{ "./zig-out/bin/zigsh", "-c" };
 
@@ -21,17 +20,33 @@ fn runShellWithInput(cmd: []const u8, input: []const u8) !struct { stdout: []u8,
     child.stdin.?.close(io);
     child.stdin = null;
 
-    var stdout: ArrayList(u8) = .empty;
-    defer stdout.deinit(testing.allocator);
-    var stderr: ArrayList(u8) = .empty;
-    defer stderr.deinit(testing.allocator);
+    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(testing.allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
 
-    try child.collectOutput(testing.allocator, &stdout, &stderr, 50 * 1024);
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > 50 * 1024 or stderr_reader.buffered().len > 50 * 1024) {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
     const term = try child.wait(io);
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer testing.allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    errdefer testing.allocator.free(stderr);
 
     return .{
-        .stdout = try stdout.toOwnedSlice(testing.allocator),
-        .stderr = try stderr.toOwnedSlice(testing.allocator),
+        .stdout = stdout,
+        .stderr = stderr,
         .term = term,
     };
 }
@@ -234,7 +249,7 @@ test "read successive reads consume lines" {
     );
 }
 
-test "read -p displays prompt on stderr" {
+test "read -p suppresses prompt on non-tty stderr" {
     const result = try runShellWithInput(
         "read -p 'Enter: ' x; printf '%s\\n' \"$x\"",
         "hello\n",
@@ -242,7 +257,7 @@ test "read -p displays prompt on stderr" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("hello\n", result.stdout);
-    try testing.expectEqualStrings("Enter: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
     try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
 }
 
@@ -265,7 +280,7 @@ test "read -p prompt with REPLY default" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("test\n", result.stdout);
-    try testing.expectEqualStrings("> ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -d custom delimiter" {
@@ -318,7 +333,7 @@ test "read -rp combined flags" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("back\\slash\n", result.stdout);
-    try testing.expectEqualStrings("prompt: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -r -d combined separate flags" {
@@ -337,7 +352,7 @@ test "read -r -p -d all three flags" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("<a\\b>\n", result.stdout);
-    try testing.expectEqualStrings("go: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -p with prompt as next arg" {
@@ -348,7 +363,7 @@ test "read -p with prompt as next arg" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("val\n", result.stdout);
-    try testing.expectEqualStrings("ask: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -d with delimiter as next arg" {

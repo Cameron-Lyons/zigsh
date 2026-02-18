@@ -54,11 +54,30 @@ pub const Shell = struct {
     }
 
     fn executeTrap(self: *Shell, action: []const u8) void {
+        const saved_status = self.env.last_exit_status;
+        const saved_should_exit = self.env.should_exit;
+        const saved_exit_value = self.env.exit_value;
+        const saved_should_return = self.env.should_return;
+        const saved_return_value = self.env.return_value;
+
+        self.env.should_exit = false;
+        self.env.should_return = false;
         _ = self.executeSource(action);
+
+        if (!self.env.should_exit) {
+            self.env.last_exit_status = saved_status;
+            self.env.should_exit = saved_should_exit;
+            self.env.exit_value = saved_exit_value;
+            self.env.should_return = saved_should_return;
+            self.env.return_value = saved_return_value;
+        }
     }
 
     fn checkSignalTraps(self: *Shell) void {
         while (signals.checkPendingSignals()) |sig| {
+            if (sig == signals.SIGINT and !self.env.options.interactive) {
+                continue;
+            }
             if (signals.trap_handlers[@intCast(sig)]) |action| {
                 self.executeTrap(action);
             }
@@ -68,13 +87,20 @@ pub const Shell = struct {
     pub fn runExitTrap(self: *Shell) void {
         if (signals.getExitTrap()) |action| {
             signals.setExitTrap(null);
+            const saved_status = self.env.last_exit_status;
             const saved_exit = self.env.should_exit;
             const saved_value = self.env.exit_value;
+            const saved_should_return = self.env.should_return;
+            const saved_return_value = self.env.return_value;
             self.env.should_exit = false;
+            self.env.should_return = false;
             _ = self.executeSource(action);
             if (self.env.should_exit) {} else {
+                self.env.last_exit_status = saved_status;
                 self.env.should_exit = saved_exit;
                 self.env.exit_value = saved_value;
+                self.env.should_return = saved_should_return;
+                self.env.return_value = saved_return_value;
             }
             self.gpa.free(action);
         }
@@ -107,6 +133,9 @@ pub const Shell = struct {
             if (cmd == null) break;
             status = executor.executeCompleteCommand(cmd.?);
             self.env.last_exit_status = status;
+            if (!self.env.should_exit and !self.env.should_return) {
+                self.checkSignalTraps();
+            }
             if (self.env.should_exit) break;
             if (self.env.should_return) break;
         }
@@ -191,12 +220,8 @@ pub const Shell = struct {
                 var parser = Parser.init(alloc, &lexer) catch break;
                 parser.env = &self.env;
                 if (parser.parseProgram()) |program| {
-                    if (self.env.options.verbose) {
-                        posix.writeAll(2, accum.items);
-                        posix.writeAll(2, "\n");
-                    }
-                    var executor = Executor.init(alloc, &self.env, &self.jobs);
-                    const status = executor.executeProgram(program);
+                    _ = program;
+                    const status = self.executeSource(accum.items);
                     self.env.last_exit_status = status;
                     break;
                 } else |err| {
@@ -209,30 +234,34 @@ pub const Shell = struct {
                         accum.append(self.gpa, '\n') catch break;
                         accum.appendSlice(self.gpa, cont) catch break;
                     } else {
-                        self.reportError("syntax error", err);
-                        self.env.last_exit_status = 2;
+                        const status = self.executeSource(accum.items);
+                        self.env.last_exit_status = status;
                         break;
                     }
                 }
             }
         }
         self.runExitTrap();
-        return self.env.exit_value;
+        if (self.env.should_exit) return self.env.exit_value;
+        return self.env.last_exit_status;
     }
 
     fn runSimple(self: *Shell) u8 {
         var buf: [4096]u8 = undefined;
+        const show_prompt = posix.isatty(0);
 
         while (!self.env.should_exit) {
             self.jobs.updateJobStatus();
             self.jobs.notifyDoneJobs();
             self.checkSignalTraps();
 
-            const ps1_raw = self.env.get("PS1") orelse "$ ";
-            const prompt_expanded = Expander.expandPromptString(self.gpa, ps1_raw, &self.env, &self.jobs) catch null;
-            defer if (prompt_expanded) |p| self.gpa.free(p);
-            const prompt = prompt_expanded orelse ps1_raw;
-            posix.writeAll(2, prompt);
+            if (show_prompt) {
+                const ps1_raw = self.env.get("PS1") orelse "$ ";
+                const prompt_expanded = Expander.expandPromptString(self.gpa, ps1_raw, &self.env, &self.jobs) catch null;
+                defer if (prompt_expanded) |p| self.gpa.free(p);
+                const prompt = prompt_expanded orelse ps1_raw;
+                posix.writeAll(2, prompt);
+            }
 
             const n = posix.read(0, &buf) catch break;
             if (n == 0) break;
@@ -255,21 +284,19 @@ pub const Shell = struct {
                 var parser = Parser.init(alloc, &lexer) catch break;
                 parser.env = &self.env;
                 if (parser.parseProgram()) |program| {
-                    if (self.env.options.verbose) {
-                        posix.writeAll(2, accum.items);
-                        posix.writeAll(2, "\n");
-                    }
-                    var executor = Executor.init(alloc, &self.env, &self.jobs);
-                    const status = executor.executeProgram(program);
+                    _ = program;
+                    const status = self.executeSource(accum.items);
                     self.env.last_exit_status = status;
                     break;
                 } else |err| {
                     if (isIncompleteError(err)) {
-                        const ps2_raw = self.env.get("PS2") orelse "> ";
-                        const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
-                        defer if (ps2_expanded) |p| self.gpa.free(p);
-                        const ps2 = ps2_expanded orelse ps2_raw;
-                        posix.writeAll(2, ps2);
+                        if (show_prompt) {
+                            const ps2_raw = self.env.get("PS2") orelse "> ";
+                            const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
+                            defer if (ps2_expanded) |p| self.gpa.free(p);
+                            const ps2 = ps2_expanded orelse ps2_raw;
+                            posix.writeAll(2, ps2);
+                        }
                         const n2 = posix.read(0, &buf) catch break;
                         if (n2 == 0) break;
                         var cont = buf[0..n2];
@@ -279,15 +306,16 @@ pub const Shell = struct {
                         accum.append(self.gpa, '\n') catch break;
                         accum.appendSlice(self.gpa, cont) catch break;
                     } else {
-                        self.reportError("syntax error", err);
-                        self.env.last_exit_status = 2;
+                        const status = self.executeSource(accum.items);
+                        self.env.last_exit_status = status;
                         break;
                     }
                 }
             }
         }
         self.runExitTrap();
-        return self.env.exit_value;
+        if (self.env.should_exit) return self.env.exit_value;
+        return self.env.last_exit_status;
     }
 
     fn loadHistory(self: *Shell) void {
