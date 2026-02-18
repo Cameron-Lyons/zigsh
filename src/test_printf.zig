@@ -1,24 +1,6 @@
 const std = @import("std");
-const testing = std.testing;
-const process = std.process;
-
-const zigsh_argv_prefix = [_][]const u8{ "./zig-out/bin/zigsh", "-c" };
-
-fn runShell(cmd: []const u8) !struct { stdout: []u8, stderr: []u8, term: process.Child.Term } {
-    const argv = zigsh_argv_prefix ++ .{cmd};
-    const result = try process.run(testing.allocator, testing.io, .{
-        .argv = &argv,
-    });
-    return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
-}
-
-fn expectOutput(cmd: []const u8, expected: []const u8) !void {
-    const result = try runShell(cmd);
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-    try testing.expectEqualStrings(expected, result.stdout);
-    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
-}
+const test_support = @import("test_support.zig");
+const expectOutput = test_support.expectOutput;
 
 test "printf %s" {
     try expectOutput("printf '%s' hello", "hello");
