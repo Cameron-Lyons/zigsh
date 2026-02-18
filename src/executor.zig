@@ -546,12 +546,13 @@ pub const Executor = struct {
             }
         }
 
+        var expanded_assign_values: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer expanded_assign_values.deinit(self.alloc);
+        var assigns_expanded = false;
+
         if (fields.len == 0) {
             if (simple.assigns.len > 0 and simple.words.len > 0) {
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch continue;
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             }
             return self.env.last_exit_status;
         }
@@ -596,16 +597,10 @@ pub const Executor = struct {
         var status: u8 = 0;
 
         if (std.mem.eql(u8, cmd_name, ".") or std.mem.eql(u8, cmd_name, "source")) {
-            for (simple.assigns) |assign| {
-                const value = expander.expandWord(assign.value) catch "";
-                self.env.set(assign.name, value, false) catch {};
-            }
+            self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             status = self.executeSourceBuiltin(fields);
         } else if (std.mem.eql(u8, cmd_name, "eval")) {
-            for (simple.assigns) |assign| {
-                const value = expander.expandWord(assign.value) catch "";
-                self.env.set(assign.name, value, false) catch {};
-            }
+            self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             status = self.executeEvalBuiltin(fields);
         } else if (std.mem.eql(u8, cmd_name, "exec")) {
             var cmd_idx: usize = 1;
@@ -618,10 +613,7 @@ pub const Executor = struct {
                 } else break;
             }
             if (cmd_idx >= fields.len) {
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.set(assign.name, value, true) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, true);
                 self.env.last_exit_status = 0;
                 return 0;
             }
@@ -653,35 +645,24 @@ pub const Executor = struct {
             }
         } else if (std.mem.eql(u8, cmd_name, "fc")) {
             status = self.executeFcBuiltin(fields);
-        } else if (self.env.functions.get(cmd_name) != null and !isSpecialBuiltin(cmd_name)) {
+        } else if (self.env.functions.get(cmd_name) != null and !builtins.isSpecialBuiltin(cmd_name)) {
             const has_temp_assigns = simple.assigns.len > 0;
             if (has_temp_assigns) {
                 self.env.pushScope() catch {};
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.declareLocal(assign.name) catch {};
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, true, false);
             }
             status = self.executeFunction(cmd_name, fields);
             if (has_temp_assigns) {
                 self.env.popScope();
             }
         } else if (builtins.lookup(cmd_name)) |builtin_fn| {
-            const is_special = isSpecialBuiltin(cmd_name);
+            const is_special = builtins.isSpecialBuiltin(cmd_name);
             const has_temp = simple.assigns.len > 0 and simple.words.len > 0 and !is_special and !is_assign_builtin;
             if (has_temp) {
                 self.env.pushScope() catch {};
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.declareLocal(assign.name) catch {};
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, true, false);
             } else if (simple.assigns.len > 0 and simple.words.len > 0) {
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             }
             status = builtin_fn(fields, self.env);
             if (has_temp) {
@@ -697,6 +678,56 @@ pub const Executor = struct {
         }
         self.env.last_exit_status = status;
         return status;
+    }
+
+    fn ensureExpandedAssignValues(
+        self: *Executor,
+        expander: *Expander,
+        assigns: []const ast.Assignment,
+        expanded_assign_values: *std.ArrayListUnmanaged([]const u8),
+        assigns_expanded: *bool,
+    ) void {
+        if (assigns_expanded.*) return;
+        expanded_assign_values.clearRetainingCapacity();
+        expanded_assign_values.ensureTotalCapacity(self.alloc, assigns.len) catch {};
+        for (assigns) |assign| {
+            const value = expander.expandWord(assign.value) catch "";
+            expanded_assign_values.append(self.alloc, value) catch {};
+        }
+        assigns_expanded.* = true;
+    }
+
+    fn applySimpleAssigns(
+        self: *Executor,
+        expander: *Expander,
+        assigns: []const ast.Assignment,
+        expanded_assign_values: *std.ArrayListUnmanaged([]const u8),
+        assigns_expanded: *bool,
+        declare_local: bool,
+        exported: bool,
+    ) void {
+        if (!assigns_expanded.*) {
+            expanded_assign_values.clearRetainingCapacity();
+            expanded_assign_values.ensureTotalCapacity(self.alloc, assigns.len) catch {};
+            for (assigns) |assign| {
+                const value = expander.expandWord(assign.value) catch "";
+                expanded_assign_values.append(self.alloc, value) catch {};
+                if (declare_local) self.env.declareLocal(assign.name) catch {};
+                self.env.set(assign.name, value, exported) catch {};
+            }
+            assigns_expanded.* = true;
+            return;
+        }
+
+        self.ensureExpandedAssignValues(expander, assigns, expanded_assign_values, assigns_expanded);
+        for (assigns, 0..) |assign, idx| {
+            const value = if (idx < expanded_assign_values.items.len)
+                expanded_assign_values.items[idx]
+            else
+                expander.expandWord(assign.value) catch "";
+            if (declare_local) self.env.declareLocal(assign.name) catch {};
+            self.env.set(assign.name, value, exported) catch {};
+        }
     }
 
     fn executeCompound(self: *Executor, cp: ast.CompoundPair) u8 {
@@ -728,20 +759,13 @@ pub const Executor = struct {
     }
 
     fn executeFunctionDef(self: *Executor, fd: ast.FunctionDef) u8 {
-        const special_builtins = [_][]const u8{
-            "break",  ":",        "continue", ".",   "eval",  "exec",  "exit",
-            "export", "readonly", "return",   "set", "shift", "times", "trap",
-            "unset",
-        };
-        for (special_builtins) |sb| {
-            if (std.mem.eql(u8, fd.name, sb)) {
-                posix.writeAll(2, "zigsh: ");
-                posix.writeAll(2, fd.name);
-                posix.writeAll(2, ": is a special builtin\n");
-                self.env.should_exit = true;
-                self.env.exit_value = 2;
-                return 2;
-            }
+        if (builtins.isSpecialBuiltin(fd.name)) {
+            posix.writeAll(2, "zigsh: ");
+            posix.writeAll(2, fd.name);
+            posix.writeAll(2, ": is a special builtin\n");
+            self.env.should_exit = true;
+            self.env.exit_value = 2;
+            return 2;
         }
         var has_heredoc = false;
         for (fd.body.redirects) |redir| {
@@ -1807,7 +1831,7 @@ pub const Executor = struct {
                 } else if (self.env.functions.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, "\n");
-                } else if (builtins.lookup(name) != null or isSpecialBuiltin(name)) {
+                } else if (builtins.lookup(name) != null or builtins.isSpecialBuiltin(name)) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, "\n");
                 } else if (self.findExecutable(name)) |path| {
@@ -1843,7 +1867,7 @@ pub const Executor = struct {
                 } else if (self.env.functions.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a function\n");
-                } else if (builtins.lookup(name) != null or isSpecialBuiltin(name)) {
+                } else if (builtins.lookup(name) != null or builtins.isSpecialBuiltin(name)) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a shell builtin\n");
                 } else if (self.findExecutable(name)) |path| {
@@ -2102,17 +2126,6 @@ pub const Executor = struct {
         return fields.toOwnedSlice(self.alloc);
     }
 };
-
-fn isSpecialBuiltin(name: []const u8) bool {
-    const specials = [_][]const u8{
-        ":",      ".",        "break", "continue", "eval",  "exec", "exit",
-        "export", "readonly", "set",   "shift",    "unset",
-    };
-    for (specials) |s| {
-        if (std.mem.eql(u8, name, s)) return true;
-    }
-    return false;
-}
 
 fn parseFdMove(s: []const u8) ?i32 {
     if (s.len >= 2 and s[s.len - 1] == '-') {

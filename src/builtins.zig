@@ -30,6 +30,15 @@ const printf_time = struct {
     };
 };
 
+const PrintfTzState = struct {
+    initialized: bool = false,
+    exported: bool = false,
+    value_hash: u64 = 0,
+    value_len: usize = 0,
+};
+
+var printf_tz_state = PrintfTzState{};
+
 pub const BuiltinFn = *const fn (args: []const []const u8, env: *Environment) u8;
 
 pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
@@ -84,6 +93,28 @@ pub const builtins = std.StaticStringMap(BuiltinFn).initComptime(.{
 
 pub fn lookup(name: []const u8) ?BuiltinFn {
     return builtins.get(name);
+}
+
+pub const special_builtins = std.StaticStringMap(void).initComptime(.{
+    .{ ":", {} },
+    .{ ".", {} },
+    .{ "break", {} },
+    .{ "continue", {} },
+    .{ "eval", {} },
+    .{ "exec", {} },
+    .{ "exit", {} },
+    .{ "export", {} },
+    .{ "readonly", {} },
+    .{ "set", {} },
+    .{ "shift", {} },
+    .{ "unset", {} },
+    .{ "return", {} },
+    .{ "trap", {} },
+    .{ "times", {} },
+});
+
+pub fn isSpecialBuiltin(name: []const u8) bool {
+    return special_builtins.has(name);
 }
 
 fn builtinColon(_: []const []const u8, _: *Environment) u8 {
@@ -2230,6 +2261,21 @@ const PrintfSpec = struct {
     len: usize = 0,
 };
 
+var printf_capture_output: ?*std.ArrayListUnmanaged(u8) = null;
+var printf_capture_alloc: ?std.mem.Allocator = null;
+var printf_capture_failed: bool = false;
+
+fn printfCaptureHook(fd: posix.fd_t, data: []const u8) bool {
+    if (fd != 1) return false;
+    const out = printf_capture_output orelse return false;
+    const alloc = printf_capture_alloc orelse return false;
+    out.appendSlice(alloc, data) catch {
+        printf_capture_failed = true;
+        return true;
+    };
+    return true;
+}
+
 fn printfProcessEscape(fmt: []const u8) struct { byte: u8, advance: usize } {
     if (fmt.len < 2 or fmt[0] != '\\') return .{ .byte = fmt[0], .advance = 1 };
     switch (fmt[1]) {
@@ -2994,22 +3040,47 @@ fn printfFormatChar(arg: []const u8, spec: PrintfSpec) void {
 }
 
 fn printfSyncTzFromEnv(env: *Environment) void {
+    var desired_exported = false;
+    var desired_hash: u64 = 0;
+    var desired_len: usize = 0;
+    var desired_value: []const u8 = "";
+
     if (env.vars.get("TZ")) |v| {
         if (v.exported) {
-            const tz_z = env.alloc.dupeZ(u8, v.value) catch {
-                _ = printf_time.unsetenv("TZ");
-                printf_time.tzset();
-                return;
-            };
-            defer env.alloc.free(tz_z);
-            _ = printf_time.setenv("TZ", tz_z.ptr, 1);
-        } else {
-            _ = printf_time.unsetenv("TZ");
+            desired_exported = true;
+            desired_value = v.value;
+            desired_len = v.value.len;
+            desired_hash = std.hash.Wyhash.hash(0, v.value);
         }
+    }
+
+    if (printf_tz_state.initialized and
+        printf_tz_state.exported == desired_exported and
+        printf_tz_state.value_hash == desired_hash and
+        printf_tz_state.value_len == desired_len)
+    {
+        return;
+    }
+
+    if (desired_exported) {
+        const tz_z = env.alloc.dupeZ(u8, desired_value) catch {
+            _ = printf_time.unsetenv("TZ");
+            printf_time.tzset();
+            printf_tz_state = .{ .initialized = true };
+            return;
+        };
+        defer env.alloc.free(tz_z);
+        _ = printf_time.setenv("TZ", tz_z.ptr, 1);
     } else {
         _ = printf_time.unsetenv("TZ");
     }
     printf_time.tzset();
+    printf_tz_state = .{
+        .initialized = true,
+        .exported = desired_exported,
+        .value_hash = desired_hash,
+        .value_len = desired_len,
+    };
 }
 
 fn printfFormatTime(spec: PrintfSpec, arg: []const u8, env: *Environment, status: *u8) void {
@@ -3051,10 +3122,36 @@ fn printfFormatTime(spec: PrintfSpec, arg: []const u8, env: *Environment, status
     printfFormatString(out, spec);
 }
 
-fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx: *usize, env: *Environment) struct { status: u8, early_exit: bool } {
-    var status: u8 = 0;
-    var i: usize = 0;
+const PrintfToken = union(enum) {
+    literal: []const u8,
+    conversion: PrintfSpec,
+};
 
+fn printfCompileFormat(fmt: []const u8, alloc: std.mem.Allocator) ![]PrintfToken {
+    var tokens: std.ArrayListUnmanaged(PrintfToken) = .empty;
+    errdefer {
+        for (tokens.items) |tok| {
+            switch (tok) {
+                .literal => |lit| alloc.free(lit),
+                .conversion => {},
+            }
+        }
+        tokens.deinit(alloc);
+    }
+
+    var literal: std.ArrayListUnmanaged(u8) = .empty;
+    defer literal.deinit(alloc);
+
+    const flushLiteral = struct {
+        fn f(tok_list: *std.ArrayListUnmanaged(PrintfToken), lit: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator) !void {
+            if (lit.items.len == 0) return;
+            const dup = try a.dupe(u8, lit.items);
+            try tok_list.append(a, .{ .literal = dup });
+            lit.clearRetainingCapacity();
+        }
+    }.f;
+
+    var i: usize = 0;
     while (i < fmt.len) {
         if (fmt[i] == '\\') {
             if (i + 1 < fmt.len and (fmt[i + 1] == 'u' or fmt[i + 1] == 'U')) {
@@ -3068,25 +3165,65 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
                     count += 1;
                 }
                 if (count > 0) {
-                    printfWriteUtf8(codepoint);
+                    var utf8_buf: [4]u8 = undefined;
+                    const utf8_len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch blk: {
+                        utf8_buf[0] = 0xef;
+                        utf8_buf[1] = 0xbf;
+                        utf8_buf[2] = 0xbd;
+                        break :blk @as(u3, 3);
+                    };
+                    try literal.appendSlice(alloc, utf8_buf[0..utf8_len]);
                     i = j;
-                } else {
-                    posix.writeAll(1, "\\");
-                    i += 1;
+                    continue;
                 }
-            } else {
-                const esc = printfProcessEscape(fmt[i..]);
-                const byte_arr: [1]u8 = .{esc.byte};
-                posix.writeAll(1, &byte_arr);
-                i += esc.advance;
+                try literal.append(alloc, '\\');
+                i += 1;
+                continue;
             }
-        } else if (fmt[i] == '%') {
+            const esc = printfProcessEscape(fmt[i..]);
+            try literal.append(alloc, esc.byte);
+            i += esc.advance;
+            continue;
+        }
+
+        if (fmt[i] == '%') {
             if (i + 1 < fmt.len and fmt[i + 1] == '%') {
-                posix.writeAll(1, "%");
+                try literal.append(alloc, '%');
                 i += 2;
                 continue;
             }
-            var spec = printfParseSpec(fmt[i..]);
+            try flushLiteral(&tokens, &literal, alloc);
+            const spec = printfParseSpec(fmt[i..]);
+            try tokens.append(alloc, .{ .conversion = spec });
+            i += spec.len;
+            continue;
+        }
+
+        try literal.append(alloc, fmt[i]);
+        i += 1;
+    }
+
+    try flushLiteral(&tokens, &literal, alloc);
+    return try tokens.toOwnedSlice(alloc);
+}
+
+fn printfFreeCompiledFormat(tokens: []const PrintfToken, alloc: std.mem.Allocator) void {
+    for (tokens) |tok| {
+        switch (tok) {
+            .literal => |lit| alloc.free(lit),
+            .conversion => {},
+        }
+    }
+    alloc.free(tokens);
+}
+
+fn printfRunCompiledFormat(tokens: []const PrintfToken, printf_args: []const []const u8, arg_idx: *usize, env: *Environment) struct { status: u8, early_exit: bool } {
+    var status: u8 = 0;
+
+    for (tokens) |tok| switch (tok) {
+        .literal => |lit| posix.writeAll(1, lit),
+        .conversion => |base_spec| {
+            var spec = base_spec;
             if (spec.width_star) {
                 const w_arg = printfGetNextArg(printf_args, arg_idx);
                 var w_err = false;
@@ -3167,14 +3304,9 @@ fn printfProcessFormat(fmt: []const u8, printf_args: []const []const u8, arg_idx
                     status = 1;
                 },
             }
-            i += spec.len;
-        } else {
-            var end = i + 1;
-            while (end < fmt.len and fmt[end] != '\\' and fmt[end] != '%') : (end += 1) {}
-            posix.writeAll(1, fmt[i..end]);
-            i = end;
-        }
-    }
+        },
+    };
+
     return .{ .status = status, .early_exit = false };
 }
 
@@ -3218,53 +3350,48 @@ fn builtinPrintf(args: []const []const u8, env: *Environment) u8 {
     const printf_args = if (args.len > fmt_idx + 1) args[fmt_idx + 1 ..] else &[_][]const u8{};
     var arg_idx: usize = 0;
     var status: u8 = 0;
+    const compiled_fmt = printfCompileFormat(fmt, env.alloc) catch return 1;
+    defer printfFreeCompiledFormat(compiled_fmt, env.alloc);
 
-    var saved_stdout: i32 = -1;
-    var pipe_fds: [2]i32 = .{ -1, -1 };
-    if (var_name != null) {
-        pipe_fds = posix.pipe() catch return 1;
-        saved_stdout = posix.dup(1) catch {
-            posix.close(pipe_fds[0]);
-            posix.close(pipe_fds[1]);
-            return 1;
-        };
-        posix.dup2(pipe_fds[1], 1) catch {
-            posix.close(saved_stdout);
-            posix.close(pipe_fds[0]);
-            posix.close(pipe_fds[1]);
-            return 1;
-        };
-        posix.close(pipe_fds[1]);
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(env.alloc);
+
+    const had_var_name = var_name != null;
+    const saved_hook = posix.write_hook;
+    if (had_var_name) {
+        printf_capture_output = &captured;
+        printf_capture_alloc = env.alloc;
+        printf_capture_failed = false;
+        posix.write_hook = &printfCaptureHook;
+    }
+    defer {
+        if (had_var_name) {
+            posix.write_hook = saved_hook;
+            printf_capture_output = null;
+            printf_capture_alloc = null;
+            printf_capture_failed = false;
+        }
     }
 
     posix.stdout_write_error = false;
-    const result = printfProcessFormat(fmt, printf_args, &arg_idx, env);
+    const result = printfRunCompiledFormat(compiled_fmt, printf_args, &arg_idx, env);
     if (result.status != 0) status = result.status;
     if (!result.early_exit and arg_idx > 0) {
         while (arg_idx < printf_args.len) {
             const prev_idx = arg_idx;
-            const loop_result = printfProcessFormat(fmt, printf_args, &arg_idx, env);
+            const loop_result = printfRunCompiledFormat(compiled_fmt, printf_args, &arg_idx, env);
             if (loop_result.status != 0) status = loop_result.status;
             if (loop_result.early_exit) break;
             if (arg_idx == prev_idx) break;
         }
     }
+
+    if (had_var_name and printf_capture_failed and status == 0) status = 1;
     if (posix.stdout_write_error and status == 0) status = 1;
 
     if (var_name) |vn| {
-        posix.dup2(saved_stdout, 1) catch {};
-        posix.close(saved_stdout);
-
-        var output: std.ArrayListUnmanaged(u8) = .empty;
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n = posix.read(pipe_fds[0], &buf) catch break;
-            if (n == 0) break;
-            output.appendSlice(env.alloc, buf[0..n]) catch break;
-        }
-        posix.close(pipe_fds[0]);
-
-        const val = output.toOwnedSlice(env.alloc) catch return 1;
+        if (printf_capture_failed) return 1;
+        const val = captured.items;
         if (std.mem.indexOfScalar(u8, vn, '[')) |lb| {
             if (vn.len > lb + 2 and vn[vn.len - 1] == ']') {
                 const base = vn[0..lb];
@@ -3280,7 +3407,6 @@ fn builtinPrintf(args: []const []const u8, env: *Environment) u8 {
         } else {
             env.set(vn, val, false) catch {};
         }
-        env.alloc.free(val);
     }
 
     return status;
@@ -3521,19 +3647,7 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
 
         if (flag_P) {
             if (flag_a) {
-                var any = false;
-                const path_env = env.get("PATH") orelse "/usr/bin:/bin";
-                var iter = std.mem.splitScalar(u8, path_env, ':');
-                while (iter.next()) |dir| {
-                    const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
-                    const full_z = std.posix.toPosixPath(full) catch continue;
-                    if (posix.access(&full_z, 1) and !isDirectory(&full_z)) {
-                        posix.writeAll(1, full);
-                        posix.writeAll(1, "\n");
-                        any = true;
-                    }
-                }
-                if (!any) {
+                if (!printTypePathMatches(name, env, .path_only)) {
                     status = 1;
                 }
             } else {
@@ -3612,25 +3726,9 @@ fn builtinType(args: []const []const u8, env: *Environment) u8 {
         }
 
         if (flag_a) {
-            const path_env = env.get("PATH") orelse "/usr/bin:/bin";
-            var iter = std.mem.splitScalar(u8, path_env, ':');
-            while (iter.next()) |dir| {
-                const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
-                const full_z = std.posix.toPosixPath(full) catch continue;
-                if (posix.access(&full_z, 1) and !isDirectory(&full_z)) {
-                    found = true;
-                    if (flag_t) {
-                        posix.writeAll(1, "file\n");
-                    } else if (flag_p) {
-                        posix.writeAll(1, full);
-                        posix.writeAll(1, "\n");
-                    } else {
-                        posix.writeAll(1, name);
-                        posix.writeAll(1, " is ");
-                        posix.writeAll(1, full);
-                        posix.writeAll(1, "\n");
-                    }
-                }
+            const mode: TypePathPrintMode = if (flag_t) .type_only else if (flag_p) .path_only else .name_and_path;
+            if (printTypePathMatches(name, env, mode)) {
+                found = true;
             }
         } else {
             if (findInPathNonDir(name, env)) |path| {
@@ -3683,34 +3781,6 @@ fn isShellKeyword(name: []const u8) bool {
     return false;
 }
 
-fn isSpecialBuiltin(name: []const u8) bool {
-    const specials = [_][]const u8{
-        ":",      ".",        "break", "continue", "eval",  "exec",   "exit",
-        "export", "readonly", "set",   "shift",    "unset", "return", "trap",
-        "times",
-    };
-    for (specials) |s| {
-        if (std.mem.eql(u8, name, s)) return true;
-    }
-    return false;
-}
-
-fn findInPath(name: []const u8, env: *const Environment) bool {
-    if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        const path_z = std.posix.toPosixPath(name) catch return false;
-        return posix.access(&path_z, 1);
-    }
-    const path_env = env.get("PATH") orelse "/usr/bin:/bin";
-    var iter = std.mem.splitScalar(u8, path_env, ':');
-    while (iter.next()) |dir| {
-        var full_buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, name }) catch continue;
-        const full_z = std.posix.toPosixPath(full) catch continue;
-        if (posix.access(&full_z, 1)) return true;
-    }
-    return false;
-}
-
 var find_path_result_buf: [4096]u8 = undefined;
 
 fn isDirectory(path_z: [*:0]const u8) bool {
@@ -3718,34 +3788,81 @@ fn isDirectory(path_z: [*:0]const u8) bool {
     return (st.mode & posix.S_IFDIR) != 0;
 }
 
-fn findInPathNonDir(name: []const u8, env: *const Environment) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        const path_z = std.posix.toPosixPath(name) catch return null;
-        if (posix.access(&path_z, 1) and !isDirectory(&path_z)) return name;
-        return null;
+const TypePathPrintMode = enum {
+    path_only,
+    type_only,
+    name_and_path,
+};
+
+fn printTypePathLine(name: []const u8, path: []const u8, mode: TypePathPrintMode) void {
+    switch (mode) {
+        .path_only => {
+            posix.writeAll(1, path);
+            posix.writeAll(1, "\n");
+        },
+        .type_only => {
+            posix.writeAll(1, "file\n");
+        },
+        .name_and_path => {
+            posix.writeAll(1, name);
+            posix.writeAll(1, " is ");
+            posix.writeAll(1, path);
+            posix.writeAll(1, "\n");
+        },
     }
-    const path_env = env.get("PATH") orelse "/usr/bin:/bin";
-    var iter = std.mem.splitScalar(u8, path_env, ':');
-    while (iter.next()) |dir| {
-        const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
-        const full_z = std.posix.toPosixPath(full) catch continue;
-        if (posix.access(&full_z, 1) and !isDirectory(&full_z)) return full;
-    }
-    return null;
 }
 
-fn findInPathStr(name: []const u8, env: *const Environment) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        const path_z = std.posix.toPosixPath(name) catch return null;
-        if (posix.access(&path_z, 1)) return name;
-        return null;
+fn printTypePathMatches(name: []const u8, env: *const Environment, mode: TypePathPrintMode) bool {
+    var any = false;
+
+    if (std.mem.indexOfScalar(u8, name, '/')) |_| {
+        const path_z = std.posix.toPosixPath(name) catch return false;
+        if (posix.access(&path_z, 1) and !isDirectory(&path_z)) {
+            printTypePathLine(name, name, mode);
+            any = true;
+        }
+        return any;
     }
+
     const path_env = env.get("PATH") orelse "/usr/bin:/bin";
     var iter = std.mem.splitScalar(u8, path_env, ':');
     while (iter.next()) |dir| {
         const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
         const full_z = std.posix.toPosixPath(full) catch continue;
-        if (posix.access(&full_z, 1)) return full;
+        if (posix.access(&full_z, 1) and !isDirectory(&full_z)) {
+            printTypePathLine(name, full, mode);
+            any = true;
+        }
+    }
+    return any;
+}
+
+fn isExecutableNonDir(path: []const u8) bool {
+    const path_z = std.posix.toPosixPath(path) catch return false;
+    return posix.access(&path_z, posix.X_OK) and !isDirectory(&path_z);
+}
+
+fn findInPathNonDir(name: []const u8, env: *Environment) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const path_z = std.posix.toPosixPath(name) catch return null;
+        if (posix.access(&path_z, posix.X_OK) and !isDirectory(&path_z)) return name;
+        return null;
+    }
+
+    if (env.getCachedCommand(name)) |cached| {
+        if (isExecutableNonDir(cached)) return cached;
+        env.removeCachedCommand(name);
+    }
+
+    const path_env = env.get("PATH") orelse "/usr/bin:/bin";
+    var iter = std.mem.splitScalar(u8, path_env, ':');
+    while (iter.next()) |dir| {
+        const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const full_z = std.posix.toPosixPath(full) catch continue;
+        if (posix.access(&full_z, posix.X_OK) and !isDirectory(&full_z)) {
+            env.cacheCommand(name, full) catch {};
+            return full;
+        }
     }
     return null;
 }
@@ -4098,18 +4215,8 @@ fn builtinHash(args: []const []const u8, env: *Environment) u8 {
 
     var status: u8 = 0;
     for (args[1..]) |name| {
-        if (findInPath(name, env)) {
-            const path_env = env.get("PATH") orelse "/usr/bin:/bin";
-            var iter = std.mem.splitScalar(u8, path_env, ':');
-            while (iter.next()) |dir| {
-                var full_buf: [4096]u8 = undefined;
-                const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, name }) catch continue;
-                const full_z = std.posix.toPosixPath(full) catch continue;
-                if (posix.access(&full_z, 1)) {
-                    env.cacheCommand(name, full) catch {};
-                    break;
-                }
-            }
+        if (findInPathNonDir(name, env)) |path| {
+            env.cacheCommand(name, path) catch {};
         } else {
             posix.writeAll(2, "hash: ");
             posix.writeAll(2, name);
