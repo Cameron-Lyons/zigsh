@@ -1,1 +1,0 @@
-echo flag --eval; false; echo bye
