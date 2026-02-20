@@ -523,14 +523,6 @@ pub const Expander = struct {
         }
     }
 
-    fn resolveIndirectName(self: *Expander, name: []const u8) ?[]const u8 {
-        if (name.len > 1 and name[0] == '!') {
-            const ref_name = name[1..];
-            return self.env.get(ref_name);
-        }
-        return name;
-    }
-
     fn expandArrayKeys(self: *Expander, op: ast.PrefixListOp) ExpandError![]const u8 {
         if (self.env.getArray(op.prefix)) |elems| {
             var result: std.ArrayListUnmanaged(u8) = .empty;

@@ -2312,15 +2312,6 @@ fn printfProcessEscape(fmt: []const u8) struct { byte: u8, advance: usize } {
     }
 }
 
-fn printfWriteUtf8(codepoint: u21) void {
-    var buf: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(codepoint, &buf) catch {
-        posix.writeAll(1, "\xef\xbf\xbd");
-        return;
-    };
-    posix.writeAll(1, buf[0..len]);
-}
-
 fn printfProcessBEscape(fmt: []const u8) struct { byte: u8, advance: usize, is_unicode: bool, codepoint: u21 } {
     if (fmt.len < 2 or fmt[0] != '\\') return .{ .byte = fmt[0], .advance = 1, .is_unicode = false, .codepoint = 0 };
     switch (fmt[1]) {
