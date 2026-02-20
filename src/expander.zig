@@ -8,6 +8,7 @@ const posix = @import("posix.zig");
 const types = @import("types.zig");
 const Environment = @import("env.zig").Environment;
 const signals = @import("signals.zig");
+const shell_utils = @import("shell_utils.zig");
 
 pub const ExpandError = error{
     UnsetVariable,
@@ -506,7 +507,7 @@ pub const Expander = struct {
             if (self.getParamValue(var_name)) |val| return try self.alloc.dupe(u8, val);
             return try self.alloc.dupe(u8, "");
         }
-        if (!isValidVarName(var_name)) {
+        if (!shell_utils.isValidVarName(var_name)) {
             posix.writeAll(2, "zigsh: ");
             posix.writeAll(2, var_name);
             posix.writeAll(2, ": invalid variable name\n");
@@ -560,15 +561,6 @@ pub const Expander = struct {
         if (std.fmt.parseInt(i64, subscript, 10) catch null) |val| return val;
         const expanded = self.expandArithmetic(subscript) catch return null;
         return std.fmt.parseInt(i64, expanded, 10) catch null;
-    }
-
-    fn isValidVarName(name: []const u8) bool {
-        if (name.len == 0) return false;
-        if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
-        for (name[1..]) |ch| {
-            if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
-        }
-        return true;
     }
 
     const StripMode = enum { prefix_short, prefix_long, suffix_short, suffix_long };
