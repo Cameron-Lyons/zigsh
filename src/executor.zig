@@ -680,23 +680,6 @@ pub const Executor = struct {
         return status;
     }
 
-    fn ensureExpandedAssignValues(
-        self: *Executor,
-        expander: *Expander,
-        assigns: []const ast.Assignment,
-        expanded_assign_values: *std.ArrayListUnmanaged([]const u8),
-        assigns_expanded: *bool,
-    ) void {
-        if (assigns_expanded.*) return;
-        expanded_assign_values.clearRetainingCapacity();
-        expanded_assign_values.ensureTotalCapacity(self.alloc, assigns.len) catch {};
-        for (assigns) |assign| {
-            const value = expander.expandWord(assign.value) catch "";
-            expanded_assign_values.append(self.alloc, value) catch {};
-        }
-        assigns_expanded.* = true;
-    }
-
     fn applySimpleAssigns(
         self: *Executor,
         expander: *Expander,
@@ -719,7 +702,6 @@ pub const Executor = struct {
             return;
         }
 
-        self.ensureExpandedAssignValues(expander, assigns, expanded_assign_values, assigns_expanded);
         for (assigns, 0..) |assign, idx| {
             const value = if (idx < expanded_assign_values.items.len)
                 expanded_assign_values.items[idx]
@@ -1495,13 +1477,29 @@ pub const Executor = struct {
 
     fn findExecutable(self: *Executor, name: []const u8) ?[*:0]const u8 {
         if (std.mem.indexOfScalar(u8, name, '/') != null) {
+            const name_z = std.posix.toPosixPath(name) catch return null;
+            const st = posix.stat(&name_z) catch return null;
+            if (st.mode & posix.S_IFMT != posix.S_IFREG) return null;
+            if (!posix.access(&name_z, posix.X_OK)) return null;
             const duped = self.alloc.dupeZ(u8, name) catch return null;
             return duped.ptr;
         }
 
         if (self.env.getCachedCommand(name)) |cached| {
-            const duped = self.alloc.dupeZ(u8, cached) catch return null;
-            return duped.ptr;
+            const cached_z = std.posix.toPosixPath(cached) catch {
+                self.env.removeCachedCommand(name);
+                return null;
+            };
+            const st = posix.stat(&cached_z) catch {
+                self.env.removeCachedCommand(name);
+                return null;
+            };
+            if (st.mode & posix.S_IFMT != posix.S_IFREG or !posix.access(&cached_z, posix.X_OK)) {
+                self.env.removeCachedCommand(name);
+            } else {
+                const duped = self.alloc.dupeZ(u8, cached) catch return null;
+                return duped.ptr;
+            }
         }
 
         const path_env = self.env.get("PATH") orelse "/usr/bin:/bin";
