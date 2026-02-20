@@ -15,6 +15,7 @@ const glob = @import("glob.zig");
 const token = @import("token.zig");
 const signals = @import("signals.zig");
 const Arithmetic = @import("arithmetic.zig").Arithmetic;
+const shell_utils = @import("shell_utils.zig");
 
 pub const Executor = struct {
     env: *Environment,
@@ -1446,6 +1447,7 @@ pub const Executor = struct {
             posix.writeAll(2, ": command not found\n");
             return 127;
         };
+        defer self.alloc.free(std.mem.sliceTo(path, 0));
 
         const pid = posix.fork() catch {
             posix.writeAll(2, "zigsh: fork failed\n");
@@ -1476,43 +1478,10 @@ pub const Executor = struct {
     }
 
     fn findExecutable(self: *Executor, name: []const u8) ?[*:0]const u8 {
-        if (std.mem.indexOfScalar(u8, name, '/') != null) {
-            const name_z = std.posix.toPosixPath(name) catch return null;
-            const st = posix.stat(&name_z) catch return null;
-            if (st.mode & posix.S_IFMT != posix.S_IFREG) return null;
-            if (!posix.access(&name_z, posix.X_OK)) return null;
-            const duped = self.alloc.dupeZ(u8, name) catch return null;
-            return duped.ptr;
-        }
-
-        if (self.env.getCachedCommand(name)) |cached| {
-            const cached_z = std.posix.toPosixPath(cached) catch {
-                self.env.removeCachedCommand(name);
-                return null;
-            };
-            const st = posix.stat(&cached_z) catch {
-                self.env.removeCachedCommand(name);
-                return null;
-            };
-            if (st.mode & posix.S_IFMT != posix.S_IFREG or !posix.access(&cached_z, posix.X_OK)) {
-                self.env.removeCachedCommand(name);
-            } else {
-                const duped = self.alloc.dupeZ(u8, cached) catch return null;
-                return duped.ptr;
-            }
-        }
-
-        const path_env = self.env.get("PATH") orelse "/usr/bin:/bin";
-        var iter = std.mem.splitScalar(u8, path_env, ':');
-        while (iter.next()) |dir| {
-            const full_path = std.fmt.allocPrintSentinel(self.alloc, "{s}/{s}", .{ dir, name }, 0) catch continue;
-            const st = posix.stat(full_path.ptr) catch continue;
-            if (st.mode & posix.S_IFMT == posix.S_IFREG and posix.access(full_path.ptr, posix.X_OK)) {
-                self.env.cacheCommand(name, std.mem.sliceTo(full_path, 0)) catch {};
-                return full_path.ptr;
-            }
-        }
-        return null;
+        var path_buf: [4096]u8 = undefined;
+        const path = shell_utils.findInPathNonDir(name, self.env, &path_buf) orelse return null;
+        const duped = self.alloc.dupeZ(u8, path) catch return null;
+        return duped.ptr;
     }
 
     fn buildArgv(self: *Executor, fields: []const []const u8) ![:null]const ?[*:0]const u8 {
@@ -1653,7 +1622,9 @@ pub const Executor = struct {
         }
 
         const filename = fields[arg_start];
-        const path = self.resolveSourcePath(filename);
+        const resolved = self.resolveSourcePath(filename);
+        defer if (resolved.owned) self.alloc.free(resolved.path);
+        const path = resolved.path;
         const fd = posix.open(path, posix.oRdonly(), 0) catch {
             posix.writeAll(2, ".: ");
             posix.writeAll(2, filename);
@@ -1698,21 +1669,30 @@ pub const Executor = struct {
         return status;
     }
 
-    fn resolveSourcePath(self: *Executor, filename: []const u8) []const u8 {
+    const ResolvedPath = struct {
+        path: []const u8,
+        owned: bool,
+    };
+
+    fn resolveSourcePath(self: *Executor, filename: []const u8) ResolvedPath {
         if (std.mem.indexOfScalar(u8, filename, '/') != null) {
-            return filename;
+            return .{ .path = filename, .owned = false };
         }
 
         const path_env = self.env.get("PATH") orelse "";
         var path_iter = std.mem.splitScalar(u8, path_env, ':');
+        var full_buf: [4096]u8 = undefined;
         while (path_iter.next()) |dir| {
-            const full = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ dir, filename }) catch continue;
+            const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, filename }) catch continue;
             const full_z = std.posix.toPosixPath(full) catch continue;
             const st = posix.stat(&full_z) catch continue;
             if (st.mode & posix.S_IFMT == posix.S_IFDIR) continue;
-            if (posix.access(&full_z, posix.R_OK)) return full;
+            if (posix.access(&full_z, posix.R_OK)) {
+                const owned = self.alloc.dupe(u8, full) catch continue;
+                return .{ .path = owned, .owned = true };
+            }
         }
-        return filename;
+        return .{ .path = filename, .owned = false };
     }
 
     fn executeEvalBuiltin(self: *Executor, fields: []const []const u8) u8 {
@@ -1769,6 +1749,7 @@ pub const Executor = struct {
             posix.writeAll(2, ": not found\n");
             return 127;
         };
+        defer self.alloc.free(std.mem.sliceTo(path, 0));
 
         const envp = self.env.buildEnvp() catch return 1;
         if (argv0_override) |a0| {
@@ -1834,6 +1815,7 @@ pub const Executor = struct {
                     posix.writeAll(1, "\n");
                 } else if (self.findExecutable(name)) |path| {
                     const p = std.mem.sliceTo(path, 0);
+                    defer self.alloc.free(p);
                     const st = posix.stat(path) catch {
                         status = 1;
                         continue;
@@ -1869,6 +1851,7 @@ pub const Executor = struct {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a shell builtin\n");
                 } else if (self.findExecutable(name)) |path| {
+                    defer self.alloc.free(std.mem.sliceTo(path, 0));
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is ");
                     posix.writeAll(1, std.mem.sliceTo(path, 0));

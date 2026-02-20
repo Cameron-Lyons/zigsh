@@ -5,6 +5,7 @@ const LineEditor = @import("line_editor.zig").LineEditor;
 const signals = @import("signals.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
+const shell_utils = @import("shell_utils.zig");
 const libc = std.c;
 const printf_time = struct {
     extern "c" fn time(tloc: ?*time_t) time_t;
@@ -445,7 +446,7 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             const is_append = eq > 0 and arg[eq - 1] == '+';
             const name = if (is_append) arg[0 .. eq - 1] else arg[0..eq];
-            if (!isValidVarName(name)) {
+            if (!shell_utils.isValidVarName(name)) {
                 posix.writeAll(2, "export: `");
                 posix.writeAll(2, arg);
                 posix.writeAll(2, "': not a valid identifier\n");
@@ -460,7 +461,7 @@ fn builtinExport(args: []const []const u8, env: *Environment) u8 {
             }
             env.set(name, value, !unexport) catch return 1;
         } else {
-            if (!isValidVarName(arg)) {
+            if (!shell_utils.isValidVarName(arg)) {
                 posix.writeAll(2, "export: `");
                 posix.writeAll(2, arg);
                 posix.writeAll(2, "': not a valid identifier\n");
@@ -501,7 +502,7 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
                 if (name.len > bracket + 2 and name[name.len - 1] == ']') {
                     const base = name[0..bracket];
                     const subscript = name[bracket + 1 .. name.len - 1];
-                    if (!isValidVarName(base)) {
+                    if (!shell_utils.isValidVarName(base)) {
                         posix.writeAll(2, "zigsh: unset: `");
                         posix.writeAll(2, name);
                         posix.writeAll(2, "': not a valid identifier\n");
@@ -546,7 +547,7 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
                     continue;
                 }
             }
-            if (!isValidVarName(name)) {
+            if (!shell_utils.isValidVarName(name)) {
                 posix.writeAll(2, "zigsh: unset: `");
                 posix.writeAll(2, name);
                 posix.writeAll(2, "': not a valid identifier\n");
@@ -569,21 +570,12 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
     return status;
 }
 
-fn isValidVarName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (name[0] != '_' and !std.ascii.isAlphabetic(name[0])) return false;
-    for (name[1..]) |ch| {
-        if (ch != '_' and !std.ascii.isAlphanumeric(ch)) return false;
-    }
-    return true;
-}
-
 fn isValidVarRef(name: []const u8) bool {
     if (std.mem.indexOfScalar(u8, name, '[')) |bracket| {
         if (name.len == 0 or name[name.len - 1] != ']') return false;
-        return isValidVarName(name[0..bracket]);
+        return shell_utils.isValidVarName(name[0..bracket]);
     }
-    return isValidVarName(name);
+    return shell_utils.isValidVarName(name);
 }
 
 fn setWriteValue(value: []const u8) void {
@@ -1820,7 +1812,7 @@ fn builtinReadonly(args: []const []const u8, env: *Environment) u8 {
             env.set(name, value, false) catch return 1;
             env.markReadonly(name);
         } else {
-            if (!isValidVarName(arg)) {
+            if (!shell_utils.isValidVarName(arg)) {
                 posix.writeAll(2, "readonly: `");
                 posix.writeAll(2, arg);
                 posix.writeAll(2, "': not a valid identifier\n");
@@ -3828,34 +3820,8 @@ fn printTypePathMatches(name: []const u8, env: *const Environment, mode: TypePat
     return any;
 }
 
-fn isExecutableNonDir(path: []const u8) bool {
-    const path_z = std.posix.toPosixPath(path) catch return false;
-    return posix.access(&path_z, posix.X_OK) and !isDirectory(&path_z);
-}
-
 fn findInPathNonDir(name: []const u8, env: *Environment) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        const path_z = std.posix.toPosixPath(name) catch return null;
-        if (posix.access(&path_z, posix.X_OK) and !isDirectory(&path_z)) return name;
-        return null;
-    }
-
-    if (env.getCachedCommand(name)) |cached| {
-        if (isExecutableNonDir(cached)) return cached;
-        env.removeCachedCommand(name);
-    }
-
-    const path_env = env.get("PATH") orelse "/usr/bin:/bin";
-    var iter = std.mem.splitScalar(u8, path_env, ':');
-    while (iter.next()) |dir| {
-        const full = std.fmt.bufPrint(&find_path_result_buf, "{s}/{s}", .{ dir, name }) catch continue;
-        const full_z = std.posix.toPosixPath(full) catch continue;
-        if (posix.access(&full_z, posix.X_OK) and !isDirectory(&full_z)) {
-            env.cacheCommand(name, full) catch {};
-            return full;
-        }
-    }
-    return null;
+    return shell_utils.findInPathNonDir(name, env, &find_path_result_buf);
 }
 
 fn builtinGetopts(args: []const []const u8, env: *Environment) u8 {
@@ -4893,7 +4859,7 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
         if (std.mem.indexOf(u8, arg, "=")) |eq| {
             const is_append = eq > 0 and arg[eq - 1] == '+';
             const name = if (is_append) arg[0 .. eq - 1] else arg[0..eq];
-            if (!isValidVarName(name)) {
+            if (!shell_utils.isValidVarName(name)) {
                 posix.writeAll(2, args[0]);
                 posix.writeAll(2, ": `");
                 posix.writeAll(2, arg);
@@ -4942,7 +4908,7 @@ fn builtinDeclare(args: []const []const u8, env: *Environment) u8 {
                 if (env.vars.getPtr(name)) |v| v.readonly = true;
             }
         } else {
-            if (!isValidVarName(arg)) {
+            if (!shell_utils.isValidVarName(arg)) {
                 posix.writeAll(2, args[0]);
                 posix.writeAll(2, ": `");
                 posix.writeAll(2, arg);
