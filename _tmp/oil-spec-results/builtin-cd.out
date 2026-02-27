@@ -1,0 +1,43 @@
+builtin-cd: FATAL: Got 0 Oils failures, but 3 are allowed
+builtin-cd: FATAL: Got 2 total failures, but 3 are allowed
+builtin-cd.test.sh
+[1mcase	line	dash	bash	zsh	osh	[0;0m
+  0	  5	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd and $PWD
+  1	 10	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd BAD/..
+  2	 26	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd with 2 or more args - with strict_arg_parse
+  3	 54	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	cd with 2 or more args is allowed (strict_arg_parse disabled)
+  4	 63	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	cd - without OLDPWD
+  5	 81	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	$OLDPWD
+  6	101	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pwd
+  7	108	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pwd after cd ..
+  8	120	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pwd with symlink and -P
+  9	140	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	setting $PWD doesn't affect the value of 'pwd' builtin
+ 10	155	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	unset PWD; then pwd
+ 11	170	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	'unset PWD; pwd' before any cd (tickles a rare corner case)
+ 12	182	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	lie about PWD; pwd before any cd
+ 13	194	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	remove pwd dir
+ 14	215	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pwd in symlinked dir on shell initialization
+ 15	236	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Test the current directory after 'cd ..' involving symlinks
+ 16	253	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd with no arguments
+ 17	260	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd to nonexistent dir
+ 18	266	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd away from dir that was deleted
+ 19	279	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd permits double bare dash
+ 20	284	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd to symlink with -L and -P
+ 21	305	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cd to relative path with -L and -P
+ 22	334	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	unset PWD; cd /tmp is allowed (regression)
+ 23	343	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	CDPATH is respected
+ 24	366	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Change directory in non-shell parent process (make or Python)
+ 25	407	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	What happens when inherited $PWD and current dir disagree?
+ 26	467	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Survey of getcwd() syscall
+ 27	488	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	chdir is a synonym for cd - busybox ash
+ 28	511	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	arguments to pwd
+ 29	516	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pwd errors out on args with strict_arg_parse
+
+[1m		dash	bash	zsh	osh	[0;0m
+	[32m[1mpass[0;0m	25	26	25	30
+	[33m[1mok[0;0m	1	0	2	0
+	[33m[1mN-I[0;0m	2	2	0	0
+	[33m[1mBUG[0;0m	2	0	3	0
+	[31m[1mFAIL[0;0m	0	2	0	0
+	total	30	30	30	30
+

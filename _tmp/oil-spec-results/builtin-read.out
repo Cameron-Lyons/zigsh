@@ -1,0 +1,79 @@
+builtin-read: FATAL: Got 0 Oils failures, but 1 are allowed
+builtin-read: FATAL: Got 8 total failures, but 1 are allowed
+builtin-read.test.sh
+[1mcase	line	bash	zsh	osh	[0;0m
+  0	  4	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read line from here doc
+  1	 15	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read from empty file
+  2	 34	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read /dev/null
+  3	 42	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read with zero args
+  4	 52	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read builtin with no newline returns status 1
+  5	 65	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read builtin splits value across multiple vars
+  6	 75	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read builtin with too few variables
+  7	 85	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n (with $REPLY)
+  8	 93	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	IFS= read -n (OSH regression: value saved in tempenv)
+  9	100	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n doesn't strip whitespace (bug fix)
+ 10	154	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -d -n - respects delimiter and splits
+ 11	213	[33m[1mok[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n with invalid arg
+ 12	220	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n from pipe
+ 13	231	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read without args uses $REPLY, no splitting occurs (without -n)
+ 14	274	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n vs. -N
+ 15	311	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -N ignores delimiters
+ 16	324	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read will unset extranous vars
+ 17	349	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -r ignores backslashes
+ 18	356	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read -r with other backslash escapes
+ 19	365	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read with line continuation reads multiple physical lines
+ 20	375	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read multiple vars spanning many lines
+ 21	385	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read -r with \n
+ 22	395	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -s from pipe, not a terminal
+ 23	415	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read with IFS=$'\n'
+ 24	426	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read multiple lines with IFS=:
+ 25	441	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read with IFS=''
+ 26	449	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read does not respect C backslash escapes
+ 27	465	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	dynamic scope used to set vars
+ 28	477	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -a reads into array
+ 29	509	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -d : (colon-separated records)
+ 30	530	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -d '' (null-separated records)
+ 31	551	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -rd
+ 32	565	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -d when there's no delimiter
+ 33	582	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -t 0 tests if input is available
+ 34	605	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read -t 0.5
+ 35	619	[33m[1mBUG[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read -t -0.5 is invalid
+ 36	634	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -u
+ 37	647	[33m[1mok[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	read -u syntax error
+ 38	657	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -u -s
+ 39	670	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -u 3 -d 5
+ 40	683	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -u 3 -d b -N 6
+ 41	705	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -N doesn't respect delimiter, while read -n does
+ 42	720	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -p (not fully tested)
+ 43	736	[33m[1mok[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	read usage
+ 44	748	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read with smooshed args
+ 45	757	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -r -d '' for NUL strings, e.g. find -print0
+ 46	777	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read from redirected directory is non-fatal error
+ 47	794	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	read -n from directory
+ 48	810	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	mapfile from directory (bash doesn't handle errors)
+ 49	825	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n 0
+ 50	841	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n and backslash escape
+ 51	863	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n 4 with incomplete backslash
+ 52	889	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	read -n 4 with backslash + delim
+ 53	905	[32m[1mpass[0;0m	[34m[1mok-2[0;0m	[32m[1mpass[0;0m	"backslash + newline" should be swallowed regardless of "-d <delim>"
+ 54	926	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	empty input and splitting
+ 55	942	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	IFS='x ' read -a: trailing spaces (unlimited split)
+ 56	966	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	IFS='x ' read a b: trailing spaces (with max_split)
+ 57	983	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	IFS='x ' read -a: intermediate spaces (unlimited split)
+ 58	1010	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	IFS='x ' incomplete backslash
+ 59	1021	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	IFS='\ ' and backslash escaping
+ 60	1036	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	max_split and backslash escaping
+ 61	1046	[32m[1mpass[0;0m	[34m[1mok-2[0;0m	[32m[1mpass[0;0m	IFS=x read a b <<< xxxxxx
+ 62	1104	[32m[1mpass[0;0m	[34m[1mok-2[0;0m	[32m[1mpass[0;0m	read and "\ "
+ 63	1168	[31m[1mFAIL[0;0m	[36m[1mok-3[0;0m	[32m[1mpass[0;0m	read bash bug
+
+[1m		bash	zsh	osh	[0;0m
+	[32m[1mpass[0;0m	52	26	64
+	[36m[1mok-3[0;0m	0	1	0
+	[34m[1mok-2[0;0m	0	3	0
+	[33m[1mok[0;0m	3	2	0
+	[33m[1mN-I[0;0m	0	24	0
+	[33m[1mBUG[0;0m	1	8	0
+	[31m[1mFAIL[0;0m	8	0	0
+	total	64	64	64
+

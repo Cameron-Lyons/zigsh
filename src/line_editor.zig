@@ -43,6 +43,7 @@ pub const LineEditor = struct {
     pub const History = struct {
         entries: [1024]?[]const u8,
         count: usize,
+        start_idx: usize,
         just_cleared: bool,
         alloc: std.mem.Allocator,
         file_path: ?[]const u8,
@@ -51,6 +52,7 @@ pub const LineEditor = struct {
             return .{
                 .entries = [_]?[]const u8{null} ** 1024,
                 .count = 0,
+                .start_idx = 0,
                 .just_cleared = false,
                 .alloc = alloc,
                 .file_path = null,
@@ -72,39 +74,43 @@ pub const LineEditor = struct {
         pub fn add(self: *History, line: []const u8) void {
             if (line.len == 0) return;
             if (self.count > 0) {
-                if (self.entries[self.count - 1]) |last| {
+                const last_idx = (self.start_idx + self.count - 1) % self.entries.len;
+                if (self.entries[last_idx]) |last| {
                     if (std.mem.eql(u8, last, line)) return;
                 }
             }
             const duped = self.alloc.dupe(u8, line) catch return;
             if (self.count < self.entries.len) {
-                self.entries[self.count] = duped;
+                const insert_idx = (self.start_idx + self.count) % self.entries.len;
+                self.entries[insert_idx] = duped;
                 self.count += 1;
             } else {
-                if (self.entries[0]) |first| {
-                    self.alloc.free(first);
+                const overwrite_idx = self.start_idx;
+                if (self.entries[overwrite_idx]) |old| {
+                    self.alloc.free(old);
                 }
-                for (0..self.entries.len - 1) |i| {
-                    self.entries[i] = self.entries[i + 1];
-                }
-                self.entries[self.entries.len - 1] = duped;
+                self.entries[overwrite_idx] = duped;
+                self.start_idx = (self.start_idx + 1) % self.entries.len;
             }
         }
 
         pub fn clear(self: *History) void {
             for (0..self.count) |i| {
-                if (self.entries[i]) |e| {
+                const idx = (self.start_idx + i) % self.entries.len;
+                if (self.entries[idx]) |e| {
                     self.alloc.free(e);
-                    self.entries[i] = null;
+                    self.entries[idx] = null;
                 }
             }
             self.count = 0;
+            self.start_idx = 0;
             self.just_cleared = true;
         }
 
         pub fn get(self: *const History, idx: usize) ?[]const u8 {
-            if (idx < self.count) return self.entries[idx];
-            return null;
+            if (idx >= self.count) return null;
+            const phys_idx = (self.start_idx + idx) % self.entries.len;
+            return self.entries[phys_idx];
         }
 
         pub fn loadFile(self: *History, path: []const u8) void {
@@ -123,14 +129,16 @@ pub const LineEditor = struct {
 
         pub fn saveFile(self: *const History) void {
             const path = self.file_path orelse return;
+            const path_z = self.alloc.dupeZ(u8, path) catch return;
+            defer self.alloc.free(path_z);
             const fd = posix.openZ(
-                (self.alloc.dupeZ(u8, path) catch return).ptr,
+                path_z.ptr,
                 posix.oWronlyCreatTrunc(),
                 0o644,
             ) catch return;
             defer posix.close(fd);
             for (0..self.count) |i| {
-                if (self.entries[i]) |entry| {
+                if (self.get(i)) |entry| {
                     _ = posix.write(fd, entry) catch {};
                     _ = posix.write(fd, "\n") catch {};
                 }
@@ -247,7 +255,7 @@ pub const LineEditor = struct {
     fn insertChar(self: *LineEditor, ch: u8) void {
         if (self.len >= self.buf.len - 1) return;
         if (self.cursor < self.len) {
-            std.mem.copyBackwards(u8, self.buf[self.cursor + 1 .. self.len + 1], self.buf[self.cursor .. self.len]);
+            std.mem.copyBackwards(u8, self.buf[self.cursor + 1 .. self.len + 1], self.buf[self.cursor..self.len]);
         }
         self.buf[self.cursor] = ch;
         self.len += 1;
@@ -257,7 +265,7 @@ pub const LineEditor = struct {
 
     fn backspace(self: *LineEditor) void {
         if (self.cursor == 0) return;
-        std.mem.copyForwards(u8, self.buf[self.cursor - 1 .. self.len - 1], self.buf[self.cursor .. self.len]);
+        std.mem.copyForwards(u8, self.buf[self.cursor - 1 .. self.len - 1], self.buf[self.cursor..self.len]);
         self.cursor -= 1;
         self.len -= 1;
         self.refreshLine();
@@ -300,7 +308,7 @@ pub const LineEditor = struct {
     }
 
     fn killToBeginning(self: *LineEditor) void {
-        std.mem.copyForwards(u8, self.buf[0 .. self.len - self.cursor], self.buf[self.cursor .. self.len]);
+        std.mem.copyForwards(u8, self.buf[0 .. self.len - self.cursor], self.buf[self.cursor..self.len]);
         self.len -= self.cursor;
         self.cursor = 0;
         self.refreshLine();
@@ -312,7 +320,7 @@ pub const LineEditor = struct {
         while (end > 0 and self.buf[end - 1] == ' ') : (end -= 1) {}
         while (end > 0 and self.buf[end - 1] != ' ') : (end -= 1) {}
         const removed = self.cursor - end;
-        std.mem.copyForwards(u8, self.buf[end .. self.len - removed], self.buf[self.cursor .. self.len]);
+        std.mem.copyForwards(u8, self.buf[end .. self.len - removed], self.buf[self.cursor..self.len]);
         self.len -= removed;
         self.cursor = end;
         self.refreshLine();
