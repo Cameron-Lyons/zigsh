@@ -1,0 +1,42 @@
+builtin-getopts: FATAL: Got 0 Oils failures, but 3 are allowed
+builtin-getopts: FATAL: Got 0 total failures, but 3 are allowed
+builtin-getopts.test.sh
+[1mcase	line	dash	bash	osh	[0;0m
+  0	  4	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts empty
+  1	 10	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts sees unknown arg
+  2	 18	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts three invocations
+  3	 32	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts resets OPTARG
+  4	 43	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	OPTARG is empty (not unset) after parsing a flag doesn't take an arg
+  5	 60	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Basic getopts invocation
+  6	 74	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	getopts with invalid variable name
+  7	 82	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts with invalid flag
+  8	 95	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts with with -
+  9	111	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts missing required argument
+ 10	124	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts doesn't look for flags after args
+ 11	138	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts with explicit args
+ 12	155	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	OPTIND
+ 13	159	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	OPTIND after multiple getopts with same spec
+ 14	192	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	OPTIND after multiple getopts with different spec
+ 15	240	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[33m[1mBUG[0;0m	OPTIND narrowed down
+ 16	276	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Getopts parses the function's arguments
+ 17	292	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Local OPTIND
+ 18	304	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	two flags: -ab
+ 19	318	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	flag and arg: -c10
+ 20	332	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	More Smooshing 1
+ 21	350	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	More Smooshing 2
+ 22	368	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	OPTIND should be >= 1 (regression)
+ 23	384	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts bug #1523
+ 24	398	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	More regression for #1523
+ 25	412	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts silent error reporting - invalid option
+ 26	422	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts silent error reporting - missing required argument
+ 27	432	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts normal mode - invalid option (compare with silent)
+ 28	440	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts normal mode - missing required argument (compare with silent)
+ 29	448	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts handles '--' #2579
+ 30	468	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	getopts leaves all args after '--' as operands #2579
+
+[1m		dash	bash	osh	[0;0m
+	[32m[1mpass[0;0m	25	28	30
+	[33m[1mok[0;0m	4	1	0
+	[33m[1mBUG[0;0m	2	2	1
+	total	31	31	31
+

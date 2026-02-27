@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+awk '{ lines[NR] = $0 } END { for (i = NR; i >= 1; i--) print lines[i] }' "$@"

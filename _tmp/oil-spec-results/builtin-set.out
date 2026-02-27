@@ -1,0 +1,36 @@
+builtin-set: FATAL: Got 1 total failures, but 0 are allowed
+builtin-set.test.sh
+[1mcase	line	bash	dash	zsh	osh	[0;0m
+  0	  4	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	can continue after unknown option
+  1	 18	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set with both options and argv
+  2	 26	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	nounset with "$@"
+  3	 32	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -u -- clears argv
+  4	 38	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -u -- x y z
+  5	 44	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -u with undefined variable exits the interpreter
+  6	 65	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	set -u with undefined var in interactive shell does NOT exit the interpreter
+  7	 99	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	set -u error can break out of nested evals
+  8	127	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	reset option with long flag
+  9	134	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	reset option with short flag
+ 10	141	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -eu (flag parsing)
+ 11	149	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -o lists options
+ 12	156	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	'set' and 'eval' round trip
+ 13	199	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	set - - and so forth
+ 14	238	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	set - leading single dash is ignored, turns off xtrace verbose (#2364)
+ 15	282	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	set - stops option processing like set --
+ 16	306	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	A single + is an ignored flag; not an argument
+ 17	341	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	set - + and + -
+ 18	363	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -a exports variables
+ 19	373	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set +a stops exporting
+ 20	384	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -o allexport (long form)
+ 21	395	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	variables set before set -a are not exported
+ 22	405	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -a exports local variables
+ 23	417	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set -a exports declare variables
+
+[1m		bash	dash	zsh	osh	[0;0m
+	[32m[1mpass[0;0m	24	20	15	24
+	[33m[1mok[0;0m	0	1	1	0
+	[33m[1mN-I[0;0m	0	1	2	0
+	[33m[1mBUG[0;0m	0	2	5	0
+	[31m[1mFAIL[0;0m	0	0	1	0
+	total	24	24	24	24
+

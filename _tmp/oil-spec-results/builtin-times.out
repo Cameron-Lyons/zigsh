@@ -1,0 +1,4 @@
+builtin-times.test.sh
+[1mcase	line	bash	zsh	osh	[0;0m
+  0	  3	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	times shows two formatted lines
+

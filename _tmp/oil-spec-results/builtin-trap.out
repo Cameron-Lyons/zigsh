@@ -1,0 +1,45 @@
+builtin-trap: FATAL: Got 0 Oils failures, but 2 are allowed
+builtin-trap.test.sh
+[1mcase	line	dash	bash	osh	[0;0m
+  0	  4	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	traps are not active inside subshells $() ()  trap | cat
+  1	 51	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap accepts/ignores --
+  2	 59	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Register invalid trap, remove invalid trap
+  3	 75	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap foo gives non-zero error
+  4	 86	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	SIGINT and INT are aliases
+  5	100	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap without args prints traps
+  6	114	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	print trap handler with multiple lines
+  7	134	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap -p is like trap: it prints the handlers and full signal names
+  8	152	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Register the same handler for multiple signals
+  9	168	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Remove multiple handlers with trap -
+ 10	186	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT clears the EXIT trap
+ 11	222	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap 0 is equivalent to trap EXIT
+ 12	242	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap 1 is equivalent to SIGHUP; HUP is equivalent to SIGHUP
+ 13	265	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap 0 2 resets EXIT AND SIGINT
+ 14	286	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap '' EXIT - printing state
+ 15	314	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap 'echo hi' KILL (regression test, caught by smoosh suite)
+ 16	334	[31m[1mFAIL[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	exit 1 when trap code string is invalid
+ 17	358	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT calling exit
+ 18	367	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT return status ignored
+ 19	376	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT with PARSE error
+ 20	383	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT with PARSE error and explicit exit
+ 21	389	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT with explicit exit
+ 22	400	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT with command sub / subshell / pipeline
+ 23	416	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	eval in the exit trap (regression for issue #293)
+ 24	423	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	exit codes for traps are isolated
+ 25	440	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	traps are cleared in subshell (started with &)
+ 26	473	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap USR1, sleep, SIGINT: non-interactively
+ 27	482	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap INT, sleep, SIGINT: non-interactively
+ 28	502	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap EXIT, sleep, SIGINT: non-interactively
+ 29	511	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Remove trap with an unsigned integer
+ 30	555	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap '' sets handler to empty string (SIG_IGN)
+ 31	572	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap '' with multiple signals
+ 32	590	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	trap with command.NoOp - check internal invariant
+
+[1m		dash	bash	osh	[0;0m
+	[32m[1mpass[0;0m	23	31	33
+	[33m[1mok[0;0m	6	0	0
+	[33m[1mN-I[0;0m	3	0	0
+	[33m[1mBUG[0;0m	0	1	0
+	[31m[1mFAIL[0;0m	1	1	0
+	total	33	33	33
+

@@ -1,0 +1,5 @@
+_backslash_dq='\ "'
+_space='[ ]'
+_sq=''"'"'single quotes'"'"
+_unicode='$[\u03bc]'
+_whitespace='$[\t\r\n]'
