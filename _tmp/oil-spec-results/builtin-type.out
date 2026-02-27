@@ -1,0 +1,18 @@
+builtin-type: FATAL: Got 1 total failures, but 0 are allowed
+builtin-type.test.sh
+[1mcase	line	bash	zsh	dash	osh	[0;0m
+  0	  4	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	type -> keyword builtin
+  1	 17	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	type -> alias external
+  2	 52	[31m[1mFAIL[0;0m	[33m[1mok[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	type of relative path
+  3	 79	[32m[1mpass[0;0m	[33m[1mok[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	type -> not found
+  4	109	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	special builtins are called out
+  5	145	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	more special builtins
+
+[1m		bash	zsh	dash	osh	[0;0m
+	[32m[1mpass[0;0m	3	1	3	6
+	[33m[1mok[0;0m	0	3	0	0
+	[33m[1mN-I[0;0m	2	2	1	0
+	[33m[1mBUG[0;0m	0	0	2	0
+	[31m[1mFAIL[0;0m	1	0	0	0
+	total	6	6	6	6
+

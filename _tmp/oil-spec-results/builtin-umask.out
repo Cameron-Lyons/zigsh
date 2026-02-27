@@ -1,0 +1,35 @@
+builtin-umask: FATAL: Got 0 Oils failures, but 2 are allowed
+builtin-umask.test.sh
+[1mcase	line	dash	bash	zsh	osh	[0;0m
+  0	  4	[33m[1mBUG[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	usage: too many args
+  1	 17	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	usage: empty input, space input
+  2	 41	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	symbolic syntax error: b=rwx
+  3	 57	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	symbolic syntax error: start with -
+  4	 82	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	usage: invalid octal digits
+  5	 92	[31m[1mFAIL[0;0m	[33m[1mok[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	usage: large octal number
+  6	111	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	'umask' without args prints the umask
+  7	120	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	'umask -S' prints symbolic umask
+  8	129	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	'umask -p' prints a form that can be eval'd
+  9	144	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	'umask 0002' sets the umask
+ 10	160	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set umask with symbolic mode: g-w,o-w
+ 11	178	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	set umask with symbolic mode: u-rw  ...  u=,g+,o-  ...
+ 12	226	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	umask with too many arguments (i.e. extra spaces)
+ 13	244	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	umask allow overwriting and duplicates
+ 14	253	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	umask a is valid who
+ 15	272	[33m[1mBUG[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	umask X perm
+ 16	313	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	umask s perm
+ 17	346	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	umask t perm
+ 18	387	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	umask default who
+ 19	418	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	umask bare op
+ 20	445	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	umask permcopy
+ 21	469	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	umask permcopy running value
+ 22	488	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	umask sequential actions
+
+[1m		dash	bash	zsh	osh	[0;0m
+	[32m[1mpass[0;0m	16	14	13	23
+	[33m[1mok[0;0m	0	1	0	0
+	[33m[1mN-I[0;0m	2	7	7	0
+	[33m[1mBUG[0;0m	4	1	2	0
+	[31m[1mFAIL[0;0m	1	0	1	0
+	total	23	23	23	23
+

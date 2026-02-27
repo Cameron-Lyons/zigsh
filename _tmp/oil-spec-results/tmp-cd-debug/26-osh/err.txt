@@ -1,0 +1,1 @@
+zigsh: strace: command not found

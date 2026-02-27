@@ -1,0 +1,16 @@
+_=set
+_backslash_dq='\ "'
+_comp_assocs=( '' )
+_comp_dumpfile=/Users/cam/.zcompdump
+_comp_options
+_comp_setup
+_compautos
+_comps
+_lastcomp
+_patcomps
+_postpatcomps
+_services
+_space='[ ]'
+_sq=\''single quotes'\'
+_unicode='[μ]'
+_whitespace=$'[\t\C-M\n]'

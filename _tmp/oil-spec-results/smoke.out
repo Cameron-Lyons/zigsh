@@ -1,0 +1,21 @@
+smoke.test.sh
+[1mcase	line	bash	dash	osh	[0;0m
+  0	  7	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	builtin
+  1	 11	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	command sub
+  2	 15	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	command sub with builtin
+  3	 19	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pipeline
+  4	 23	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	pipeline with builtin
+  5	 27	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	and-or chains
+  6	 44	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	here doc with var
+  7	 52	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	here doc without var
+  8	 59	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	here doc with builtin
+  9	 66	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Redirect external command
+ 10	 72	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Redirect with builtin
+ 11	 77	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Here doc with redirect
+ 12	 85	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	"$@" "$*"
+ 13	 92	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	$@ $*
+ 14	 99	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	failed command
+ 15	103	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	subshell
+ 16	111	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	for loop
+ 17	123	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	vars
+

@@ -1,0 +1,18 @@
+posix.test.sh
+[1mcase	line	dash	bash	osh	[0;0m
+  0	  8	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Empty for loop is allowed
+  1	 16	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Empty for loop without in.  Do can be on the same line I guess.
+  2	 29	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Empty case statement
+  3	 34	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Last case without ;;
+  4	 42	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Only case without ;;
+  5	 49	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Case with optional (
+  6	 57	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Empty action for case is syntax error
+  7	 69	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Empty action is allowed for last case
+  8	 77	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Case with | pattern
+  9	 86	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Bare semi-colon not allowed
+ 10	100	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Command substitution in default
+ 11	105	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Arithmetic expansion
+ 12	118	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Newlines in compound lists
+ 13	140	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Multiple here docs on one line
+ 14	151	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	cat here doc; echo; cat here doc
+
