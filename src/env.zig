@@ -250,6 +250,13 @@ pub const Environment = struct {
         }
         self.functions.deinit();
 
+        var arit = self.arrays.iterator();
+        while (arit.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.freeArrayStorage(entry.value_ptr.*);
+        }
+        self.arrays.deinit();
+
         self.positional_stack.deinit(self.alloc);
 
         for (self.scope_stack.items) |*frame| {
@@ -436,10 +443,23 @@ pub const Environment = struct {
 
     pub fn setArray(self: *Environment, name: []const u8, elements: []const []const u8) !void {
         const owned_elems = try self.alloc.alloc([]const u8, elements.len);
+        var copied: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < copied) : (i += 1) {
+                self.alloc.free(owned_elems[i]);
+            }
+            self.alloc.free(owned_elems);
+        }
         for (elements, 0..) |elem, i| {
             owned_elems[i] = try self.alloc.dupe(u8, elem);
+            copied += 1;
         }
-        const owned_name = if (self.arrays.getKey(name)) |k| k else try self.alloc.dupe(u8, name);
+        const owned_name = if (self.arrays.fetchRemove(name)) |kv| blk: {
+            self.freeArrayStorage(kv.value);
+            break :blk kv.key;
+        } else try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned_name);
         try self.arrays.put(owned_name, owned_elems);
         const scalar = if (elements.len > 0) elements[0] else "";
         self.set(name, scalar, false) catch {};
@@ -447,34 +467,56 @@ pub const Environment = struct {
 
     pub fn setArrayElement(self: *Environment, name: []const u8, index: usize, value: []const u8) !void {
         const owned_value = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(owned_value);
         if (self.arrays.getPtr(name)) |elems_ptr| {
-            var elems = elems_ptr.*;
+            const elems = elems_ptr.*;
             if (index < elems.len) {
+                self.alloc.free(elems[index]);
                 @constCast(elems)[index] = owned_value;
             } else {
                 var new_elems = try self.alloc.alloc([]const u8, index + 1);
+                var filled: usize = elems.len;
+                errdefer {
+                    var j: usize = elems.len;
+                    while (j < filled) : (j += 1) {
+                        if (j != index) self.alloc.free(new_elems[j]);
+                    }
+                    self.alloc.free(new_elems);
+                }
                 for (0..new_elems.len) |i| {
                     if (i < elems.len) {
                         new_elems[i] = elems[i];
                     } else if (i == index) {
                         new_elems[i] = owned_value;
                     } else {
-                        new_elems[i] = "";
+                        new_elems[i] = try self.alloc.dupe(u8, "");
                     }
+                    if (i >= elems.len) filled = i + 1;
                 }
                 elems_ptr.* = new_elems;
+                self.alloc.free(elems);
             }
             if (index == 0) self.set(name, owned_value, false) catch {};
         } else {
             var new_elems = try self.alloc.alloc([]const u8, index + 1);
+            var initialized: usize = 0;
+            errdefer {
+                var i: usize = 0;
+                while (i < initialized) : (i += 1) {
+                    if (i != index) self.alloc.free(new_elems[i]);
+                }
+                self.alloc.free(new_elems);
+            }
             for (0..new_elems.len) |i| {
                 if (i == index) {
                     new_elems[i] = owned_value;
                 } else {
-                    new_elems[i] = "";
+                    new_elems[i] = try self.alloc.dupe(u8, "");
                 }
+                initialized += 1;
             }
             const owned_name = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(owned_name);
             try self.arrays.put(owned_name, new_elems);
             const scalar = new_elems[0];
             self.set(name, scalar, false) catch {};
@@ -665,6 +707,13 @@ pub const Environment = struct {
             self.alloc.free(entry.value_ptr.*);
         }
         self.command_hash.clearAndFree();
+    }
+
+    fn freeArrayStorage(self: *Environment, elems: []const []const u8) void {
+        for (elems) |elem| {
+            self.alloc.free(elem);
+        }
+        self.alloc.free(elems);
     }
 };
 
