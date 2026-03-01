@@ -540,8 +540,7 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
                             break :blk if (ui < elems.len) ui else null;
                         };
                         if (effective_idx) |eidx| {
-                            @constCast(elems)[eidx] = "";
-                            if (eidx == 0) env.set(base, "", false) catch {};
+                            env.setArrayElement(base, eidx, "") catch {};
                         }
                     }
                     continue;

@@ -8,6 +8,7 @@ const LineEditor = @import("line_editor.zig").LineEditor;
 const signals = @import("signals.zig");
 const posix = @import("posix.zig");
 const Expander = @import("expander.zig").Expander;
+const ast = @import("ast.zig");
 
 pub const Shell = struct {
     env: Environment,
@@ -158,6 +159,44 @@ pub const Shell = struct {
             err == error.ExpectedIn;
     }
 
+    const AccumulationResult = union(enum) {
+        executed: u8,
+        incomplete,
+        retry,
+    };
+
+    fn executeParsedProgram(self: *Shell, alloc: std.mem.Allocator, program: ast.Program) u8 {
+        var executor = Executor.init(alloc, &self.env, &self.jobs);
+        var status: u8 = 0;
+
+        for (program.commands) |cmd| {
+            status = executor.executeCompleteCommand(cmd);
+            self.env.last_exit_status = status;
+            if (!self.env.should_exit and !self.env.should_return) {
+                self.checkSignalTraps();
+            }
+            if (self.env.should_exit or self.env.should_return) break;
+        }
+
+        return status;
+    }
+
+    fn executeAccumulated(self: *Shell, source: []const u8) AccumulationResult {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var lexer = Lexer.init(source);
+        var parser = Parser.init(alloc, &lexer) catch return .retry;
+        parser.env = &self.env;
+        if (parser.parseProgram()) |program| {
+            return .{ .executed = self.executeParsedProgram(alloc, program) };
+        } else |err| {
+            if (isIncompleteError(err)) return .incomplete;
+            return .{ .executed = self.executeSource(source) };
+        }
+    }
+
     pub fn executeFile(self: *Shell, path: []const u8) u8 {
         const fd = posix.open(path, posix.oRdonly(), 0) catch {
             posix.writeAll(2, "zigsh: ");
@@ -212,20 +251,12 @@ pub const Shell = struct {
             accum.appendSlice(self.gpa, line) catch continue;
 
             while (true) {
-                var arena = std.heap.ArenaAllocator.init(self.gpa);
-                defer arena.deinit();
-                const alloc = arena.allocator();
-
-                var lexer = Lexer.init(accum.items);
-                var parser = Parser.init(alloc, &lexer) catch break;
-                parser.env = &self.env;
-                if (parser.parseProgram()) |program| {
-                    _ = program;
-                    const status = self.executeSource(accum.items);
-                    self.env.last_exit_status = status;
-                    break;
-                } else |err| {
-                    if (isIncompleteError(err)) {
+                switch (self.executeAccumulated(accum.items)) {
+                    .executed => |status| {
+                        self.env.last_exit_status = status;
+                        break;
+                    },
+                    .incomplete => {
                         const ps2_raw = self.env.get("PS2") orelse "> ";
                         const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
                         defer if (ps2_expanded) |p| self.gpa.free(p);
@@ -233,11 +264,8 @@ pub const Shell = struct {
                         const cont = editor.readLine(ps2) orelse break;
                         accum.append(self.gpa, '\n') catch break;
                         accum.appendSlice(self.gpa, cont) catch break;
-                    } else {
-                        const status = self.executeSource(accum.items);
-                        self.env.last_exit_status = status;
-                        break;
-                    }
+                    },
+                    .retry => break,
                 }
             }
         }
@@ -276,20 +304,12 @@ pub const Shell = struct {
             accum.appendSlice(self.gpa, line) catch continue;
 
             while (true) {
-                var arena = std.heap.ArenaAllocator.init(self.gpa);
-                defer arena.deinit();
-                const alloc = arena.allocator();
-
-                var lexer = Lexer.init(accum.items);
-                var parser = Parser.init(alloc, &lexer) catch break;
-                parser.env = &self.env;
-                if (parser.parseProgram()) |program| {
-                    _ = program;
-                    const status = self.executeSource(accum.items);
-                    self.env.last_exit_status = status;
-                    break;
-                } else |err| {
-                    if (isIncompleteError(err)) {
+                switch (self.executeAccumulated(accum.items)) {
+                    .executed => |status| {
+                        self.env.last_exit_status = status;
+                        break;
+                    },
+                    .incomplete => {
                         if (show_prompt) {
                             const ps2_raw = self.env.get("PS2") orelse "> ";
                             const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
@@ -305,11 +325,8 @@ pub const Shell = struct {
                         }
                         accum.append(self.gpa, '\n') catch break;
                         accum.appendSlice(self.gpa, cont) catch break;
-                    } else {
-                        const status = self.executeSource(accum.items);
-                        self.env.last_exit_status = status;
-                        break;
-                    }
+                    },
+                    .retry => break,
                 }
             }
         }

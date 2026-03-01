@@ -224,8 +224,12 @@ pub const Executor = struct {
 
         var prev_read_fd: ?types.Fd = null;
         var last_pid: ?posix.pid_t = null;
-        var child_pids: [64]posix.pid_t = undefined;
-        var num_children: usize = 0;
+        var child_pids: std.ArrayListUnmanaged(posix.pid_t) = .empty;
+        defer child_pids.deinit(self.alloc);
+        child_pids.ensureTotalCapacity(self.alloc, pipeline.commands.len) catch {
+            posix.writeAll(2, "zigsh: out of memory\n");
+            return 1;
+        };
 
         const use_lastpipe = self.env.shopt.lastpipe and !self.env.options.monitor;
         var lastpipe_status: ?u8 = null;
@@ -278,10 +282,10 @@ pub const Executor = struct {
                 posix.exit(status);
             }
 
-            if (num_children < 64) {
-                child_pids[num_children] = pid;
-                num_children += 1;
-            }
+            child_pids.append(self.alloc, pid) catch {
+                posix.writeAll(2, "zigsh: out of memory\n");
+                return 1;
+            };
             last_pid = pid;
 
             if (prev_read_fd) |rd| {
@@ -295,25 +299,28 @@ pub const Executor = struct {
 
         var status: u8 = 0;
         var pipefail_status: u8 = 0;
-        var pipe_statuses: [64]u8 = undefined;
-        for (child_pids[0..num_children], 0..) |cpid, idx| {
+        var pipe_statuses: std.ArrayListUnmanaged(u8) = .empty;
+        defer pipe_statuses.deinit(self.alloc);
+        pipe_statuses.ensureTotalCapacity(self.alloc, child_pids.items.len + @as(usize, @intFromBool(lastpipe_status != null))) catch {
+            posix.writeAll(2, "zigsh: out of memory\n");
+            return 1;
+        };
+        for (child_pids.items) |cpid| {
             const result = posix.waitpid(cpid, 0);
             const s = posix.statusFromWait(result.status);
-            if (idx < 64) pipe_statuses[idx] = s;
+            pipe_statuses.append(self.alloc, s) catch {};
             if (s != 0) pipefail_status = s;
             if (cpid == last_pid) {
                 status = s;
             }
         }
         if (lastpipe_status) |lps| {
-            if (num_children < 64) {
-                pipe_statuses[num_children] = lps;
-            }
+            pipe_statuses.append(self.alloc, lps) catch {};
             status = lps;
             if (lps != 0) pipefail_status = lps;
-            self.setPipeStatus(pipe_statuses[0 .. num_children + 1]);
+            self.setPipeStatus(pipe_statuses.items);
         } else {
-            self.setPipeStatus(pipe_statuses[0..num_children]);
+            self.setPipeStatus(pipe_statuses.items);
         }
 
         if (self.env.options.pipefail) {
