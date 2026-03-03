@@ -1094,52 +1094,7 @@ pub const Expander = struct {
             'P' => {
                 return self.expandPromptWithShellExpansion(val);
             },
-            'Q' => {
-                var needs_ansi = false;
-                for (val) |ch| {
-                    if (ch < 0x20 or ch == 0x7f) {
-                        needs_ansi = true;
-                        break;
-                    }
-                }
-                var result: std.ArrayListUnmanaged(u8) = .empty;
-                if (needs_ansi) {
-                    try result.appendSlice(self.alloc, "$'");
-                    for (val) |ch| {
-                        switch (ch) {
-                            '\n' => try result.appendSlice(self.alloc, "\\n"),
-                            '\t' => try result.appendSlice(self.alloc, "\\t"),
-                            '\r' => try result.appendSlice(self.alloc, "\\r"),
-                            0x07 => try result.appendSlice(self.alloc, "\\a"),
-                            0x08 => try result.appendSlice(self.alloc, "\\b"),
-                            0x1b => try result.appendSlice(self.alloc, "\\E"),
-                            '\\' => try result.appendSlice(self.alloc, "\\\\"),
-                            '\'' => try result.appendSlice(self.alloc, "\\'"),
-                            else => {
-                                if (ch < 0x20 or ch == 0x7f) {
-                                    var esc_buf: [6]u8 = undefined;
-                                    const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
-                                    try result.appendSlice(self.alloc, esc);
-                                } else {
-                                    try result.append(self.alloc, ch);
-                                }
-                            },
-                        }
-                    }
-                    try result.append(self.alloc, '\'');
-                } else {
-                    try result.append(self.alloc, '\'');
-                    for (val) |ch| {
-                        if (ch == '\'') {
-                            try result.appendSlice(self.alloc, "'\\''");
-                        } else {
-                            try result.append(self.alloc, ch);
-                        }
-                    }
-                    try result.append(self.alloc, '\'');
-                }
-                return result.toOwnedSlice(self.alloc);
-            },
+            'Q' => return self.quoteTransformQ(val),
             'E' => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
                 var i: usize = 0;
@@ -1213,49 +1168,7 @@ pub const Expander = struct {
 
     fn expandTransformElement(self: *Expander, op: ast.TransformOp, val: []const u8) ExpandError![]const u8 {
         switch (op.operator) {
-            'Q' => {
-                var needs_ansi = false;
-                for (val) |ch| {
-                    if (ch < 0x20 or ch == 0x7f) { needs_ansi = true; break; }
-                }
-                var result: std.ArrayListUnmanaged(u8) = .empty;
-                if (needs_ansi) {
-                    try result.appendSlice(self.alloc, "$'");
-                    for (val) |ch| {
-                        switch (ch) {
-                            '\n' => try result.appendSlice(self.alloc, "\\n"),
-                            '\t' => try result.appendSlice(self.alloc, "\\t"),
-                            '\r' => try result.appendSlice(self.alloc, "\\r"),
-                            0x07 => try result.appendSlice(self.alloc, "\\a"),
-                            0x08 => try result.appendSlice(self.alloc, "\\b"),
-                            0x1b => try result.appendSlice(self.alloc, "\\E"),
-                            '\\' => try result.appendSlice(self.alloc, "\\\\"),
-                            '\'' => try result.appendSlice(self.alloc, "\\'"),
-                            else => {
-                                if (ch < 0x20 or ch == 0x7f) {
-                                    var esc_buf: [6]u8 = undefined;
-                                    const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
-                                    try result.appendSlice(self.alloc, esc);
-                                } else {
-                                    try result.append(self.alloc, ch);
-                                }
-                            },
-                        }
-                    }
-                    try result.append(self.alloc, '\'');
-                } else {
-                    try result.append(self.alloc, '\'');
-                    for (val) |ch| {
-                        if (ch == '\'') {
-                            try result.appendSlice(self.alloc, "'\\''");
-                        } else {
-                            try result.append(self.alloc, ch);
-                        }
-                    }
-                    try result.append(self.alloc, '\'');
-                }
-                return result.toOwnedSlice(self.alloc);
-            },
+            'Q' => return self.quoteTransformQ(val),
             'P' => return self.expandPromptWithShellExpansion(val),
             'a' => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
@@ -1425,7 +1338,7 @@ pub const Expander = struct {
             if (input[i] == '\\') {
                 i += 1;
                 if (i >= input.len) {
-                    try result.append(alloc,'\\');
+                    try result.append(alloc, '\\');
                     break;
                 }
                 switch (input[i]) {
@@ -1735,7 +1648,11 @@ pub const Expander = struct {
                         var depth: usize = 1;
                         var j = arith_start;
                         while (j + 1 < body.len) {
-                            if (body[j] == '(' and body[j + 1] == '(') { depth += 1; j += 2; continue; }
+                            if (body[j] == '(' and body[j + 1] == '(') {
+                                depth += 1;
+                                j += 2;
+                                continue;
+                            }
                             if (body[j] == ')' and body[j + 1] == ')') {
                                 depth -= 1;
                                 if (depth == 0) break;
@@ -1754,8 +1671,9 @@ pub const Expander = struct {
                         var depth: usize = 1;
                         var j = cmd_start;
                         while (j < body.len) {
-                            if (body[j] == '(') { depth += 1; }
-                            else if (body[j] == ')') {
+                            if (body[j] == '(') {
+                                depth += 1;
+                            } else if (body[j] == ')') {
                                 depth -= 1;
                                 if (depth == 0) break;
                             }
@@ -2022,7 +1940,10 @@ pub const Expander = struct {
                         while (j < expr.len and depth > 0) : (j += 1) {
                             if (j + 1 < expr.len and expr[j] == ')' and expr[j + 1] == ')') {
                                 depth -= 2;
-                                if (depth == 0) { j += 2; break; }
+                                if (depth == 0) {
+                                    j += 2;
+                                    break;
+                                }
                                 j += 1;
                             } else if (expr[j] == '(') {
                                 depth += 1;
@@ -2757,46 +2678,7 @@ pub const Expander = struct {
             .case_conv => |op| return try self.caseConvStr(val, op.mode),
             .transform => |op| {
                 switch (op.operator) {
-                    'Q' => {
-                        var result: std.ArrayListUnmanaged(u8) = .empty;
-                        var needs_ansi = false;
-                        for (val) |ch| {
-                            if (ch < 0x20 or ch == 0x7f) { needs_ansi = true; break; }
-                        }
-                        if (needs_ansi) {
-                            try result.appendSlice(self.alloc, "$'");
-                            for (val) |ch| {
-                                switch (ch) {
-                                    '\n' => try result.appendSlice(self.alloc, "\\n"),
-                                    '\t' => try result.appendSlice(self.alloc, "\\t"),
-                                    '\r' => try result.appendSlice(self.alloc, "\\r"),
-                                    '\\' => try result.appendSlice(self.alloc, "\\\\"),
-                                    '\'' => try result.appendSlice(self.alloc, "\\'"),
-                                    else => {
-                                        if (ch < 0x20 or ch == 0x7f) {
-                                            var esc_buf: [6]u8 = undefined;
-                                            const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
-                                            try result.appendSlice(self.alloc, esc);
-                                        } else {
-                                            try result.append(self.alloc, ch);
-                                        }
-                                    },
-                                }
-                            }
-                            try result.append(self.alloc, '\'');
-                        } else {
-                            try result.append(self.alloc, '\'');
-                            for (val) |ch| {
-                                if (ch == '\'') {
-                                    try result.appendSlice(self.alloc, "'\\''");
-                                } else {
-                                    try result.append(self.alloc, ch);
-                                }
-                            }
-                            try result.append(self.alloc, '\'');
-                        }
-                        return result.toOwnedSlice(self.alloc);
-                    },
+                    'Q' => return self.quoteTransformQ(val),
                     'P' => return self.expandPromptWithShellExpansion(val),
                     'a' => {
                         var result: std.ArrayListUnmanaged(u8) = .empty;
@@ -2816,6 +2698,55 @@ pub const Expander = struct {
             },
             else => return try self.alloc.dupe(u8, val),
         }
+    }
+
+    fn quoteTransformQ(self: *Expander, val: []const u8) ExpandError![]const u8 {
+        var needs_ansi = false;
+        for (val) |ch| {
+            if (ch < 0x20 or ch == 0x7f) {
+                needs_ansi = true;
+                break;
+            }
+        }
+
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        if (needs_ansi) {
+            try result.appendSlice(self.alloc, "$'");
+            for (val) |ch| {
+                switch (ch) {
+                    '\n' => try result.appendSlice(self.alloc, "\\n"),
+                    '\t' => try result.appendSlice(self.alloc, "\\t"),
+                    '\r' => try result.appendSlice(self.alloc, "\\r"),
+                    0x07 => try result.appendSlice(self.alloc, "\\a"),
+                    0x08 => try result.appendSlice(self.alloc, "\\b"),
+                    0x1b => try result.appendSlice(self.alloc, "\\E"),
+                    '\\' => try result.appendSlice(self.alloc, "\\\\"),
+                    '\'' => try result.appendSlice(self.alloc, "\\'"),
+                    else => {
+                        if (ch < 0x20 or ch == 0x7f) {
+                            var esc_buf: [6]u8 = undefined;
+                            const esc = std.fmt.bufPrint(&esc_buf, "\\u00{x:0>2}", .{ch}) catch unreachable;
+                            try result.appendSlice(self.alloc, esc);
+                        } else {
+                            try result.append(self.alloc, ch);
+                        }
+                    },
+                }
+            }
+            try result.append(self.alloc, '\'');
+        } else {
+            try result.append(self.alloc, '\'');
+            for (val) |ch| {
+                if (ch == '\'') {
+                    try result.appendSlice(self.alloc, "'\\''");
+                } else {
+                    try result.append(self.alloc, ch);
+                }
+            }
+            try result.append(self.alloc, '\'');
+        }
+
+        return result.toOwnedSlice(self.alloc);
     }
 
     fn stripStr(self: *Expander, val: []const u8, pattern: ast.Word, mode: StripMode) ExpandError![]const u8 {

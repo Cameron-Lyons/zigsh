@@ -1540,7 +1540,7 @@ fn builtinKill(args: []const []const u8, env: *Environment) u8 {
             return status;
         }
         var i: u6 = 1;
-        while (i < 32) : (i += 1) {
+        while (i < signals.SIGNAL_LIMIT_U6) : (i += 1) {
             if (signals.sigNameFromNum(i)) |name| {
                 var buf: [8]u8 = undefined;
                 const num_s = std.fmt.bufPrint(&buf, "{d:>2}) ", .{i}) catch continue;
@@ -4595,12 +4595,12 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 fn sigFromName(name: []const u8) ?u6 {
     const trimmed = std.mem.trim(u8, name, " \t");
     if (std.fmt.parseInt(u6, trimmed, 10)) |n| {
-        if (n >= 32) return null;
+        if (n >= signals.SIGNAL_LIMIT_U6) return null;
         return n;
     } else |_| {}
     const stripped = if (trimmed.len > 3 and eqlIgnoreCase(trimmed[0..3], "SIG")) trimmed[3..] else trimmed;
     if (eqlIgnoreCase(stripped, "EXIT")) return 0;
-    for (1..32) |i| {
+    for (1..signals.SIGNAL_LIMIT) |i| {
         const sig: u6 = @intCast(i);
         if (signals.sigNameFromNum(sig)) |short_name| {
             if (eqlIgnoreCase(stripped, short_name)) return sig;

@@ -5,6 +5,7 @@ pub const fd_t = i32;
 pub const pid_t = i32;
 pub const mode_t = c.mode_t;
 pub const WNOHANG: u32 = 1;
+const MIN_INTERNAL_DUP_FD: c_int = 100;
 
 pub fn pipe() ![2]fd_t {
     var fds: [2]fd_t = undefined;
@@ -20,7 +21,7 @@ pub fn dup(old: fd_t) !fd_t {
 }
 
 pub fn dupHighFd(old: fd_t) !fd_t {
-    const rc = c.fcntl(old, c.F.DUPFD, @as(c_int, 100));
+    const rc = c.fcntl(old, c.F.DUPFD, MIN_INTERNAL_DUP_FD);
     if (rc < 0) return error.BadFd;
     _ = c.fcntl(rc, c.F.SETFD, @as(c_int, FD_CLOEXEC));
     return rc;
@@ -199,11 +200,6 @@ pub fn getegid() u32 {
 
 pub fn isatty(fd: fd_t) bool {
     return c.isatty(fd) != 0;
-}
-
-pub fn fcntl_setfd(fd: fd_t, flags: c_int) !void {
-    const rc = c.fcntl(fd, c.F.SETFD, flags);
-    if (rc < 0) return error.FcntlFailed;
 }
 
 pub const FD_CLOEXEC = 1;
