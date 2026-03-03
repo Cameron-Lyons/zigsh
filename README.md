@@ -22,6 +22,14 @@ Run Oil spec tests (POSIX-focused subset):
 tools/oil-spec.sh
 ```
 
+Run Oil spec tests in parallel:
+
+```sh
+tools/oil-spec.sh --jobs 4
+# or via env var:
+OIL_SPEC_JOBS=4 tools/oil-spec.sh
+```
+
 Run specific Oil spec files:
 
 ```sh

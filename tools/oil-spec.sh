@@ -4,6 +4,7 @@
 #
 # Usage:
 #   tools/oil-spec.sh                  # run a default POSIX-focused subset
+#   tools/oil-spec.sh --jobs 4         # run default subset with 4 parallel jobs
 #   tools/oil-spec.sh smoke posix      # run specific spec names
 #
 set -o nounset
@@ -19,6 +20,86 @@ RUNNER_PY3="$OIL_ROOT/_tmp/sh_spec_py3.py"
 OSH_SHIM_DIR="$REPO_ROOT/_tmp/oil-bin"
 ZIG_BIN=${ZIG_BIN:-}
 
+detect_jobs() {
+  local nproc=1
+  if command -v getconf >/dev/null 2>&1; then
+    nproc=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  elif command -v sysctl >/dev/null 2>&1; then
+    nproc=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+  fi
+  case "$nproc" in
+    ''|*[!0-9]*)
+      nproc=1
+      ;;
+    0)
+      nproc=1
+      ;;
+  esac
+  printf '%s\n' "$nproc"
+}
+
+print_usage() {
+  cat <<'EOF'
+Usage:
+  tools/oil-spec.sh [--jobs N] [spec ...]
+
+Options:
+  -j, --jobs N    Number of spec files to run in parallel (default: CPU count)
+  -h, --help      Show this help text
+EOF
+}
+
+jobs=${OIL_SPEC_JOBS:-$(detect_jobs)}
+spec_names=()
+while test $# -gt 0; do
+  case "$1" in
+    -j|--jobs)
+      if test $# -lt 2; then
+        echo "missing value for $1" >&2
+        print_usage >&2
+        exit 2
+      fi
+      jobs=$2
+      shift 2
+      ;;
+    --jobs=*)
+      jobs=${1#*=}
+      shift
+      ;;
+    -h|--help)
+      print_usage
+      exit 0
+      ;;
+    --)
+      shift
+      while test $# -gt 0; do
+        spec_names+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      print_usage >&2
+      exit 2
+      ;;
+    *)
+      spec_names+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "$jobs" in
+  ''|*[!0-9]*)
+    echo "jobs must be a positive integer, got: $jobs" >&2
+    exit 2
+    ;;
+  0)
+    echo "jobs must be >= 1" >&2
+    exit 2
+    ;;
+esac
+
 if test -z "$ZIG_BIN"; then
   local_toolchain=$(ls -d "$REPO_ROOT"/.toolchains/zig-*/zig 2>/dev/null | head -n 1 || true)
   if test -n "$local_toolchain"; then
@@ -28,9 +109,21 @@ if test -z "$ZIG_BIN"; then
   fi
 fi
 
-if test $# -eq 0; then
+if test "${#spec_names[@]}" -eq 0; then
   # POSIX-focused subset that maps closely to zigsh features.
-  set -- smoke posix builtin-cd builtin-read builtin-printf builtin-set builtin-getopts builtin-type builtin-umask builtin-trap builtin-times
+  spec_names=(
+    smoke
+    posix
+    builtin-cd
+    builtin-read
+    builtin-printf
+    builtin-set
+    builtin-getopts
+    builtin-type
+    builtin-umask
+    builtin-trap
+    builtin-times
+  )
 fi
 
 mkdir -p "$REPO_ROOT/.third_party"
@@ -115,6 +208,11 @@ SH
 chmod +x "$OSH_SHIM_DIR/stat"
 
 mkdir -p "$RESULTS_DIR" "$TMP_SPEC_DIR"
+PARALLEL_TMP_DIR=$(mktemp -d "$RESULTS_DIR/.parallel.XXXXXX")
+cleanup_parallel_tmp() {
+  rm -rf "$PARALLEL_TMP_DIR"
+}
+trap cleanup_parallel_tmp EXIT
 
 # Convert the python2 spec runner to python3 for local execution.
 python3 - <<'PY' "$OIL_ROOT/test/sh_spec.py" "$RUNNER_PY3"
@@ -286,9 +384,91 @@ PY
   return "$status"
 }
 
+active_specs=()
+active_pids=()
+
+launch_spec() {
+  local spec_name=$1
+  local summary_file="$PARALLEL_TMP_DIR/$spec_name.summary"
+  local exit_file="$PARALLEL_TMP_DIR/$spec_name.exit"
+
+  (
+    set +o errexit
+    run_one "$spec_name"
+    printf '%s\n' "$?" >"$exit_file"
+  ) >"$summary_file" 2>&1 &
+
+  active_specs+=("$spec_name")
+  active_pids+=("$!")
+}
+
+reap_finished() {
+  local next_specs=()
+  local next_pids=()
+  local i=0
+  for i in "${!active_pids[@]}"; do
+    local pid=${active_pids[$i]}
+    if kill -0 "$pid" 2>/dev/null; then
+      next_specs+=("${active_specs[$i]}")
+      next_pids+=("$pid")
+      continue
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  if test "${#next_specs[@]}" -gt 0; then
+    active_specs=("${next_specs[@]}")
+  else
+    active_specs=()
+  fi
+  if test "${#next_pids[@]}" -gt 0; then
+    active_pids=("${next_pids[@]}")
+  else
+    active_pids=()
+  fi
+}
+
+wait_for_all() {
+  while test "${#active_pids[@]}" -gt 0; do
+    reap_finished
+    if test "${#active_pids[@]}" -gt 0; then
+      sleep 0.05
+    fi
+  done
+}
+
+echo "Running ${#spec_names[@]} spec file(s) with jobs=$jobs"
+for spec_name in "${spec_names[@]}"; do
+  launch_spec "$spec_name"
+  while test "${#active_pids[@]}" -ge "$jobs"; do
+    reap_finished
+    if test "${#active_pids[@]}" -ge "$jobs"; then
+      sleep 0.05
+    fi
+  done
+done
+wait_for_all
+
 num_failed=0
-for spec_name in "$@"; do
-  if ! run_one "$spec_name"; then
+for spec_name in "${spec_names[@]}"; do
+  summary_file="$PARALLEL_TMP_DIR/$spec_name.summary"
+  exit_file="$PARALLEL_TMP_DIR/$spec_name.exit"
+
+  if test -f "$summary_file"; then
+    cat "$summary_file"
+  else
+    echo "$spec_name          status=1 (missing summary)"
+  fi
+
+  status=1
+  if test -f "$exit_file"; then
+    status=$(head -n 1 "$exit_file")
+  fi
+  case "$status" in
+    ''|*[!0-9]*)
+      status=1
+      ;;
+  esac
+  if test "$status" -ne 0; then
     num_failed=$((num_failed + 1))
   fi
 done
