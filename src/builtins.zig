@@ -6,6 +6,8 @@ const signals = @import("signals.zig");
 const posix = @import("posix.zig");
 const types = @import("types.zig");
 const shell_utils = @import("shell_utils.zig");
+const builtin_meta = @import("builtins/metadata.zig");
+const builtin_argparse = @import("builtins/argparse.zig");
 const libc = std.c;
 const printf_time = struct {
     extern "c" fn time(tloc: ?*time_t) time_t;
@@ -96,26 +98,8 @@ pub fn lookup(name: []const u8) ?BuiltinFn {
     return builtins.get(name);
 }
 
-pub const special_builtins = std.StaticStringMap(void).initComptime(.{
-    .{ ":", {} },
-    .{ ".", {} },
-    .{ "break", {} },
-    .{ "continue", {} },
-    .{ "eval", {} },
-    .{ "exec", {} },
-    .{ "exit", {} },
-    .{ "export", {} },
-    .{ "readonly", {} },
-    .{ "set", {} },
-    .{ "shift", {} },
-    .{ "unset", {} },
-    .{ "return", {} },
-    .{ "trap", {} },
-    .{ "times", {} },
-});
-
 pub fn isSpecialBuiltin(name: []const u8) bool {
-    return special_builtins.has(name);
+    return builtin_meta.isSpecial(name);
 }
 
 fn builtinColon(_: []const []const u8, _: *Environment) u8 {
@@ -553,7 +537,7 @@ fn builtinUnset(args: []const []const u8, env: *Environment) u8 {
                 status = 2;
                 continue;
             }
-            if (env.vars.get(name) != null) {
+            if (env.variableKind(name) != .unset) {
                 if (env.unset(name) == .readonly) {
                     posix.writeAll(2, "zigsh: unset: ");
                     posix.writeAll(2, name);
@@ -701,7 +685,7 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
             } else if (enable) {
                 printOptions(&env.options);
             } else {
-                printOptionsReinput(&env.options);
+                printOptions(&env.options);
             }
             continue;
         }
@@ -732,78 +716,144 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
     return 0;
 }
 
-fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable: bool) bool {
-    if (std.mem.eql(u8, name, "errexit")) {
-        options.errexit = enable;
-    } else if (std.mem.eql(u8, name, "nounset")) {
-        options.nounset = enable;
-    } else if (std.mem.eql(u8, name, "xtrace")) {
-        options.xtrace = enable;
-    } else if (std.mem.eql(u8, name, "noglob")) {
-        options.noglob = enable;
-    } else if (std.mem.eql(u8, name, "noexec")) {
-        options.noexec = enable;
-    } else if (std.mem.eql(u8, name, "allexport")) {
-        options.allexport = enable;
-    } else if (std.mem.eql(u8, name, "monitor")) {
-        options.monitor = enable;
-    } else if (std.mem.eql(u8, name, "noclobber")) {
-        options.noclobber = enable;
-    } else if (std.mem.eql(u8, name, "verbose")) {
-        options.verbose = enable;
-    } else if (std.mem.eql(u8, name, "pipefail")) {
-        options.pipefail = enable;
-    } else if (std.mem.eql(u8, name, "history")) {
-        options.history = enable;
-    } else if (std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "interactive") or std.mem.eql(u8, name, "hashall") or std.mem.eql(u8, name, "braceexpand") or std.mem.eql(u8, name, "vi") or std.mem.eql(u8, name, "emacs")) {} else {
-        posix.writeAll(2, "set: unknown option: ");
-        posix.writeAll(2, name);
-        posix.writeAll(2, "\n");
-        return false;
+const set_option_print_order = [_][]const u8{
+    "allexport",
+    "errexit",
+    "monitor",
+    "noclobber",
+    "noexec",
+    "noglob",
+    "nounset",
+    "pipefail",
+    "verbose",
+    "xtrace",
+};
+
+fn setOptionPtr(options: *Environment.ShellOptions, name: []const u8) ?*bool {
+    if (std.mem.eql(u8, name, "errexit")) return &options.errexit;
+    if (std.mem.eql(u8, name, "nounset")) return &options.nounset;
+    if (std.mem.eql(u8, name, "xtrace")) return &options.xtrace;
+    if (std.mem.eql(u8, name, "noglob")) return &options.noglob;
+    if (std.mem.eql(u8, name, "noexec")) return &options.noexec;
+    if (std.mem.eql(u8, name, "allexport")) return &options.allexport;
+    if (std.mem.eql(u8, name, "monitor")) return &options.monitor;
+    if (std.mem.eql(u8, name, "noclobber")) return &options.noclobber;
+    if (std.mem.eql(u8, name, "verbose")) return &options.verbose;
+    if (std.mem.eql(u8, name, "pipefail")) return &options.pipefail;
+    if (std.mem.eql(u8, name, "history")) return &options.history;
+    return null;
+}
+
+pub fn setOptionEnabled(options: *const Environment.ShellOptions, name: []const u8) ?bool {
+    const mutable: *Environment.ShellOptions = @constCast(options);
+    if (setOptionPtr(mutable, name)) |ptr| return ptr.*;
+    return null;
+}
+
+pub fn evalPathUnary(op: []const u8, path_z: [*:0]const u8) ?bool {
+    if (std.mem.eql(u8, op, "-a") or std.mem.eql(u8, op, "-e")) {
+        _ = posix.stat(path_z) catch return false;
+        return true;
     }
-    return true;
+    if (std.mem.eql(u8, op, "-f")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFREG;
+    }
+    if (std.mem.eql(u8, op, "-d")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFDIR;
+    }
+    if (std.mem.eql(u8, op, "-b")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFBLK;
+    }
+    if (std.mem.eql(u8, op, "-c")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFCHR;
+    }
+    if (std.mem.eql(u8, op, "-p")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFIFO;
+    }
+    if (std.mem.eql(u8, op, "-h") or std.mem.eql(u8, op, "-L")) {
+        const st = posix.lstat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFLNK;
+    }
+    if (std.mem.eql(u8, op, "-S")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_IFMT == posix.S_IFSOCK;
+    }
+    if (std.mem.eql(u8, op, "-g")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_ISGID != 0;
+    }
+    if (std.mem.eql(u8, op, "-u")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_ISUID != 0;
+    }
+    if (std.mem.eql(u8, op, "-r")) return posix.access(path_z, posix.R_OK);
+    if (std.mem.eql(u8, op, "-w")) return posix.access(path_z, posix.W_OK);
+    if (std.mem.eql(u8, op, "-x")) return posix.access(path_z, posix.X_OK);
+    if (std.mem.eql(u8, op, "-s")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.size > 0;
+    }
+    if (std.mem.eql(u8, op, "-k")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.mode & posix.S_ISVTX != 0;
+    }
+    if (std.mem.eql(u8, op, "-G")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.gid == posix.getegid();
+    }
+    if (std.mem.eql(u8, op, "-O")) {
+        const st = posix.stat(path_z) catch return false;
+        return st.uid == posix.geteuid();
+    }
+    return null;
+}
+
+fn isIgnoredSetOptionName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "posix") or
+        std.mem.eql(u8, name, "interactive") or
+        std.mem.eql(u8, name, "hashall") or
+        std.mem.eql(u8, name, "braceexpand") or
+        std.mem.eql(u8, name, "vi") or
+        std.mem.eql(u8, name, "emacs");
+}
+
+fn setOptionByName(options: *Environment.ShellOptions, name: []const u8, enable: bool) bool {
+    if (setOptionPtr(options, name)) |ptr| {
+        ptr.* = enable;
+        return true;
+    }
+    if (isIgnoredSetOptionName(name)) return true;
+    posix.writeAll(2, "set: unknown option: ");
+    posix.writeAll(2, name);
+    posix.writeAll(2, "\n");
+    return false;
+}
+
+const SetOptionPrintMode = enum {
+    all,
+    set_only,
+    unset_only,
+};
+
+fn writeSetOptions(options: *const Environment.ShellOptions, mode: SetOptionPrintMode) void {
+    for (set_option_print_order) |name| {
+        const enabled = setOptionEnabled(options, name) orelse continue;
+        if (mode == .set_only and !enabled) continue;
+        if (mode == .unset_only and enabled) continue;
+        posix.writeAll(1, "set ");
+        posix.writeAll(1, if (enabled) "-o " else "+o ");
+        posix.writeAll(1, name);
+        posix.writeAll(1, "\n");
+    }
 }
 
 fn printOptions(options: *const Environment.ShellOptions) void {
-    const entries = [_]struct { name: []const u8, value: bool }{
-        .{ .name = "allexport", .value = options.allexport },
-        .{ .name = "errexit", .value = options.errexit },
-        .{ .name = "monitor", .value = options.monitor },
-        .{ .name = "noclobber", .value = options.noclobber },
-        .{ .name = "noexec", .value = options.noexec },
-        .{ .name = "noglob", .value = options.noglob },
-        .{ .name = "nounset", .value = options.nounset },
-        .{ .name = "pipefail", .value = options.pipefail },
-        .{ .name = "verbose", .value = options.verbose },
-        .{ .name = "xtrace", .value = options.xtrace },
-    };
-    for (entries) |entry| {
-        posix.writeAll(1, "set ");
-        posix.writeAll(1, if (entry.value) "-o " else "+o ");
-        posix.writeAll(1, entry.name);
-        posix.writeAll(1, "\n");
-    }
-}
-
-fn printOptionsReinput(options: *const Environment.ShellOptions) void {
-    const entries = [_]struct { name: []const u8, value: bool }{
-        .{ .name = "allexport", .value = options.allexport },
-        .{ .name = "errexit", .value = options.errexit },
-        .{ .name = "monitor", .value = options.monitor },
-        .{ .name = "noclobber", .value = options.noclobber },
-        .{ .name = "noexec", .value = options.noexec },
-        .{ .name = "noglob", .value = options.noglob },
-        .{ .name = "nounset", .value = options.nounset },
-        .{ .name = "pipefail", .value = options.pipefail },
-        .{ .name = "verbose", .value = options.verbose },
-        .{ .name = "xtrace", .value = options.xtrace },
-    };
-    for (entries) |entry| {
-        posix.writeAll(1, "set ");
-        posix.writeAll(1, if (entry.value) "-o " else "+o ");
-        posix.writeAll(1, entry.name);
-        posix.writeAll(1, "\n");
-    }
+    writeSetOptions(options, .all);
 }
 
 fn builtinShift(args: []const []const u8, env: *Environment) u8 {
@@ -1228,15 +1278,9 @@ fn testUnary(op: []const u8, operand: []const u8, test_env: *Environment) u8 {
         return if (test_env.get(operand) != null) 0 else 1;
     }
     if (std.mem.eql(u8, op, "-o")) {
-        if (std.mem.eql(u8, operand, "errexit")) return if (test_env.options.errexit) 0 else 1;
-        if (std.mem.eql(u8, operand, "nounset")) return if (test_env.options.nounset) 0 else 1;
-        if (std.mem.eql(u8, operand, "xtrace")) return if (test_env.options.xtrace) 0 else 1;
-        if (std.mem.eql(u8, operand, "verbose")) return if (test_env.options.verbose) 0 else 1;
-        if (std.mem.eql(u8, operand, "noclobber")) return if (test_env.options.noclobber) 0 else 1;
-        if (std.mem.eql(u8, operand, "noexec")) return if (test_env.options.noexec) 0 else 1;
-        if (std.mem.eql(u8, operand, "noglob")) return if (test_env.options.noglob) 0 else 1;
-        if (std.mem.eql(u8, operand, "allexport")) return if (test_env.options.allexport) 0 else 1;
-        if (std.mem.eql(u8, operand, "monitor")) return if (test_env.options.monitor) 0 else 1;
+        if (setOptionEnabled(&test_env.options, operand)) |enabled| {
+            return if (enabled) 0 else 1;
+        }
         return 1;
     }
 
@@ -1250,71 +1294,8 @@ fn testUnary(op: []const u8, operand: []const u8, test_env: *Environment) u8 {
     }
 
     const path_z = std.posix.toPosixPath(operand) catch return 1;
-
-    if (std.mem.eql(u8, op, "-a") or std.mem.eql(u8, op, "-e")) {
-        _ = posix.stat(&path_z) catch return 1;
-        return 0;
-    }
-    if (std.mem.eql(u8, op, "-f")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFREG) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-d")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFDIR) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-b")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFBLK) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-c")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFCHR) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-p")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFIFO) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-h") or std.mem.eql(u8, op, "-L")) {
-        const st = posix.lstat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFLNK) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-S")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_IFMT == posix.S_IFSOCK) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-g")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_ISGID != 0) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-u")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_ISUID != 0) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-r")) {
-        return if (posix.access(&path_z, posix.R_OK)) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-w")) {
-        return if (posix.access(&path_z, posix.W_OK)) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-x")) {
-        return if (posix.access(&path_z, posix.X_OK)) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-s")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.size > 0) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-k")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.mode & posix.S_ISVTX != 0) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-G")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.gid == posix.getegid()) 0 else 1;
-    }
-    if (std.mem.eql(u8, op, "-O")) {
-        const st = posix.stat(&path_z) catch return 1;
-        return if (st.uid == posix.geteuid()) 0 else 1;
+    if (evalPathUnary(op, &path_z)) |matched| {
+        return if (matched) 0 else 1;
     }
     return 2;
 }
@@ -1619,23 +1600,26 @@ fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
 
     while (operand_start < args.len) {
         const arg = args[operand_start];
-        if (arg.len == 0 or arg[0] != '-' or arg.len == 1) break;
         if (std.mem.eql(u8, arg, "--")) {
             operand_start += 1;
             break;
         }
-        if (std.mem.eql(u8, arg, "-p")) {
-            print_mode = true;
-            operand_start += 1;
-        } else if (std.mem.eql(u8, arg, "-l")) {
-            list_mode = true;
-            operand_start += 1;
-        } else {
+        if (!builtin_argparse.isShortCluster(arg)) break;
+        if (builtin_argparse.invalidShortFlag(arg, "pl")) |bad| {
             posix.writeAll(2, "trap: invalid option: ");
-            posix.writeAll(2, arg);
+            const arr: [2]u8 = .{ '-', bad };
+            posix.writeAll(2, &arr);
             posix.writeAll(2, "\n");
             return 2;
         }
+        for (arg[1..]) |ch| {
+            switch (ch) {
+                'p' => print_mode = true,
+                'l' => list_mode = true,
+                else => unreachable,
+            }
+        }
+        operand_start += 1;
     }
 
     if (list_mode) {
@@ -1647,17 +1631,17 @@ fn builtinTrap(args: []const []const u8, env: *Environment) u8 {
 
     if (print_mode) {
         if (operands.len == 0) {
-            printTraps();
+            printTraps(env);
         } else {
             for (operands) |sig_name| {
-                printSpecificTrap(sig_name);
+                printSpecificTrap(sig_name, env);
             }
         }
         return 0;
     }
 
     if (operands.len == 0) {
-        printTraps();
+        printTraps(env);
         return 0;
     }
 
@@ -1751,35 +1735,35 @@ fn isUnsignedInt(s: []const u8) bool {
 
 fn trapResetSignal(sig_name: []const u8, env: *Environment) bool {
     if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
-        if (signals.getExitTrap()) |old| env.alloc.free(old);
-        signals.setExitTrap(null);
+        if (signals.getExitTrap(&env.signal_state)) |old| env.alloc.free(old);
+        signals.setExitTrap(&env.signal_state, null);
         return true;
     }
     if (std.mem.eql(u8, sig_name, "ERR")) {
-        if (signals.getErrTrap()) |old| env.alloc.free(old);
-        signals.setErrTrap(null);
+        if (signals.getErrTrap(&env.signal_state)) |old| env.alloc.free(old);
+        signals.setErrTrap(&env.signal_state, null);
         return true;
     }
     const sig = sigFromName(sig_name) orelse return false;
-    if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
-    signals.setTrap(sig, null);
+    if (env.signal_state.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
+    signals.setTrap(&env.signal_state, sig, null);
     return true;
 }
 
 fn trapSetAction(sig_name: []const u8, action: ?[]const u8, env: *Environment) bool {
     if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
-        if (signals.getExitTrap()) |old| env.alloc.free(old);
-        signals.setExitTrap(action);
+        if (signals.getExitTrap(&env.signal_state)) |old| env.alloc.free(old);
+        signals.setExitTrap(&env.signal_state, action);
         return true;
     }
     if (std.mem.eql(u8, sig_name, "ERR")) {
-        if (signals.getErrTrap()) |old| env.alloc.free(old);
-        signals.setErrTrap(action);
+        if (signals.getErrTrap(&env.signal_state)) |old| env.alloc.free(old);
+        signals.setErrTrap(&env.signal_state, action);
         return true;
     }
     const sig = sigFromName(sig_name) orelse return false;
-    if (signals.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
-    signals.setTrap(sig, action);
+    if (env.signal_state.trap_handlers[@intCast(sig)]) |old| env.alloc.free(old);
+    signals.setTrap(&env.signal_state, sig, action);
     return true;
 }
 
@@ -4360,35 +4344,35 @@ const trap_sig_entries = [_]struct { num: u6, name: []const u8 }{
     .{ .num = signals.SIGPIPE, .name = "SIGPIPE" },
 };
 
-fn printTraps() void {
-    if (signals.getExitTrap()) |action| {
+fn printTraps(env: *Environment) void {
+    if (signals.getExitTrap(&env.signal_state)) |action| {
         printTrapEntry(action, "EXIT");
     }
-    if (signals.getErrTrap()) |action| {
+    if (signals.getErrTrap(&env.signal_state)) |action| {
         printTrapEntry(action, "ERR");
     }
     for (trap_sig_entries) |entry| {
-        if (signals.trap_handlers[@intCast(entry.num)]) |action| {
+        if (env.signal_state.trap_handlers[@intCast(entry.num)]) |action| {
             printTrapEntry(action, entry.name);
         }
     }
 }
 
-fn printSpecificTrap(sig_name: []const u8) void {
+fn printSpecificTrap(sig_name: []const u8, env: *Environment) void {
     if (std.mem.eql(u8, sig_name, "EXIT") or std.mem.eql(u8, sig_name, "0")) {
-        if (signals.getExitTrap()) |action| {
+        if (signals.getExitTrap(&env.signal_state)) |action| {
             printTrapEntry(action, "EXIT");
         }
         return;
     }
     if (std.mem.eql(u8, sig_name, "ERR")) {
-        if (signals.getErrTrap()) |action| {
+        if (signals.getErrTrap(&env.signal_state)) |action| {
             printTrapEntry(action, "ERR");
         }
         return;
     }
     if (sigFromName(sig_name)) |sig| {
-        if (signals.trap_handlers[@intCast(sig)]) |action| {
+        if (env.signal_state.trap_handlers[@intCast(sig)]) |action| {
             const full_name = signals.sigFullName(sig) orelse sig_name;
             printTrapEntry(action, full_name);
         }
@@ -5382,22 +5366,10 @@ fn builtinHelp(args: []const []const u8, _: *Environment) u8 {
         return 0;
     }
     const topic = args[1];
-    const known_topics = [_][]const u8{
-        "cd",     "echo",    "exit",      "export",   "read",
-        "set",    "shift",   "test",      "trap",     "type",
-        "unset",  "alias",   "break",     "continue", "declare",
-        "eval",   "exec",    "fg",        "bg",       "getopts",
-        "hash",   "history", "kill",      "let",      "local",
-        "printf", "pushd",   "popd",      "dirs",     "readonly",
-        "return", "shopt",   "source",    "umask",    "unalias",
-        "wait",   "mapfile", "readarray", "true",     "false",
-    };
-    for (known_topics) |t| {
-        if (std.mem.eql(u8, topic, t)) {
-            posix.writeAll(1, topic);
-            posix.writeAll(1, ": shell builtin command\n");
-            return 0;
-        }
+    if (builtin_meta.isKnown(topic)) {
+        posix.writeAll(1, topic);
+        posix.writeAll(1, ": shell builtin command\n");
+        return 0;
     }
     posix.writeAll(2, "zigsh: help: no help topics match '");
     posix.writeAll(2, topic);
@@ -5419,7 +5391,14 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
         } else if (std.mem.eql(u8, a, "--unset")) {
             set_mode = .unset;
             arg_start += 1;
-        } else if (a.len >= 2 and a[0] == '-') {
+        } else if (builtin_argparse.isShortCluster(a)) {
+            if (builtin_argparse.invalidShortFlag(a, "suqpo")) |ch| {
+                posix.writeAll(2, "shopt: invalid option: -");
+                const arr: [1]u8 = .{ch};
+                posix.writeAll(2, &arr);
+                posix.writeAll(2, "\n");
+                return 2;
+            }
             for (a[1..]) |ch| {
                 switch (ch) {
                     's' => set_mode = .set,
@@ -5427,13 +5406,7 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
                     'q' => set_mode = .query,
                     'p' => set_mode = .print,
                     'o' => use_set_o = true,
-                    else => {
-                        posix.writeAll(2, "shopt: invalid option: -");
-                        const arr: [1]u8 = .{ch};
-                        posix.writeAll(2, &arr);
-                        posix.writeAll(2, "\n");
-                        return 2;
-                    },
+                    else => unreachable,
                 }
             }
             arg_start += 1;
@@ -5501,8 +5474,7 @@ fn builtinShopt(args: []const []const u8, env: *Environment) u8 {
                 },
             }
         } else {
-            const set_o_ptr: ?*bool = if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset else if (std.mem.eql(u8, name, "pipefail")) &env.options.pipefail else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose else if (std.mem.eql(u8, name, "allexport")) &env.options.allexport else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor else null;
-            if (set_o_ptr) |ptr| {
+            if (setOptionPtr(&env.options, name)) |ptr| {
                 switch (set_mode) {
                     .set => ptr.* = true,
                     .unset => ptr.* = false,
@@ -5565,33 +5537,18 @@ fn shoptGetField(shopt: *@import("env.zig").Environment.ShoptOptions, name: []co
 
 fn shoptSetO(opt_names: []const []const u8, mode: ShoptMode, env: *Environment) u8 {
     if (opt_names.len == 0) {
-        const fields = [_]struct { name: []const u8, val: bool }{
-            .{ .name = "allexport", .val = env.options.allexport },
-            .{ .name = "errexit", .val = env.options.errexit },
-            .{ .name = "monitor", .val = env.options.monitor },
-            .{ .name = "noclobber", .val = env.options.noclobber },
-            .{ .name = "noexec", .val = env.options.noexec },
-            .{ .name = "noglob", .val = env.options.noglob },
-            .{ .name = "nounset", .val = env.options.nounset },
-            .{ .name = "verbose", .val = env.options.verbose },
-            .{ .name = "xtrace", .val = env.options.xtrace },
+        const print_mode: SetOptionPrintMode = switch (mode) {
+            .set => .set_only,
+            .unset => .unset_only,
+            else => .all,
         };
-        for (fields) |f| {
-            if (mode == .set and !f.val) continue;
-            if (mode == .unset and f.val) continue;
-            posix.writeAll(1, "set ");
-            posix.writeAll(1, if (f.val) "-o " else "+o ");
-            posix.writeAll(1, f.name);
-            posix.writeAll(1, "\n");
-        }
+        writeSetOptions(&env.options, print_mode);
         return 0;
     }
 
     var status: u8 = 0;
     for (opt_names) |name| {
-        const ptr: ?*bool = if (std.mem.eql(u8, name, "allexport")) &env.options.allexport else if (std.mem.eql(u8, name, "errexit")) &env.options.errexit else if (std.mem.eql(u8, name, "monitor")) &env.options.monitor else if (std.mem.eql(u8, name, "noclobber")) &env.options.noclobber else if (std.mem.eql(u8, name, "noexec")) &env.options.noexec else if (std.mem.eql(u8, name, "noglob")) &env.options.noglob else if (std.mem.eql(u8, name, "nounset")) &env.options.nounset else if (std.mem.eql(u8, name, "verbose")) &env.options.verbose else if (std.mem.eql(u8, name, "xtrace")) &env.options.xtrace else null;
-
-        if (ptr) |p| {
+        if (setOptionPtr(&env.options, name)) |p| {
             switch (mode) {
                 .set => p.* = true,
                 .unset => p.* = false,

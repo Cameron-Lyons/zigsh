@@ -42,10 +42,11 @@ pub const Shell = struct {
     }
 
     pub fn deinit(self: *Shell) void {
+        signals.clearActiveState();
         self.history.saveFile();
         self.history.deinit();
         self.jobs.deinit();
-        for (&signals.trap_handlers) |*handler| {
+        for (&self.env.signal_state.trap_handlers) |*handler| {
             if (handler.*) |h| {
                 self.gpa.free(h);
                 handler.* = null;
@@ -75,19 +76,19 @@ pub const Shell = struct {
     }
 
     fn checkSignalTraps(self: *Shell) void {
-        while (signals.checkPendingSignals()) |sig| {
+        while (signals.checkPendingSignals(&self.env.signal_state)) |sig| {
             if (sig == signals.SIGINT and !self.env.options.interactive) {
                 continue;
             }
-            if (signals.trap_handlers[@intCast(sig)]) |action| {
+            if (self.env.signal_state.trap_handlers[@intCast(sig)]) |action| {
                 self.executeTrap(action);
             }
         }
     }
 
     pub fn runExitTrap(self: *Shell) void {
-        if (signals.getExitTrap()) |action| {
-            signals.setExitTrap(null);
+        if (signals.getExitTrap(&self.env.signal_state)) |action| {
+            signals.setExitTrap(&self.env.signal_state, null);
             const saved_status = self.env.last_exit_status;
             const saved_exit = self.env.should_exit;
             const saved_value = self.env.exit_value;
@@ -132,13 +133,16 @@ pub const Shell = struct {
                 return 2;
             };
             if (cmd == null) break;
-            status = executor.executeCompleteCommand(cmd.?);
-            self.env.last_exit_status = status;
+            const result = executor.executeCompleteCommandTyped(cmd.?);
+            status = result.status;
+            self.env.last_exit_status = result.status;
             if (!self.env.should_exit and !self.env.should_return) {
                 self.checkSignalTraps();
             }
-            if (self.env.should_exit) break;
-            if (self.env.should_return) break;
+            switch (result.flow) {
+                .none => {},
+                else => break,
+            }
         }
 
         return status;
@@ -170,12 +174,16 @@ pub const Shell = struct {
         var status: u8 = 0;
 
         for (program.commands) |cmd| {
-            status = executor.executeCompleteCommand(cmd);
-            self.env.last_exit_status = status;
+            const result = executor.executeCompleteCommandTyped(cmd);
+            status = result.status;
+            self.env.last_exit_status = result.status;
             if (!self.env.should_exit and !self.env.should_return) {
                 self.checkSignalTraps();
             }
-            if (self.env.should_exit or self.env.should_return) break;
+            switch (result.flow) {
+                .none => {},
+                else => break,
+            }
         }
 
         return status;
@@ -218,6 +226,7 @@ pub const Shell = struct {
 
     pub fn runInteractive(self: *Shell) u8 {
         self.interactive = true;
+        signals.setActiveState(&self.env.signal_state);
         const is_tty = posix.isatty(0);
         if (is_tty) {
             signals.setupInteractiveSignals();
@@ -275,64 +284,84 @@ pub const Shell = struct {
     }
 
     fn runSimple(self: *Shell) u8 {
-        var buf: [4096]u8 = undefined;
-        const show_prompt = posix.isatty(0);
+        var read_buf: [4096]u8 = undefined;
+        var pending: std.ArrayListUnmanaged(u8) = .empty;
+        defer pending.deinit(self.gpa);
 
         while (!self.env.should_exit) {
             self.jobs.updateJobStatus();
             self.jobs.notifyDoneJobs();
             self.checkSignalTraps();
 
-            if (show_prompt) {
-                const ps1_raw = self.env.get("PS1") orelse "$ ";
-                const prompt_expanded = Expander.expandPromptString(self.gpa, ps1_raw, &self.env, &self.jobs) catch null;
-                defer if (prompt_expanded) |p| self.gpa.free(p);
-                const prompt = prompt_expanded orelse ps1_raw;
-                posix.writeAll(2, prompt);
-            }
-
-            const n = posix.read(0, &buf) catch break;
+            const n = posix.read(0, &read_buf) catch break;
             if (n == 0) break;
-            var line = buf[0..n];
-            if (line.len > 0 and line[line.len - 1] == '\n') {
-                line = line[0 .. line.len - 1];
-            }
-            if (line.len == 0) continue;
+            pending.appendSlice(self.gpa, read_buf[0..n]) catch break;
+            self.drainStreamBuffer(&pending, false);
+            if (self.env.should_return) break;
+        }
 
-            var accum: std.ArrayListUnmanaged(u8) = .empty;
-            defer accum.deinit(self.gpa);
-            accum.appendSlice(self.gpa, line) catch continue;
-
-            while (true) {
-                switch (self.executeAccumulated(accum.items)) {
-                    .executed => |status| {
-                        self.env.last_exit_status = status;
-                        break;
-                    },
-                    .incomplete => {
-                        if (show_prompt) {
-                            const ps2_raw = self.env.get("PS2") orelse "> ";
-                            const ps2_expanded = Expander.expandPromptString(self.gpa, ps2_raw, &self.env, &self.jobs) catch null;
-                            defer if (ps2_expanded) |p| self.gpa.free(p);
-                            const ps2 = ps2_expanded orelse ps2_raw;
-                            posix.writeAll(2, ps2);
-                        }
-                        const n2 = posix.read(0, &buf) catch break;
-                        if (n2 == 0) break;
-                        var cont = buf[0..n2];
-                        if (cont.len > 0 and cont[cont.len - 1] == '\n') {
-                            cont = cont[0 .. cont.len - 1];
-                        }
-                        accum.append(self.gpa, '\n') catch break;
-                        accum.appendSlice(self.gpa, cont) catch break;
-                    },
-                    .retry => break,
-                }
-            }
+        if (!self.env.should_exit and !self.env.should_return) {
+            self.drainStreamBuffer(&pending, true);
         }
         self.runExitTrap();
         if (self.env.should_exit) return self.env.exit_value;
         return self.env.last_exit_status;
+    }
+
+    fn drainStreamBuffer(self: *Shell, pending: *std.ArrayListUnmanaged(u8), eof: bool) void {
+        while (pending.items.len > 0 and !self.env.should_exit and !self.env.should_return) {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            var lexer = Lexer.init(pending.items);
+            var parser = Parser.init(alloc, &lexer) catch {
+                if (eof) {
+                    self.reportError("syntax error", error.UnexpectedEOF);
+                    self.env.last_exit_status = 2;
+                    pending.clearRetainingCapacity();
+                }
+                return;
+            };
+            parser.env = &self.env;
+
+            const cmd = parser.parseOneCommand() catch |err| {
+                if (!eof and isIncompleteError(err)) {
+                    return;
+                }
+                self.reportError("syntax error", err);
+                self.env.last_exit_status = 2;
+                pending.clearRetainingCapacity();
+                return;
+            };
+            if (cmd == null) {
+                pending.clearRetainingCapacity();
+                return;
+            }
+
+            var executor = Executor.init(alloc, &self.env, &self.jobs);
+            const result = executor.executeCompleteCommandTyped(cmd.?);
+            self.env.last_exit_status = result.status;
+            if (!self.env.should_exit and !self.env.should_return) {
+                self.checkSignalTraps();
+            }
+            switch (result.flow) {
+                .none => {},
+                else => return,
+            }
+
+            const consumed: usize = @intCast(parser.lexer.pos);
+            if (consumed == 0 or consumed > pending.items.len) {
+                pending.clearRetainingCapacity();
+                return;
+            }
+
+            const remaining = pending.items[consumed..];
+            if (remaining.len > 0) {
+                std.mem.copyForwards(u8, pending.items[0..remaining.len], remaining);
+            }
+            pending.items.len = remaining.len;
+        }
     }
 
     fn loadHistory(self: *Shell) void {

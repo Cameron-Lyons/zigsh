@@ -25,6 +25,19 @@ pub const Executor = struct {
     bang_reached: bool = false,
     current_line: u32 = 0,
 
+    pub const FlowControl = enum {
+        none,
+        exit_shell,
+        return_from_function,
+        break_loop,
+        continue_loop,
+    };
+
+    pub const CommandResult = struct {
+        status: u8,
+        flow: FlowControl,
+    };
+
     pub fn init(alloc: std.mem.Allocator, env: *Environment, jobs: *JobTable) Executor {
         return .{ .env = env, .jobs = jobs, .alloc = alloc };
     }
@@ -51,13 +64,29 @@ pub const Executor = struct {
         return self.executeList(cmd.list);
     }
 
+    pub fn executeCompleteCommandTyped(self: *Executor, cmd: ast.CompleteCommand) CommandResult {
+        const status = self.executeCompleteCommand(cmd);
+        return .{
+            .status = status,
+            .flow = self.currentFlow(),
+        };
+    }
+
+    fn currentFlow(self: *const Executor) FlowControl {
+        if (self.env.should_exit) return .exit_shell;
+        if (self.env.should_return) return .return_from_function;
+        if (self.env.break_count > 0) return .break_loop;
+        if (self.env.continue_count > 0) return .continue_loop;
+        return .none;
+    }
+
     fn executeBackground(self: *Executor, list: ast.List) u8 {
         const pid = posix.fork() catch {
             posix.writeAll(2, "zigsh: fork failed\n");
             return 1;
         };
         if (pid == 0) {
-            signals.clearTrapsForSubshell();
+            signals.clearTrapsForSubshell(&self.env.signal_state);
             posix.setpgid(0, 0) catch {};
             posix.exit(self.executeList(list));
         }
@@ -128,7 +157,7 @@ pub const Executor = struct {
             return 1;
         };
         if (pid == 0) {
-            signals.clearTrapsForSubshell();
+            signals.clearTrapsForSubshell(&self.env.signal_state);
             posix.setpgid(0, 0) catch {};
             const status = self.executeAndOr(and_or);
             posix.exit(status);
@@ -198,7 +227,7 @@ pub const Executor = struct {
         if (and_or.rest.len > 0 and !last_ran) self.bang_reached = true;
         self.env.last_exit_status = status;
         if (status != 0 and !self.in_err_trap) {
-            if (signals.getErrTrap()) |action| {
+            if (signals.getErrTrap(&self.env.signal_state)) |action| {
                 self.in_err_trap = true;
                 _ = self.executeInline(action);
                 self.in_err_trap = false;
@@ -267,7 +296,7 @@ pub const Executor = struct {
             };
 
             if (pid == 0) {
-                signals.clearTrapsForSubshell();
+                signals.clearTrapsForSubshell(&self.env.signal_state);
                 self.env.in_subshell = true;
                 if (prev_read_fd) |rd| {
                     posix.dup2(rd, types.STDIN) catch posix.exit(1);
@@ -808,7 +837,7 @@ pub const Executor = struct {
     fn executeSubshell(self: *Executor, sub: ast.Subshell) u8 {
         const pid = posix.fork() catch return 1;
         if (pid == 0) {
-            signals.clearTrapsForSubshell();
+            signals.clearTrapsForSubshell(&self.env.signal_state);
             self.env.loop_depth = 0;
             self.env.in_subshell = true;
             const status = self.executeCompoundList(sub.body);
@@ -1127,81 +1156,14 @@ pub const Executor = struct {
             return self.env.get(val) != null;
         }
         if (std.mem.eql(u8, op, "-o")) {
-            if (std.mem.eql(u8, val, "errexit")) return self.env.options.errexit;
-            if (std.mem.eql(u8, val, "nounset")) return self.env.options.nounset;
-            if (std.mem.eql(u8, val, "xtrace")) return self.env.options.xtrace;
-            if (std.mem.eql(u8, val, "verbose")) return self.env.options.verbose;
-            if (std.mem.eql(u8, val, "noclobber")) return self.env.options.noclobber;
-            if (std.mem.eql(u8, val, "noexec")) return self.env.options.noexec;
-            if (std.mem.eql(u8, val, "noglob")) return self.env.options.noglob;
-            if (std.mem.eql(u8, val, "allexport")) return self.env.options.allexport;
-            return false;
+            return builtins.setOptionEnabled(&self.env.options, val) orelse false;
         }
         if (std.mem.eql(u8, op, "-t")) {
             const fd_num = std.fmt.parseInt(posix.fd_t, val, 10) catch return false;
             return posix.isatty(fd_num);
         }
         const path_z = std.posix.toPosixPath(val) catch return false;
-        if (std.mem.eql(u8, op, "-a") or std.mem.eql(u8, op, "-e")) {
-            _ = posix.stat(&path_z) catch return false;
-            return true;
-        }
-        if (std.mem.eql(u8, op, "-f")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFREG;
-        }
-        if (std.mem.eql(u8, op, "-d")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFDIR;
-        }
-        if (std.mem.eql(u8, op, "-b")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFBLK;
-        }
-        if (std.mem.eql(u8, op, "-c")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFCHR;
-        }
-        if (std.mem.eql(u8, op, "-p")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFIFO;
-        }
-        if (std.mem.eql(u8, op, "-h") or std.mem.eql(u8, op, "-L")) {
-            const st = posix.lstat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFLNK;
-        }
-        if (std.mem.eql(u8, op, "-S")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_IFMT == posix.S_IFSOCK;
-        }
-        if (std.mem.eql(u8, op, "-g")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_ISGID != 0;
-        }
-        if (std.mem.eql(u8, op, "-u")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_ISUID != 0;
-        }
-        if (std.mem.eql(u8, op, "-k")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.mode & posix.S_ISVTX != 0;
-        }
-        if (std.mem.eql(u8, op, "-r")) return posix.access(&path_z, posix.R_OK);
-        if (std.mem.eql(u8, op, "-w")) return posix.access(&path_z, posix.W_OK);
-        if (std.mem.eql(u8, op, "-x")) return posix.access(&path_z, posix.X_OK);
-        if (std.mem.eql(u8, op, "-s")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.size > 0;
-        }
-        if (std.mem.eql(u8, op, "-G")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.gid == posix.getegid();
-        }
-        if (std.mem.eql(u8, op, "-O")) {
-            const st = posix.stat(&path_z) catch return false;
-            return st.uid == posix.geteuid();
-        }
-        return false;
+        return builtins.evalPathUnary(op, &path_z) orelse false;
     }
 
     fn evalDbBinary(self: *Executor, op: []const u8, lhs: []const u8, rhs: []const u8) bool {

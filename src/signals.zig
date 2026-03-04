@@ -80,13 +80,25 @@ pub const TRAP_EXIT: usize = 0;
 pub const TRAP_ERR: usize = SIGNAL_LIMIT + 1;
 const TRAP_COUNT: usize = TRAP_ERR + 1;
 
-pub var trap_handlers: [TRAP_COUNT]?[]const u8 = [_]?[]const u8{null} ** TRAP_COUNT;
-pub var received_signals: [SIGNAL_LIMIT]bool = [_]bool{false} ** SIGNAL_LIMIT;
+pub const State = struct {
+    trap_handlers: [TRAP_COUNT]?[]const u8 = [_]?[]const u8{null} ** TRAP_COUNT,
+    received_signals: [SIGNAL_LIMIT]bool = [_]bool{false} ** SIGNAL_LIMIT,
+};
+
+var active_state: ?*State = null;
+
+pub fn setActiveState(state: *State) void {
+    active_state = state;
+}
+
+pub fn clearActiveState() void {
+    active_state = null;
+}
 
 fn signalHandler(sig: SIG) callconv(.c) void {
     const s: usize = @intFromEnum(sig);
-    if (s < SIGNAL_LIMIT) {
-        received_signals[s] = true;
+    if (s < SIGNAL_LIMIT and active_state != null) {
+        active_state.?.received_signals[s] = true;
     }
 }
 
@@ -129,22 +141,22 @@ pub fn setupInteractiveSignals() void {
     ignoreSignal(SIGTTOU);
 }
 
-pub fn clearTrapsForSubshell() void {
+pub fn clearTrapsForSubshell(state: *State) void {
     for (1..SIGNAL_LIMIT) |i| {
-        if (trap_handlers[i]) |action| {
+        if (state.trap_handlers[i]) |action| {
             if (action.len > 0) {
-                trap_handlers[i] = null;
+                state.trap_handlers[i] = null;
                 defaultSignal(@intCast(i));
             }
         }
     }
-    trap_handlers[TRAP_EXIT] = null;
-    trap_handlers[TRAP_ERR] = null;
+    state.trap_handlers[TRAP_EXIT] = null;
+    state.trap_handlers[TRAP_ERR] = null;
 }
 
-pub fn setTrap(signum: u6, action: ?[]const u8) void {
+pub fn setTrap(state: *State, signum: u6, action: ?[]const u8) void {
     if (signum < SIGNAL_LIMIT_U6) {
-        trap_handlers[@intCast(signum)] = action;
+        state.trap_handlers[@intCast(signum)] = action;
         if (signum == SIGKILL or signum == SIGSTOP) return;
         if (action) |a| {
             if (a.len == 0) {
@@ -158,26 +170,26 @@ pub fn setTrap(signum: u6, action: ?[]const u8) void {
     }
 }
 
-pub fn getExitTrap() ?[]const u8 {
-    return trap_handlers[TRAP_EXIT];
+pub fn getExitTrap(state: *const State) ?[]const u8 {
+    return state.trap_handlers[TRAP_EXIT];
 }
 
-pub fn setExitTrap(action: ?[]const u8) void {
-    trap_handlers[TRAP_EXIT] = action;
+pub fn setExitTrap(state: *State, action: ?[]const u8) void {
+    state.trap_handlers[TRAP_EXIT] = action;
 }
 
-pub fn getErrTrap() ?[]const u8 {
-    return trap_handlers[TRAP_ERR];
+pub fn getErrTrap(state: *const State) ?[]const u8 {
+    return state.trap_handlers[TRAP_ERR];
 }
 
-pub fn setErrTrap(action: ?[]const u8) void {
-    trap_handlers[TRAP_ERR] = action;
+pub fn setErrTrap(state: *State, action: ?[]const u8) void {
+    state.trap_handlers[TRAP_ERR] = action;
 }
 
-pub fn checkPendingSignals() ?u6 {
+pub fn checkPendingSignals(state: *State) ?u6 {
     for (0..SIGNAL_LIMIT) |i| {
-        if (received_signals[i]) {
-            received_signals[i] = false;
+        if (state.received_signals[i]) {
+            state.received_signals[i] = false;
             return @intCast(i);
         }
     }

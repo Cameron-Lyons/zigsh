@@ -1152,7 +1152,7 @@ pub const Expander = struct {
             'a' => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
                 const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
-                if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
+                if (self.env.isArrayVar(base_name)) try result.append(self.alloc, 'a');
                 if (self.env.vars.get(base_name)) |variable| {
                     if (variable.integer) try result.append(self.alloc, 'i');
                     if (variable.lowercase) try result.append(self.alloc, 'l');
@@ -1173,7 +1173,7 @@ pub const Expander = struct {
             'a' => {
                 var result: std.ArrayListUnmanaged(u8) = .empty;
                 const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
-                if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
+                if (self.env.isArrayVar(base_name)) try result.append(self.alloc, 'a');
                 if (self.env.vars.get(base_name)) |variable| {
                     if (variable.integer) try result.append(self.alloc, 'i');
                     if (variable.lowercase) try result.append(self.alloc, 'l');
@@ -1872,7 +1872,7 @@ pub const Expander = struct {
         };
 
         if (pid == 0) {
-            signals.clearTrapsForSubshell();
+            signals.clearTrapsForSubshell(&self.env.signal_state);
             self.env.in_subshell = true;
             posix.close(pipe_fds[0]);
             posix.dup2(pipe_fds[1], 1) catch posix.exit(1);
@@ -2683,7 +2683,7 @@ pub const Expander = struct {
                     'a' => {
                         var result: std.ArrayListUnmanaged(u8) = .empty;
                         const base_name = if (parseArraySubscript(op.name)) |arr| arr.base else op.name;
-                        if (self.env.arrays.contains(base_name)) try result.append(self.alloc, 'a');
+                        if (self.env.isArrayVar(base_name)) try result.append(self.alloc, 'a');
                         if (self.env.vars.get(base_name)) |variable| {
                             if (variable.integer) try result.append(self.alloc, 'i');
                             if (variable.lowercase) try result.append(self.alloc, 'l');

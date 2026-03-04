@@ -315,11 +315,6 @@ pub fn setpgid(pid: pid_t, pgid: pid_t) !void {
     if (rc < 0) return error.SetpgidFailed;
 }
 
-pub fn killpg(pgrp: pid_t, sig: u6) !void {
-    const rc = c.kill(-pgrp, @enumFromInt(sig));
-    if (rc < 0) return error.KillFailed;
-}
-
 pub fn exit(status: u8) noreturn {
     std.process.exit(status);
 }
