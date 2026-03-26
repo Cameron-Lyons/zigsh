@@ -16,6 +16,20 @@ Run tests:
 zig build test
 ```
 
+Run benchmarks:
+
+```
+zig build bench -Doptimize=ReleaseFast
+```
+
+Filter or tune the benchmark run:
+
+```
+zig build bench -Doptimize=ReleaseFast -- --filter parser
+zig build bench -Doptimize=ReleaseFast -- --iterations 2000
+zig build bench -Doptimize=ReleaseFast -- --list
+```
+
 ## Usage
 
 ```sh
@@ -98,4 +112,5 @@ src/
   posix.zig         POSIX/libc wrapper functions
   types.zig         Shared type aliases
   errors.zig        Error types
+  bench.zig         Benchmark harness for core shell workloads
 ```
