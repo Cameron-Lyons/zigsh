@@ -30,6 +30,32 @@ zig build bench -Doptimize=ReleaseFast -- --iterations 2000
 zig build bench -Doptimize=ReleaseFast -- --list
 ```
 
+Run Oil spec tests (POSIX-focused subset):
+
+```sh
+tools/oil-spec.sh
+```
+
+Run Oil spec tests in parallel:
+
+```sh
+tools/oil-spec.sh --jobs 4
+# or via env var:
+OIL_SPEC_JOBS=4 tools/oil-spec.sh
+```
+
+Run specific Oil spec files:
+
+```sh
+tools/oil-spec.sh smoke builtin-read builtin-printf
+```
+
+The runner writes logs and per-file stats to:
+
+```sh
+_tmp/oil-spec-results/
+```
+
 ## Usage
 
 ```sh

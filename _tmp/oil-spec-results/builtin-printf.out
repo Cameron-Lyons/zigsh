@@ -1,0 +1,77 @@
+builtin-printf: FATAL: Got 0 Oils failures, but 1 are allowed
+builtin-printf: FATAL: Got 28 total failures, but 1 are allowed
+builtin-printf.test.sh
+[1mcase	line	dash	bash	zsh	osh	[0;0m
+  0	 18	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	printf with no args
+  1	 24	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	printf -v %s
+  2	 38	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	printf -v %q
+  3	 60	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	printf -v a[1]
+  4	 76	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	printf -v syntax error
+  5	 84	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	dynamic declare instead of %s
+  6	 95	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	dynamic declare instead of %q
+  7	112	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	printf -v dynamic scope
+  8	144	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf with too few arguments
+  9	150	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf with too many arguments
+ 10	158	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf width strings
+ 11	166	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf integer
+ 12	186	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %6.4d -- "precision" does padding for integers
+ 13	204	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %6.4x X o
+ 14	230	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	%06d zero padding vs. %6.6d
+ 15	244	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	%06x %06X %06o
+ 16	254	[31m[1mFAIL[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	%06s is no-op
+ 17	274	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %6.4s does both truncation and padding
+ 18	290	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %6.0s and %0.0s
+ 19	300	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	printf %6.s and %0.s
+ 20	314	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %*.*s (width/precision from args)
+ 21	328	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	unsigned / octal / hex
+ 22	348	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	unsigned / octal / hex big
+ 23	384	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	empty string (osh is more strict)
+ 24	391	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	No char after ' => zero code point
+ 25	403	[33m[1mBUG[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Unicode char with '
+ 26	486	[31m[1mFAIL[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Invalid UTF-8
+ 27	543	[31m[1mFAIL[0;0m	[31m[1mFAIL[0;0m	[31m[1mFAIL[0;0m	[33m[1mBUG[0;0m	Too large
+ 28	577	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	negative numbers with unsigned / octal / hex
+ 29	603	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf floating point (not required, but they all implement it)
+ 30	619	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf floating point with - and 0
+ 31	643	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf eE fF gG
+ 32	659	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf backslash escapes
+ 33	677	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf octal backslash escapes
+ 34	685	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf unicode backslash escapes
+ 35	697	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf invalid backslash escape (is ignored)
+ 36	703	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf % escapes
+ 37	709	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %c ASCII
+ 38	721	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %c unicode - prints the first BYTE of a string - it does not respect UTF-8
+ 39	742	[33m[1mok[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf invalid format
+ 40	757	[33m[1mN-I[0;0m	[33m[1mok[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	printf %q
+ 41	770	[33m[1mN-I[0;0m	[33m[1mok[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	printf %6q (width)
+ 42	787	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	printf negative numbers
+ 43	850	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf + and space flags
+ 44	863	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf # flag
+ 45	883	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	Runtime error for invalid integer
+ 46	911	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	%(strftime format)T
+ 47	930	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	%(strftime format)T doesn't respect TZ if not exported
+ 48	952	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	%(strftime format)T TZ in environ but not in shell's memory
+ 49	973	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	%10.5(strftime format)T
+ 50	992	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	Regression for 'printf x y'
+ 51	999	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	bash truncates long strftime string at 128
+ 52	1049	[33m[1mok[0;0m	[33m[1mok[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	printf positive integer overflow
+ 53	1130	[33m[1mok[0;0m	[33m[1mok[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	printf negative integer overflow
+ 54	1208	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %b does backslash escaping
+ 55	1244	[33m[1mN-I[0;0m	[31m[1mFAIL[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %b unicode escapes
+ 56	1259	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[32m[1mpass[0;0m	printf %b respects \c early return
+ 57	1268	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	printf %b supports octal escapes, both \141 and \0141
+ 58	1309	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mN-I[0;0m	[32m[1mpass[0;0m	printf %b with truncated octal escapes
+ 59	1345	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	printf %d %X support hex 0x5 and octal 055
+ 60	1403	[32m[1mpass[0;0m	[32m[1mpass[0;0m	[33m[1mBUG[0;0m	[32m[1mpass[0;0m	printf %d with + prefix (positive sign)
+ 61	1439	[32m[1mpass[0;0m	[31m[1mFAIL[0;0m	[34m[1mBUG-2[0;0m	[32m[1mpass[0;0m	leading spaces are accepted in value given to %d %X, but not trailing spaces
+ 62	1500	[33m[1mok[0;0m	[31m[1mFAIL[0;0m	[33m[1mok[0;0m	[32m[1mpass[0;0m	Arbitrary base 64#a is rejected (unlike in shell arithmetic)
+
+[1m		dash	bash	zsh	osh	[0;0m
+	[32m[1mpass[0;0m	37	41	37	62
+	[33m[1mok[0;0m	4	4	5	0
+	[33m[1mN-I[0;0m	18	0	9	0
+	[34m[1mBUG-2[0;0m	0	0	1	0
+	[33m[1mBUG[0;0m	1	0	4	1
+	[31m[1mFAIL[0;0m	3	18	7	0
+	total	63	63	63	63
+

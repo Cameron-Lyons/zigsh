@@ -1,47 +1,11 @@
 const std = @import("std");
 const testing = std.testing;
 const process = std.process;
-const Io = std.Io;
-const ArrayList = std.ArrayList;
-
-const zigsh_argv_prefix = [_][]const u8{ "./zig-out/bin/zigsh", "-c" };
-
-fn runShellWithInput(cmd: []const u8, input: []const u8) !struct { stdout: []u8, stderr: []u8, term: process.Child.Term } {
-    const io = testing.io;
-    const argv = zigsh_argv_prefix ++ .{cmd};
-    var child = try process.spawn(io, .{
-        .argv = &argv,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    defer child.kill(io);
-
-    child.stdin.?.writeStreamingAll(io, input) catch {};
-    child.stdin.?.close(io);
-    child.stdin = null;
-
-    var stdout: ArrayList(u8) = .empty;
-    defer stdout.deinit(testing.allocator);
-    var stderr: ArrayList(u8) = .empty;
-    defer stderr.deinit(testing.allocator);
-
-    try child.collectOutput(testing.allocator, &stdout, &stderr, 50 * 1024);
-    const term = try child.wait(io);
-
-    return .{
-        .stdout = try stdout.toOwnedSlice(testing.allocator),
-        .stderr = try stderr.toOwnedSlice(testing.allocator),
-        .term = term,
-    };
-}
+const test_support = @import("test_support.zig");
+const runShellWithInput = test_support.runShellWithInput;
 
 fn expectReadOutput(cmd: []const u8, input: []const u8, expected: []const u8) !void {
-    const result = try runShellWithInput(cmd, input);
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-    try testing.expectEqualStrings(expected, result.stdout);
-    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
+    try test_support.expectOutputWithInput(cmd, input, expected);
 }
 
 test "read single variable" {
@@ -234,7 +198,7 @@ test "read successive reads consume lines" {
     );
 }
 
-test "read -p displays prompt on stderr" {
+test "read -p suppresses prompt on non-tty stderr" {
     const result = try runShellWithInput(
         "read -p 'Enter: ' x; printf '%s\\n' \"$x\"",
         "hello\n",
@@ -242,7 +206,7 @@ test "read -p displays prompt on stderr" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("hello\n", result.stdout);
-    try testing.expectEqualStrings("Enter: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
     try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
 }
 
@@ -265,7 +229,7 @@ test "read -p prompt with REPLY default" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("test\n", result.stdout);
-    try testing.expectEqualStrings("> ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -d custom delimiter" {
@@ -318,7 +282,7 @@ test "read -rp combined flags" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("back\\slash\n", result.stdout);
-    try testing.expectEqualStrings("prompt: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -r -d combined separate flags" {
@@ -337,7 +301,7 @@ test "read -r -p -d all three flags" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("<a\\b>\n", result.stdout);
-    try testing.expectEqualStrings("go: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -p with prompt as next arg" {
@@ -348,7 +312,7 @@ test "read -p with prompt as next arg" {
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
     try testing.expectEqualStrings("val\n", result.stdout);
-    try testing.expectEqualStrings("ask: ", result.stderr);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "read -d with delimiter as next arg" {

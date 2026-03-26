@@ -15,6 +15,7 @@ const glob = @import("glob.zig");
 const token = @import("token.zig");
 const signals = @import("signals.zig");
 const Arithmetic = @import("arithmetic.zig").Arithmetic;
+const shell_utils = @import("shell_utils.zig");
 
 pub const Executor = struct {
     env: *Environment,
@@ -223,8 +224,12 @@ pub const Executor = struct {
 
         var prev_read_fd: ?types.Fd = null;
         var last_pid: ?posix.pid_t = null;
-        var child_pids: [64]posix.pid_t = undefined;
-        var num_children: usize = 0;
+        var child_pids: std.ArrayListUnmanaged(posix.pid_t) = .empty;
+        defer child_pids.deinit(self.alloc);
+        child_pids.ensureTotalCapacity(self.alloc, pipeline.commands.len) catch {
+            posix.writeAll(2, "zigsh: out of memory\n");
+            return 1;
+        };
 
         const use_lastpipe = self.env.shopt.lastpipe and !self.env.options.monitor;
         var lastpipe_status: ?u8 = null;
@@ -277,10 +282,10 @@ pub const Executor = struct {
                 posix.exit(status);
             }
 
-            if (num_children < 64) {
-                child_pids[num_children] = pid;
-                num_children += 1;
-            }
+            child_pids.append(self.alloc, pid) catch {
+                posix.writeAll(2, "zigsh: out of memory\n");
+                return 1;
+            };
             last_pid = pid;
 
             if (prev_read_fd) |rd| {
@@ -294,25 +299,28 @@ pub const Executor = struct {
 
         var status: u8 = 0;
         var pipefail_status: u8 = 0;
-        var pipe_statuses: [64]u8 = undefined;
-        for (child_pids[0..num_children], 0..) |cpid, idx| {
+        var pipe_statuses: std.ArrayListUnmanaged(u8) = .empty;
+        defer pipe_statuses.deinit(self.alloc);
+        pipe_statuses.ensureTotalCapacity(self.alloc, child_pids.items.len + @as(usize, @intFromBool(lastpipe_status != null))) catch {
+            posix.writeAll(2, "zigsh: out of memory\n");
+            return 1;
+        };
+        for (child_pids.items) |cpid| {
             const result = posix.waitpid(cpid, 0);
             const s = posix.statusFromWait(result.status);
-            if (idx < 64) pipe_statuses[idx] = s;
+            pipe_statuses.append(self.alloc, s) catch {};
             if (s != 0) pipefail_status = s;
             if (cpid == last_pid) {
                 status = s;
             }
         }
         if (lastpipe_status) |lps| {
-            if (num_children < 64) {
-                pipe_statuses[num_children] = lps;
-            }
+            pipe_statuses.append(self.alloc, lps) catch {};
             status = lps;
             if (lps != 0) pipefail_status = lps;
-            self.setPipeStatus(pipe_statuses[0 .. num_children + 1]);
+            self.setPipeStatus(pipe_statuses.items);
         } else {
-            self.setPipeStatus(pipe_statuses[0..num_children]);
+            self.setPipeStatus(pipe_statuses.items);
         }
 
         if (self.env.options.pipefail) {
@@ -546,12 +554,13 @@ pub const Executor = struct {
             }
         }
 
+        var expanded_assign_values: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer expanded_assign_values.deinit(self.alloc);
+        var assigns_expanded = false;
+
         if (fields.len == 0) {
             if (simple.assigns.len > 0 and simple.words.len > 0) {
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch continue;
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             }
             return self.env.last_exit_status;
         }
@@ -596,16 +605,10 @@ pub const Executor = struct {
         var status: u8 = 0;
 
         if (std.mem.eql(u8, cmd_name, ".") or std.mem.eql(u8, cmd_name, "source")) {
-            for (simple.assigns) |assign| {
-                const value = expander.expandWord(assign.value) catch "";
-                self.env.set(assign.name, value, false) catch {};
-            }
+            self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             status = self.executeSourceBuiltin(fields);
         } else if (std.mem.eql(u8, cmd_name, "eval")) {
-            for (simple.assigns) |assign| {
-                const value = expander.expandWord(assign.value) catch "";
-                self.env.set(assign.name, value, false) catch {};
-            }
+            self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             status = self.executeEvalBuiltin(fields);
         } else if (std.mem.eql(u8, cmd_name, "exec")) {
             var cmd_idx: usize = 1;
@@ -618,10 +621,7 @@ pub const Executor = struct {
                 } else break;
             }
             if (cmd_idx >= fields.len) {
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.set(assign.name, value, true) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, true);
                 self.env.last_exit_status = 0;
                 return 0;
             }
@@ -653,35 +653,24 @@ pub const Executor = struct {
             }
         } else if (std.mem.eql(u8, cmd_name, "fc")) {
             status = self.executeFcBuiltin(fields);
-        } else if (self.env.functions.get(cmd_name) != null and !isSpecialBuiltin(cmd_name)) {
+        } else if (self.env.functions.get(cmd_name) != null and !builtins.isSpecialBuiltin(cmd_name)) {
             const has_temp_assigns = simple.assigns.len > 0;
             if (has_temp_assigns) {
                 self.env.pushScope() catch {};
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.declareLocal(assign.name) catch {};
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, true, false);
             }
             status = self.executeFunction(cmd_name, fields);
             if (has_temp_assigns) {
                 self.env.popScope();
             }
         } else if (builtins.lookup(cmd_name)) |builtin_fn| {
-            const is_special = isSpecialBuiltin(cmd_name);
+            const is_special = builtins.isSpecialBuiltin(cmd_name);
             const has_temp = simple.assigns.len > 0 and simple.words.len > 0 and !is_special and !is_assign_builtin;
             if (has_temp) {
                 self.env.pushScope() catch {};
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.declareLocal(assign.name) catch {};
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, true, false);
             } else if (simple.assigns.len > 0 and simple.words.len > 0) {
-                for (simple.assigns) |assign| {
-                    const value = expander.expandWord(assign.value) catch "";
-                    self.env.set(assign.name, value, false) catch {};
-                }
+                self.applySimpleAssigns(&expander, simple.assigns, &expanded_assign_values, &assigns_expanded, false, false);
             }
             status = builtin_fn(fields, self.env);
             if (has_temp) {
@@ -697,6 +686,38 @@ pub const Executor = struct {
         }
         self.env.last_exit_status = status;
         return status;
+    }
+
+    fn applySimpleAssigns(
+        self: *Executor,
+        expander: *Expander,
+        assigns: []const ast.Assignment,
+        expanded_assign_values: *std.ArrayListUnmanaged([]const u8),
+        assigns_expanded: *bool,
+        declare_local: bool,
+        exported: bool,
+    ) void {
+        if (!assigns_expanded.*) {
+            expanded_assign_values.clearRetainingCapacity();
+            expanded_assign_values.ensureTotalCapacity(self.alloc, assigns.len) catch {};
+            for (assigns) |assign| {
+                const value = expander.expandWord(assign.value) catch "";
+                expanded_assign_values.append(self.alloc, value) catch {};
+                if (declare_local) self.env.declareLocal(assign.name) catch {};
+                self.env.set(assign.name, value, exported) catch {};
+            }
+            assigns_expanded.* = true;
+            return;
+        }
+
+        for (assigns, 0..) |assign, idx| {
+            const value = if (idx < expanded_assign_values.items.len)
+                expanded_assign_values.items[idx]
+            else
+                expander.expandWord(assign.value) catch "";
+            if (declare_local) self.env.declareLocal(assign.name) catch {};
+            self.env.set(assign.name, value, exported) catch {};
+        }
     }
 
     fn executeCompound(self: *Executor, cp: ast.CompoundPair) u8 {
@@ -728,20 +749,13 @@ pub const Executor = struct {
     }
 
     fn executeFunctionDef(self: *Executor, fd: ast.FunctionDef) u8 {
-        const special_builtins = [_][]const u8{
-            "break", ":", "continue", ".", "eval", "exec", "exit",
-            "export", "readonly", "return", "set", "shift", "times",
-            "trap", "unset",
-        };
-        for (special_builtins) |sb| {
-            if (std.mem.eql(u8, fd.name, sb)) {
-                posix.writeAll(2, "zigsh: ");
-                posix.writeAll(2, fd.name);
-                posix.writeAll(2, ": is a special builtin\n");
-                self.env.should_exit = true;
-                self.env.exit_value = 2;
-                return 2;
-            }
+        if (builtins.isSpecialBuiltin(fd.name)) {
+            posix.writeAll(2, "zigsh: ");
+            posix.writeAll(2, fd.name);
+            posix.writeAll(2, ": is a special builtin\n");
+            self.env.should_exit = true;
+            self.env.exit_value = 2;
+            return 2;
         }
         var has_heredoc = false;
         for (fd.body.redirects) |redir| {
@@ -1245,12 +1259,7 @@ pub const Executor = struct {
                     const digits = str[hash_idx + 1 ..];
                     var result: i64 = 0;
                     for (digits) |ch| {
-                        const d: i64 = if (ch >= '0' and ch <= '9') ch - '0'
-                        else if (ch >= 'a' and ch <= 'z') ch - 'a' + 10
-                        else if (ch >= 'A' and ch <= 'Z') ch - 'A' + 36
-                        else if (ch == '@') 62
-                        else if (ch == '_') 63
-                        else return 0;
+                        const d: i64 = if (ch >= '0' and ch <= '9') ch - '0' else if (ch >= 'a' and ch <= 'z') ch - 'a' + 10 else if (ch >= 'A' and ch <= 'Z') ch - 'A' + 36 else if (ch == '@') 62 else if (ch == '_') 63 else return 0;
                         if (d >= base_val) return 0;
                         result = result * base_val + d;
                     }
@@ -1445,6 +1454,7 @@ pub const Executor = struct {
             posix.writeAll(2, ": command not found\n");
             return 127;
         };
+        defer self.alloc.free(std.mem.sliceTo(path, 0));
 
         const pid = posix.fork() catch {
             posix.writeAll(2, "zigsh: fork failed\n");
@@ -1475,27 +1485,10 @@ pub const Executor = struct {
     }
 
     fn findExecutable(self: *Executor, name: []const u8) ?[*:0]const u8 {
-        if (std.mem.indexOfScalar(u8, name, '/') != null) {
-            const duped = self.alloc.dupeZ(u8, name) catch return null;
-            return duped.ptr;
-        }
-
-        if (self.env.getCachedCommand(name)) |cached| {
-            const duped = self.alloc.dupeZ(u8, cached) catch return null;
-            return duped.ptr;
-        }
-
-        const path_env = self.env.get("PATH") orelse "/usr/bin:/bin";
-        var iter = std.mem.splitScalar(u8, path_env, ':');
-        while (iter.next()) |dir| {
-            const full_path = std.fmt.allocPrintSentinel(self.alloc, "{s}/{s}", .{ dir, name }, 0) catch continue;
-            const st = posix.stat(full_path.ptr) catch continue;
-            if (st.mode & posix.S_IFMT == posix.S_IFREG and posix.access(full_path.ptr, posix.X_OK)) {
-                self.env.cacheCommand(name, std.mem.sliceTo(full_path, 0)) catch {};
-                return full_path.ptr;
-            }
-        }
-        return null;
+        var path_buf: [4096]u8 = undefined;
+        const path = shell_utils.findInPathNonDir(name, self.env, &path_buf) orelse return null;
+        const duped = self.alloc.dupeZ(u8, path) catch return null;
+        return duped.ptr;
     }
 
     fn buildArgv(self: *Executor, fields: []const []const u8) ![:null]const ?[*:0]const u8 {
@@ -1548,7 +1541,7 @@ pub const Executor = struct {
                     posix.close(pipe_fds[1]);
                     try state.save(fd);
                     posix.dup2(pipe_fds[0], fd) catch return error.RedirectionFailed;
-                    posix.close(pipe_fds[0]);
+                    if (pipe_fds[0] != fd) posix.close(pipe_fds[0]);
                 },
                 else => {},
             }
@@ -1603,7 +1596,7 @@ pub const Executor = struct {
                 posix.close(pipe_fds[1]);
                 try state.save(fd);
                 posix.dup2(pipe_fds[0], fd) catch return error.RedirectionFailed;
-                posix.close(pipe_fds[0]);
+                if (pipe_fds[0] != fd) posix.close(pipe_fds[0]);
             },
         }
     }
@@ -1636,7 +1629,9 @@ pub const Executor = struct {
         }
 
         const filename = fields[arg_start];
-        const path = self.resolveSourcePath(filename);
+        const resolved = self.resolveSourcePath(filename);
+        defer if (resolved.owned) self.alloc.free(resolved.path);
+        const path = resolved.path;
         const fd = posix.open(path, posix.oRdonly(), 0) catch {
             posix.writeAll(2, ".: ");
             posix.writeAll(2, filename);
@@ -1681,21 +1676,30 @@ pub const Executor = struct {
         return status;
     }
 
-    fn resolveSourcePath(self: *Executor, filename: []const u8) []const u8 {
+    const ResolvedPath = struct {
+        path: []const u8,
+        owned: bool,
+    };
+
+    fn resolveSourcePath(self: *Executor, filename: []const u8) ResolvedPath {
         if (std.mem.indexOfScalar(u8, filename, '/') != null) {
-            return filename;
+            return .{ .path = filename, .owned = false };
         }
 
         const path_env = self.env.get("PATH") orelse "";
         var path_iter = std.mem.splitScalar(u8, path_env, ':');
+        var full_buf: [4096]u8 = undefined;
         while (path_iter.next()) |dir| {
-            const full = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ dir, filename }) catch continue;
+            const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, filename }) catch continue;
             const full_z = std.posix.toPosixPath(full) catch continue;
             const st = posix.stat(&full_z) catch continue;
             if (st.mode & posix.S_IFMT == posix.S_IFDIR) continue;
-            if (posix.access(&full_z, posix.R_OK)) return full;
+            if (posix.access(&full_z, posix.R_OK)) {
+                const owned = self.alloc.dupe(u8, full) catch continue;
+                return .{ .path = owned, .owned = true };
+            }
         }
-        return filename;
+        return .{ .path = filename, .owned = false };
     }
 
     fn executeEvalBuiltin(self: *Executor, fields: []const []const u8) u8 {
@@ -1752,6 +1756,7 @@ pub const Executor = struct {
             posix.writeAll(2, ": not found\n");
             return 127;
         };
+        defer self.alloc.free(std.mem.sliceTo(path, 0));
 
         const envp = self.env.buildEnvp() catch return 1;
         if (argv0_override) |a0| {
@@ -1812,11 +1817,12 @@ pub const Executor = struct {
                 } else if (self.env.functions.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, "\n");
-                } else if (builtins.lookup(name) != null or isSpecialBuiltin(name)) {
+                } else if (builtins.lookup(name) != null or builtins.isSpecialBuiltin(name)) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, "\n");
                 } else if (self.findExecutable(name)) |path| {
                     const p = std.mem.sliceTo(path, 0);
+                    defer self.alloc.free(p);
                     const st = posix.stat(path) catch {
                         status = 1;
                         continue;
@@ -1848,10 +1854,11 @@ pub const Executor = struct {
                 } else if (self.env.functions.get(name) != null) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a function\n");
-                } else if (builtins.lookup(name) != null or isSpecialBuiltin(name)) {
+                } else if (builtins.lookup(name) != null or builtins.isSpecialBuiltin(name)) {
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is a shell builtin\n");
                 } else if (self.findExecutable(name)) |path| {
+                    defer self.alloc.free(std.mem.sliceTo(path, 0));
                     posix.writeAll(1, name);
                     posix.writeAll(1, " is ");
                     posix.writeAll(1, std.mem.sliceTo(path, 0));
@@ -2107,17 +2114,6 @@ pub const Executor = struct {
         return fields.toOwnedSlice(self.alloc);
     }
 };
-
-fn isSpecialBuiltin(name: []const u8) bool {
-    const specials = [_][]const u8{
-        ":", ".", "break", "continue", "eval", "exec", "exit",
-        "export", "readonly", "set", "shift", "unset",
-    };
-    for (specials) |s| {
-        if (std.mem.eql(u8, name, s)) return true;
-    }
-    return false;
-}
 
 fn parseFdMove(s: []const u8) ?i32 {
     if (s.len >= 2 and s[s.len - 1] == '-') {

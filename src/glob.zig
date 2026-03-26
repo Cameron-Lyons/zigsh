@@ -50,10 +50,7 @@ fn expandImpl(alloc: std.mem.Allocator, pattern: []const u8, dotglob: bool) ![]c
         }
 
         if (fnmatch(file_pattern, name)) {
-            const full = if (dir_path.len > 0)
-                try std.fmt.allocPrint(alloc, "{s}{s}", .{ dir_path, name })
-            else
-                try alloc.dupe(u8, name);
+            const full = try joinPath(alloc, dir_path, name);
             try results.append(alloc, full);
         }
     }
@@ -72,6 +69,15 @@ fn expandImpl(alloc: std.mem.Allocator, pattern: []const u8, dotglob: bool) ![]c
     }.lessThan);
 
     return results.toOwnedSlice(alloc);
+}
+
+fn joinPath(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) ![]const u8 {
+    if (dir_path.len == 0) return alloc.dupe(u8, name);
+
+    const full = try alloc.alloc(u8, dir_path.len + name.len);
+    @memcpy(full[0..dir_path.len], dir_path);
+    @memcpy(full[dir_path.len..], name);
+    return full;
 }
 
 pub fn fnmatchNoCase(pattern: []const u8, text: []const u8) bool {

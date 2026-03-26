@@ -1,30 +1,16 @@
 const std = @import("std");
 const testing = std.testing;
 const process = std.process;
+const test_support = @import("test_support.zig");
+const runShell = test_support.runShell;
+const expectOutput = test_support.expectOutput;
+const expectExitCode = test_support.expectExitCode;
 
-const zigsh_argv_prefix = [_][]const u8{ "./zig-out/bin/zigsh", "-c" };
-
-fn runShell(cmd: []const u8) !struct { stdout: []u8, stderr: []u8, term: process.Child.Term } {
-    const argv = zigsh_argv_prefix ++ .{cmd};
-    const result = try process.run(testing.allocator, testing.io, .{
-        .argv = &argv,
-    });
-    return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
-}
-
-fn expectOutput(cmd: []const u8, expected: []const u8) !void {
-    const result = try runShell(cmd);
-    defer testing.allocator.free(result.stdout);
+fn expectedPhysicalTmpPath() ![]u8 {
+    const result = try test_support.runShell("cd /tmp; /bin/pwd -P");
     defer testing.allocator.free(result.stderr);
-    try testing.expectEqualStrings(expected, result.stdout);
-    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
-}
-
-fn expectExitCode(cmd: []const u8, code: u8) !void {
-    const result = try runShell(cmd);
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-    try testing.expectEqual(process.Child.Term{ .exited = code }, result.term);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    return result.stdout;
 }
 
 // --- Arithmetic assignment operators ---
@@ -207,7 +193,9 @@ test "times format contains m and s" {
 // --- cd -L/-P ---
 
 test "cd -P resolves to physical path" {
-    try expectOutput("cd -P /tmp; echo $PWD", "/tmp\n");
+    const expected = try expectedPhysicalTmpPath();
+    defer testing.allocator.free(expected);
+    try expectOutput("cd -P /tmp; echo $PWD", expected);
 }
 
 test "cd -L is default logical" {
@@ -215,7 +203,9 @@ test "cd -L is default logical" {
 }
 
 test "cd -P after -L, last wins" {
-    try expectOutput("cd -L -P /tmp; echo $PWD", "/tmp\n");
+    const expected = try expectedPhysicalTmpPath();
+    defer testing.allocator.free(expected);
+    try expectOutput("cd -L -P /tmp; echo $PWD", expected);
 }
 
 // --- test -nt/-ot/-ef ---
@@ -321,7 +311,13 @@ test "readonly with no args shows readonly vars" {
 // --- hash -d/-t ---
 
 test "hash -t prints cached path" {
-    try expectOutput("hash ls; hash -t ls", "/usr/bin/ls\n");
+    const result = try runShell("hash ls; hash -t ls");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expect(result.stdout.len > "/ls\n".len);
+    try testing.expect(result.stdout[0] == '/');
+    try testing.expect(std.mem.endsWith(u8, result.stdout, "/ls\n"));
+    try testing.expectEqual(process.Child.Term{ .exited = 0 }, result.term);
 }
 
 test "hash -d removes cached entry" {
@@ -453,7 +449,9 @@ test "umask symbolic input restrictive" {
 // --- pwd -L/-P ---
 
 test "pwd -P shows physical path" {
-    try expectOutput("cd /tmp; pwd -P", "/tmp\n");
+    const expected = try expectedPhysicalTmpPath();
+    defer testing.allocator.free(expected);
+    try expectOutput("cd /tmp; pwd -P", expected);
 }
 
 test "pwd -L shows logical path" {

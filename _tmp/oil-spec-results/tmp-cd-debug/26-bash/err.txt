@@ -1,0 +1,1 @@
+bash: line 3: strace: command not found

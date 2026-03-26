@@ -1,3 +1,0 @@
-func renderPrompt() {
-  error 'oops'
-}
