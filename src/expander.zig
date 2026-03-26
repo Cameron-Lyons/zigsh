@@ -90,15 +90,18 @@ pub const Expander = struct {
     pub fn expandWordsToFields(self: *Expander, words: []const ast.Word) ExpandError![]const []const u8 {
         var raw_fields: std.ArrayListUnmanaged([]const u8) = .empty;
         var word_boundaries: std.ArrayListUnmanaged(usize) = .empty;
-        const expanded_words = braceExpandWords(self.alloc, words) catch |err| blk: {
-            if (err == error.InvalidRange) {
-                posix.writeAll(2, "zigsh: brace expansion: bad range\n");
-                self.env.should_exit = true;
-                self.env.exit_value = 2;
-                return error.BadSubstitution;
+        const expanded_words = if (hasLiteralBracePattern(words))
+            braceExpandWords(self.alloc, words) catch |err| blk: {
+                if (err == error.InvalidRange) {
+                    posix.writeAll(2, "zigsh: brace expansion: bad range\n");
+                    self.env.should_exit = true;
+                    self.env.exit_value = 2;
+                    return error.BadSubstitution;
+                }
+                break :blk words;
             }
-            break :blk words;
-        };
+        else
+            words;
         for (expanded_words) |word| {
             try word_boundaries.append(self.alloc, raw_fields.items.len);
             if (findQuotedAt(word)) |at_info| {
@@ -1216,7 +1219,10 @@ pub const Expander = struct {
             'Q' => {
                 var needs_ansi = false;
                 for (val) |ch| {
-                    if (ch < 0x20 or ch == 0x7f) { needs_ansi = true; break; }
+                    if (ch < 0x20 or ch == 0x7f) {
+                        needs_ansi = true;
+                        break;
+                    }
                 }
                 var result: std.ArrayListUnmanaged(u8) = .empty;
                 if (needs_ansi) {
@@ -1425,7 +1431,7 @@ pub const Expander = struct {
             if (input[i] == '\\') {
                 i += 1;
                 if (i >= input.len) {
-                    try result.append(alloc,'\\');
+                    try result.append(alloc, '\\');
                     break;
                 }
                 switch (input[i]) {
@@ -1735,7 +1741,11 @@ pub const Expander = struct {
                         var depth: usize = 1;
                         var j = arith_start;
                         while (j + 1 < body.len) {
-                            if (body[j] == '(' and body[j + 1] == '(') { depth += 1; j += 2; continue; }
+                            if (body[j] == '(' and body[j + 1] == '(') {
+                                depth += 1;
+                                j += 2;
+                                continue;
+                            }
                             if (body[j] == ')' and body[j + 1] == ')') {
                                 depth -= 1;
                                 if (depth == 0) break;
@@ -1754,8 +1764,9 @@ pub const Expander = struct {
                         var depth: usize = 1;
                         var j = cmd_start;
                         while (j < body.len) {
-                            if (body[j] == '(') { depth += 1; }
-                            else if (body[j] == ')') {
+                            if (body[j] == '(') {
+                                depth += 1;
+                            } else if (body[j] == ')') {
                                 depth -= 1;
                                 if (depth == 0) break;
                             }
@@ -2022,7 +2033,10 @@ pub const Expander = struct {
                         while (j < expr.len and depth > 0) : (j += 1) {
                             if (j + 1 < expr.len and expr[j] == ')' and expr[j + 1] == ')') {
                                 depth -= 2;
-                                if (depth == 0) { j += 2; break; }
+                                if (depth == 0) {
+                                    j += 2;
+                                    break;
+                                }
                                 j += 1;
                             } else if (expr[j] == '(') {
                                 depth += 1;
@@ -2386,29 +2400,40 @@ pub const Expander = struct {
         var fields: std.ArrayListUnmanaged([]const u8) = .empty;
         var glob_flags: std.ArrayListUnmanaged(bool) = .empty;
         var char_glob_flags: std.ArrayListUnmanaged([]const bool) = .empty;
+        const track_glob = !self.env.options.noglob;
         const ifs = self.env.ifs;
         var i: usize = 0;
 
         skipIfsWhitespace(text, splittable, ifs, &i);
 
         while (i < text.len) {
+            const field_start = i;
             var field: std.ArrayListUnmanaged(u8) = .empty;
             var field_glob: std.ArrayListUnmanaged(bool) = .empty;
             var has_glob = false;
 
             while (i < text.len) {
                 if (splittable[i] and isIfsChar(text[i], ifs)) break;
-                if (globbable_chars[i] and (text[i] == '*' or text[i] == '?' or text[i] == '[')) {
-                    has_glob = true;
+                if (track_glob and globbable_chars[i] and (text[i] == '*' or text[i] == '?' or text[i] == '[')) {
+                    if (!has_glob) {
+                        has_glob = true;
+                        var backfill = field_start;
+                        while (backfill < i) : (backfill += 1) {
+                            try field_glob.append(self.alloc, globbable_chars[backfill]);
+                        }
+                    }
                 }
                 try field.append(self.alloc, text[i]);
-                try field_glob.append(self.alloc, globbable_chars[i]);
+                if (has_glob) try field_glob.append(self.alloc, globbable_chars[i]);
                 i += 1;
             }
 
             try fields.append(self.alloc, try field.toOwnedSlice(self.alloc));
             try glob_flags.append(self.alloc, has_glob);
-            try char_glob_flags.append(self.alloc, try field_glob.toOwnedSlice(self.alloc));
+            try char_glob_flags.append(
+                self.alloc,
+                if (has_glob) try field_glob.toOwnedSlice(self.alloc) else &.{},
+            );
 
             if (i >= text.len) break;
 
@@ -2761,7 +2786,10 @@ pub const Expander = struct {
                         var result: std.ArrayListUnmanaged(u8) = .empty;
                         var needs_ansi = false;
                         for (val) |ch| {
-                            if (ch < 0x20 or ch == 0x7f) { needs_ansi = true; break; }
+                            if (ch < 0x20 or ch == 0x7f) {
+                                needs_ansi = true;
+                                break;
+                            }
                         }
                         if (needs_ansi) {
                             try result.appendSlice(self.alloc, "$'");
@@ -3109,6 +3137,24 @@ fn hasDoubleDot(elems: []const FlatElem) bool {
             elems[i + 1] == .literal_char and elems[i + 1].literal_char == '.')
         {
             return true;
+        }
+    }
+    return false;
+}
+
+fn hasLiteralBracePattern(words: []const ast.Word) bool {
+    for (words) |word| {
+        for (word.parts) |part| {
+            switch (part) {
+                .literal => |lit| {
+                    if (std.mem.indexOfScalar(u8, lit, '{') != null or
+                        std.mem.indexOfScalar(u8, lit, '}') != null)
+                    {
+                        return true;
+                    }
+                },
+                else => {},
+            }
         }
     }
     return false;

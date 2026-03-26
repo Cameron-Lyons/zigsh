@@ -1,5 +1,7 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const c = std.c;
+const linux = std.os.linux;
 
 pub const fd_t = i32;
 pub const pid_t = i32;
@@ -121,21 +123,50 @@ fn statResultFromC(st: c.Stat) StatResult {
     };
 }
 
+fn statResultFromLinux(st: linux.Statx) StatResult {
+    return .{
+        .mode = st.mode,
+        .size = st.size,
+        .mtime_sec = st.mtime.sec,
+        .mtime_nsec = st.mtime.nsec,
+        .dev_major = st.dev_major,
+        .dev_minor = st.dev_minor,
+        .ino = st.ino,
+        .uid = st.uid,
+        .gid = st.gid,
+    };
+}
+
 pub fn stat(path: [*:0]const u8) !StatResult {
+    if (builtin.os.tag == .linux) {
+        var st: linux.Statx = std.mem.zeroes(linux.Statx);
+        const rc = c.statx(@as(c.fd_t, @intCast(c.AT.FDCWD)), path, 0, linux.STATX.BASIC_STATS, &st);
+        if (rc < 0) return error.StatFailed;
+        return statResultFromLinux(st);
+    }
+
     var st: c.Stat = undefined;
-    const rc = c.fstatat(@as(c.fd_t, @intCast(c.AT.FDCWD)), path, &st, 0);
+    const rc = c.stat(path, &st);
     if (rc < 0) return error.StatFailed;
     return statResultFromC(st);
 }
 
 pub fn lstat(path: [*:0]const u8) !StatResult {
+    if (builtin.os.tag == .linux) {
+        var st: linux.Statx = std.mem.zeroes(linux.Statx);
+        const rc = c.statx(
+            @as(c.fd_t, @intCast(c.AT.FDCWD)),
+            path,
+            @as(u32, c.AT.SYMLINK_NOFOLLOW),
+            linux.STATX.BASIC_STATS,
+            &st,
+        );
+        if (rc < 0) return error.StatFailed;
+        return statResultFromLinux(st);
+    }
+
     var st: c.Stat = undefined;
-    const rc = c.fstatat(
-        @as(c.fd_t, @intCast(c.AT.FDCWD)),
-        path,
-        &st,
-        @as(u32, c.AT.SYMLINK_NOFOLLOW),
-    );
+    const rc = ext.fstatat(@as(c.fd_t, @intCast(c.AT.FDCWD)), path, &st, @as(u32, c.AT.SYMLINK_NOFOLLOW));
     if (rc < 0) return error.StatFailed;
     return statResultFromC(st);
 }
@@ -274,6 +305,7 @@ const ext = struct {
     extern "c" fn tcgetpgrp(fd: c_int) pid_t;
     extern "c" fn tcsetpgrp(fd: c_int, pgrp: pid_t) c_int;
     extern "c" fn setpgid(pid: pid_t, pgid: pid_t) c_int;
+    extern "c" fn fstatat(dirfd: c.fd_t, path: [*:0]const u8, buf: *c.Stat, flag: u32) c_int;
     extern "c" fn getpwnam(name: [*:0]const u8) ?*const Passwd;
     extern "c" fn getrusage(who: c_int, usage: *rusage) c_int;
     extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
