@@ -101,12 +101,7 @@ case "$jobs" in
 esac
 
 if test -z "$ZIG_BIN"; then
-  local_toolchain=$(ls -d "$REPO_ROOT"/.toolchains/zig-*/zig 2>/dev/null | head -n 1 || true)
-  if test -n "$local_toolchain"; then
-    ZIG_BIN="$local_toolchain"
-  else
-    ZIG_BIN=zig
-  fi
+  ZIG_BIN="$REPO_ROOT/tools/zig.sh"
 fi
 
 if test "${#spec_names[@]}" -eq 0; then

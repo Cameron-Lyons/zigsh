@@ -4,30 +4,33 @@ A POSIX.1-2017 Shell Command Language implementation written in Zig.
 
 ## Building
 
-Requires Zig 0.16+ with libc support.
+Requires Zig 0.16+ with libc support if you want to use a system install.
+The repo also includes `tools/zig.sh`, which
+uses a matching local toolchain from `.toolchains/`, falls back to `zig` from
+`PATH`, and downloads Zig into `.toolchains/` on demand if neither exists.
 
 ```
-zig build
+tools/zig.sh build
 ```
 
 Run tests:
 
 ```
-zig build test
+tools/zig.sh build test
 ```
 
 Run benchmarks:
 
 ```
-zig build bench -Doptimize=ReleaseFast
+tools/zig.sh build bench -Doptimize=ReleaseFast
 ```
 
 Filter or tune the benchmark run:
 
 ```
-zig build bench -Doptimize=ReleaseFast -- --filter parser
-zig build bench -Doptimize=ReleaseFast -- --iterations 2000
-zig build bench -Doptimize=ReleaseFast -- --list
+tools/zig.sh build bench -Doptimize=ReleaseFast -- --filter parser
+tools/zig.sh build bench -Doptimize=ReleaseFast -- --iterations 2000
+tools/zig.sh build bench -Doptimize=ReleaseFast -- --list
 ```
 
 Run Oil spec tests (POSIX-focused subset):
@@ -54,6 +57,12 @@ The runner writes logs and per-file stats to:
 
 ```sh
 _tmp/oil-spec-results/
+```
+
+To see which Zig binary the repo will use:
+
+```sh
+tools/zig.sh --print-path
 ```
 
 ## Usage
