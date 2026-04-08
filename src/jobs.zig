@@ -68,15 +68,6 @@ pub const JobTable = struct {
         return error.TooManyJobs;
     }
 
-    pub fn findByPgid(self: *JobTable, pgid: posix.pid_t) ?*Job {
-        for (&self.jobs.*) |*slot| {
-            if (slot.*) |*job| {
-                if (job.pgid == pgid) return job;
-            }
-        }
-        return null;
-    }
-
     pub fn findById(self: *JobTable, id: u32) ?*Job {
         for (&self.jobs.*) |*slot| {
             if (slot.*) |*job| {

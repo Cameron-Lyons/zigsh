@@ -125,14 +125,6 @@ pub fn setupInteractiveSignals() void {
     ignoreSignal(SIGTTOU);
 }
 
-pub fn setupChildSignals() void {
-    defaultSignal(SIGINT);
-    defaultSignal(SIGQUIT);
-    defaultSignal(SIGTSTP);
-    defaultSignal(SIGTTIN);
-    defaultSignal(SIGTTOU);
-}
-
 pub fn clearTrapsForSubshell() void {
     for (1..32) |i| {
         if (trap_handlers[i]) |action| {

@@ -232,11 +232,6 @@ pub fn isatty(fd: fd_t) bool {
     return c.isatty(fd) != 0;
 }
 
-pub fn fcntl_setfd(fd: fd_t, flags: c_int) !void {
-    const rc = c.fcntl(fd, c.F.SETFD, flags);
-    if (rc < 0) return error.FcntlFailed;
-}
-
 pub const FD_CLOEXEC = 1;
 
 pub fn oRdonly() OpenFlags {
@@ -349,11 +344,6 @@ pub fn tcsetpgrp(fd: fd_t, pgrp: pid_t) !void {
 pub fn setpgid(pid: pid_t, pgid: pid_t) !void {
     const rc = ext.setpgid(pid, pgid);
     if (rc < 0) return error.SetpgidFailed;
-}
-
-pub fn killpg(pgrp: pid_t, sig: u6) !void {
-    const rc = c.kill(-pgrp, @enumFromInt(sig));
-    if (rc < 0) return error.KillFailed;
 }
 
 pub fn exit(status: u8) noreturn {
