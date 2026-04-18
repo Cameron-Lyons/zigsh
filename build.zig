@@ -1,5 +1,31 @@
 const std = @import("std");
 
+fn addStandaloneTest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    root_source_file: []const u8,
+    step_name: []const u8,
+    step_description: []const u8,
+    aggregate_step: *std.Build.Step,
+) void {
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path(root_source_file),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const tests = b.addTest(.{
+        .root_module = test_mod,
+    });
+    const run_tests = b.addRunArtifact(tests);
+    run_tests.step.dependOn(b.getInstallStep());
+
+    const named_step = b.step(step_name, step_description);
+    named_step.dependOn(&run_tests.step);
+    aggregate_step.dependOn(&run_tests.step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -40,51 +66,27 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 
-    const integration_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/test_printf.zig"),
+    addStandaloneTest(b, target, optimize, "src/test_printf.zig", "test-printf", "Run printf integration tests", test_step);
+    addStandaloneTest(b, target, optimize, "src/test_read.zig", "test-read", "Run read integration tests", test_step);
+    addStandaloneTest(b, target, optimize, "src/test_posix.zig", "test-posix", "Run POSIX integration tests", test_step);
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
-    const integration_tests = b.addTest(.{
-        .root_module = integration_test_mod,
-    });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    run_integration_tests.step.dependOn(b.getInstallStep());
-
-    const integration_test_step = b.step("test-printf", "Run printf integration tests");
-    integration_test_step.dependOn(&run_integration_tests.step);
-    test_step.dependOn(&run_integration_tests.step);
-
-    const read_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/test_read.zig"),
-        .target = target,
-        .optimize = optimize,
+    const bench_exe = b.addExecutable(.{
+        .name = "zigsh-bench",
+        .root_module = bench_mod,
     });
 
-    const read_tests = b.addTest(.{
-        .root_module = read_test_mod,
-    });
-    const run_read_tests = b.addRunArtifact(read_tests);
-    run_read_tests.step.dependOn(b.getInstallStep());
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
 
-    const read_test_step = b.step("test-read", "Run read integration tests");
-    read_test_step.dependOn(&run_read_tests.step);
-    test_step.dependOn(&run_read_tests.step);
-
-    const posix_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/test_posix.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const posix_tests = b.addTest(.{
-        .root_module = posix_test_mod,
-    });
-    const run_posix_tests = b.addRunArtifact(posix_tests);
-    run_posix_tests.step.dependOn(b.getInstallStep());
-
-    const posix_test_step = b.step("test-posix", "Run POSIX integration tests");
-    posix_test_step.dependOn(&run_posix_tests.step);
-    test_step.dependOn(&run_posix_tests.step);
+    const bench_step = b.step("bench", "Run benchmark suite");
+    bench_step.dependOn(&run_bench.step);
 }

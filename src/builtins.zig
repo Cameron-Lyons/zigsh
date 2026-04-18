@@ -683,9 +683,9 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
                 i += 1;
                 if (!setOptionByName(&env.options, args[i], enable)) return 2;
             } else if (enable) {
-                printOptions(&env.options);
+                printOptions(&env.options, .list);
             } else {
-                printOptions(&env.options);
+                printOptions(&env.options, .reinput);
             }
             continue;
         }
@@ -702,7 +702,7 @@ fn builtinSet(args: []const []const u8, env: *Environment) u8 {
                 'C' => env.options.noclobber = enable,
                 'm' => env.options.monitor = enable,
                 'o' => {
-                    if (enable) printOptions(&env.options);
+                    if (enable) printOptions(&env.options, .list);
                 },
                 else => {},
             }
@@ -852,8 +852,90 @@ fn writeSetOptions(options: *const Environment.ShellOptions, mode: SetOptionPrin
     }
 }
 
-fn printOptions(options: *const Environment.ShellOptions) void {
-    writeSetOptions(options, .all);
+const OptionPrintMode = enum {
+    list,
+    reinput,
+};
+
+fn printOptions(options: *const Environment.ShellOptions, mode: OptionPrintMode) void {
+    switch (mode) {
+        .list => {
+            for (set_option_print_order) |name| {
+                const enabled = setOptionEnabled(options, name) orelse continue;
+                posix.writeAll(1, name);
+                posix.writeAll(1, if (name.len < 16) "\t\t" else "\t");
+                posix.writeAll(1, if (enabled) "on" else "off");
+                posix.writeAll(1, "\n");
+            }
+        },
+        .reinput => writeSetOptions(options, .all),
+    }
+}
+
+const LoopControlKind = enum {
+    break_loop,
+    continue_loop,
+};
+
+fn loopControlName(comptime kind: LoopControlKind) []const u8 {
+    return switch (kind) {
+        .break_loop => "break",
+        .continue_loop => "continue",
+    };
+}
+
+fn setLoopControlCount(env: *Environment, comptime kind: LoopControlKind, count: u32) void {
+    switch (kind) {
+        .break_loop => env.break_count = count,
+        .continue_loop => env.continue_count = count,
+    }
+}
+
+fn handleLoopControlBuiltin(args: []const []const u8, env: *Environment, comptime kind: LoopControlKind) u8 {
+    const name = loopControlName(kind);
+    const too_many_status: u8 = switch (kind) {
+        .break_loop => 1,
+        .continue_loop => 2,
+    };
+
+    if (args.len > 2) {
+        posix.writeAll(2, name);
+        posix.writeAll(2, ": too many arguments\n");
+        if (kind == .continue_loop and !env.options.interactive) {
+            env.should_exit = true;
+            env.exit_value = too_many_status;
+        }
+        return too_many_status;
+    }
+
+    var n: u32 = 1;
+    if (args.len > 1) {
+        n = std.fmt.parseInt(u32, args[1], 10) catch {
+            posix.writeAll(2, name);
+            posix.writeAll(2, ": ");
+            posix.writeAll(2, args[1]);
+            posix.writeAll(2, ": numeric argument required\n");
+            if (env.loop_depth > 0) setLoopControlCount(env, kind, 1);
+            return 1;
+        };
+        if (n == 0) {
+            posix.writeAll(2, name);
+            posix.writeAll(2, ": loop count must be > 0\n");
+            return 1;
+        }
+    }
+
+    if (env.loop_depth == 0) {
+        if (env.in_subshell) {
+            env.should_exit = true;
+            env.exit_value = 1;
+            return 1;
+        }
+        return 0;
+    }
+
+    setLoopControlCount(env, kind, n);
+    return 0;
 }
 
 fn builtinShift(args: []const []const u8, env: *Environment) u8 {
@@ -905,69 +987,11 @@ fn builtinReturn(args: []const []const u8, env: *Environment) u8 {
 }
 
 fn builtinBreak(args: []const []const u8, env: *Environment) u8 {
-    if (args.len > 2) {
-        posix.writeAll(2, "break: too many arguments\n");
-        return 1;
-    }
-    var n: u32 = 1;
-    if (args.len > 1) {
-        n = std.fmt.parseInt(u32, args[1], 10) catch {
-            posix.writeAll(2, "break: ");
-            posix.writeAll(2, args[1]);
-            posix.writeAll(2, ": numeric argument required\n");
-            if (env.loop_depth > 0) env.break_count = 1;
-            return 1;
-        };
-        if (n == 0) {
-            posix.writeAll(2, "break: loop count must be > 0\n");
-            return 1;
-        }
-    }
-    if (env.loop_depth == 0) {
-        if (env.in_subshell) {
-            env.should_exit = true;
-            env.exit_value = 1;
-            return 1;
-        }
-        return 0;
-    }
-    env.break_count = n;
-    return 0;
+    return handleLoopControlBuiltin(args, env, .break_loop);
 }
 
 fn builtinContinue(args: []const []const u8, env: *Environment) u8 {
-    if (args.len > 2) {
-        posix.writeAll(2, "continue: too many arguments\n");
-        if (!env.options.interactive) {
-            env.should_exit = true;
-            env.exit_value = 2;
-        }
-        return 2;
-    }
-    var n: u32 = 1;
-    if (args.len > 1) {
-        n = std.fmt.parseInt(u32, args[1], 10) catch {
-            posix.writeAll(2, "continue: ");
-            posix.writeAll(2, args[1]);
-            posix.writeAll(2, ": numeric argument required\n");
-            if (env.loop_depth > 0) env.break_count = 1;
-            return 1;
-        };
-        if (n == 0) {
-            posix.writeAll(2, "continue: loop count must be > 0\n");
-            return 1;
-        }
-    }
-    if (env.loop_depth == 0) {
-        if (env.in_subshell) {
-            env.should_exit = true;
-            env.exit_value = 1;
-            return 1;
-        }
-        return 0;
-    }
-    env.continue_count = n;
-    return 0;
+    return handleLoopControlBuiltin(args, env, .continue_loop);
 }
 
 fn builtinEcho(args: []const []const u8, _: *Environment) u8 {

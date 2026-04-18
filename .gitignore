@@ -1,2 +1,5 @@
 .zig-cache/
 zig-out/
+.third_party/oil/
+oil/
+.toolchains/

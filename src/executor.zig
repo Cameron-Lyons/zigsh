@@ -42,21 +42,6 @@ pub const Executor = struct {
         return .{ .env = env, .jobs = jobs, .alloc = alloc };
     }
 
-    pub fn executeProgram(self: *Executor, program: ast.Program) u8 {
-        var status: u8 = 0;
-        for (program.commands) |cmd| {
-            self.env.abort_line = null;
-            status = self.executeCompleteCommand(cmd);
-            if (self.env.should_exit) break;
-            if (self.env.options.errexit and status != 0 and self.env.errexit_suppressed == 0 and !self.bang_reached) {
-                self.env.should_exit = true;
-                self.env.exit_value = status;
-                break;
-            }
-        }
-        return status;
-    }
-
     pub fn executeCompleteCommand(self: *Executor, cmd: ast.CompleteCommand) u8 {
         if (cmd.bg) {
             return self.executeBackground(cmd.list);

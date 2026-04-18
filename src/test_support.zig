@@ -1,7 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
 const process = std.process;
-const Io = std.Io;
 
 const zigsh_argv_prefix = [_][]const u8{ "./zig-out/bin/zigsh", "-c" };
 
@@ -34,16 +33,15 @@ pub fn runShellWithInput(cmd: []const u8, input: []const u8) !RunResult {
     child.stdin.?.close(io);
     child.stdin = null;
 
-    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: Io.File.MultiReader = undefined;
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
     multi_reader.init(testing.allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer multi_reader.deinit();
 
-    const stdout_reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-
     while (multi_reader.fill(64, .none)) |_| {
-        if (stdout_reader.buffered().len > 50 * 1024 or stderr_reader.buffered().len > 50 * 1024) {
+        if (multi_reader.reader(0).buffered().len > 50 * 1024 or
+            multi_reader.reader(1).buffered().len > 50 * 1024)
+        {
             return error.StreamTooLong;
         }
     } else |err| switch (err) {
@@ -53,14 +51,14 @@ pub fn runShellWithInput(cmd: []const u8, input: []const u8) !RunResult {
 
     try multi_reader.checkAnyError();
     const term = try child.wait(io);
-    const stdout = try multi_reader.toOwnedSlice(0);
-    errdefer testing.allocator.free(stdout);
-    const stderr = try multi_reader.toOwnedSlice(1);
-    errdefer testing.allocator.free(stderr);
+    const stdout_owned = try multi_reader.toOwnedSlice(0);
+    errdefer testing.allocator.free(stdout_owned);
+    const stderr_owned = try multi_reader.toOwnedSlice(1);
+    errdefer testing.allocator.free(stderr_owned);
 
     return .{
-        .stdout = stdout,
-        .stderr = stderr,
+        .stdout = stdout_owned,
+        .stderr = stderr_owned,
         .term = term,
     };
 }
