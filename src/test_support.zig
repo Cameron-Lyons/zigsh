@@ -33,16 +33,27 @@ pub fn runShellWithInput(cmd: []const u8, input: []const u8) !RunResult {
     child.stdin.?.close(io);
     child.stdin = null;
 
-    var stdout: std.ArrayList(u8) = .empty;
-    defer stdout.deinit(testing.allocator);
-    var stderr: std.ArrayList(u8) = .empty;
-    defer stderr.deinit(testing.allocator);
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(testing.allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
 
-    try child.collectOutput(testing.allocator, &stdout, &stderr, 50 * 1024);
+    while (multi_reader.fill(64, .none)) |_| {
+        if (multi_reader.reader(0).buffered().len > 50 * 1024 or
+            multi_reader.reader(1).buffered().len > 50 * 1024)
+        {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
     const term = try child.wait(io);
-    const stdout_owned = try stdout.toOwnedSlice(testing.allocator);
+    const stdout_owned = try multi_reader.toOwnedSlice(0);
     errdefer testing.allocator.free(stdout_owned);
-    const stderr_owned = try stderr.toOwnedSlice(testing.allocator);
+    const stderr_owned = try multi_reader.toOwnedSlice(1);
     errdefer testing.allocator.free(stderr_owned);
 
     return .{

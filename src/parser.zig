@@ -54,9 +54,6 @@ pub const Parser = struct {
     current: Token,
     source: []const u8,
     env: ?*@import("env.zig").Environment = null,
-    expanding_aliases: [16][]const u8 = undefined,
-    expanding_alias_count: u8 = 0,
-    alias_depth: u8 = 0,
 
     pub fn init(alloc: std.mem.Allocator, lexer: *Lexer) !Parser {
         const source = lexer.source;
@@ -341,8 +338,17 @@ pub const Parser = struct {
                 }
                 return .{ .compound = try self.parseCompoundWithRedirects(.{ .subshell = try self.parseSubshell() }) };
             },
-            .kw_do, .kw_done, .kw_then, .kw_else, .kw_elif, .kw_fi, .kw_esac, .kw_in,
-            .dsemi, .semi_and, .dsemi_and,
+            .kw_do,
+            .kw_done,
+            .kw_then,
+            .kw_else,
+            .kw_elif,
+            .kw_fi,
+            .kw_esac,
+            .kw_in,
+            .dsemi,
+            .semi_and,
+            .dsemi_and,
             => {
                 posix.writeAll(2, "zigsh: syntax error near unexpected token `");
                 posix.writeAll(2, self.tokenText(self.current));
@@ -358,107 +364,12 @@ pub const Parser = struct {
         }
     }
 
-    fn isAlreadyExpanding(self: *Parser, name: []const u8) bool {
-        for (self.expanding_aliases[0..self.expanding_alias_count]) |expanding| {
-            if (std.mem.eql(u8, expanding, name)) return true;
-        }
-        return false;
-    }
-
-    fn isUnquotedWord(self: *Parser) bool {
-        if (self.current.tag != .word) return false;
-        const text = self.tokenText(self.current);
-        for (text) |ch| {
-            if (ch == '\'' or ch == '"' or ch == '\\') return false;
-        }
-        return true;
-    }
-
     fn tryAliasExpandWord(self: *Parser) void {
-        const env = self.env orelse return;
-        if (!env.shopt.expand_aliases) return;
-        if (!self.isUnquotedWord()) return;
-        const word_text = self.tokenText(self.current);
-        const alias_val = env.getAlias(word_text) orelse return;
-        self.substituteInSource(self.current.start, self.current.end, alias_val);
-        self.lexer.pos = self.current.start;
-        self.current = self.lexer.next() catch return;
+        _ = self;
     }
 
     fn tryAliasExpand(self: *Parser) void {
-        self.expanding_alias_count = 0;
-        self.alias_depth = 0;
-
-        while (self.alias_depth < 16) {
-            const env = self.env orelse return;
-            if (!env.shopt.expand_aliases) return;
-            if (!self.isUnquotedWord()) return;
-
-            const word_text = self.tokenText(self.current);
-            if (self.isAlreadyExpanding(word_text)) return;
-            const alias_val = env.getAlias(word_text) orelse return;
-
-            if (self.expanding_alias_count < 16) {
-                self.expanding_aliases[self.expanding_alias_count] = word_text;
-                self.expanding_alias_count += 1;
-            }
-            self.alias_depth += 1;
-
-            self.substituteInSource(self.current.start, self.current.end, alias_val);
-
-            if (alias_val.len > 0 and alias_val[alias_val.len - 1] == ' ') {
-                self.expandTrailingSpaceAliases(@as(u32, self.current.start) + @as(u32, @intCast(alias_val.len)));
-            }
-
-            self.lexer.pos = self.current.start;
-            self.lexer.reserved_word_context = true;
-            self.current = self.lexer.next() catch return;
-        }
-    }
-
-    fn substituteInSource(self: *Parser, start: u32, end: u32, replacement: []const u8) void {
-        var new_source: std.ArrayListUnmanaged(u8) = .empty;
-        new_source.appendSlice(self.alloc, self.source[0..start]) catch return;
-        new_source.appendSlice(self.alloc, replacement) catch return;
-        new_source.appendSlice(self.alloc, self.source[end..]) catch return;
-        const expanded = new_source.toOwnedSlice(self.alloc) catch return;
-        self.source = expanded;
-        self.lexer.source = expanded;
-    }
-
-    fn expandTrailingSpaceAliases(self: *Parser, start_pos: u32) void {
-        self.expandTrailingSpaceRecursive(start_pos, 0);
-    }
-
-    fn expandTrailingSpaceRecursive(self: *Parser, start_pos: u32, depth: u8) void {
-        if (depth >= 16) return;
-        var pos = start_pos;
-        while (pos < self.source.len) {
-            if (self.source[pos] == ' ' or self.source[pos] == '\t') {
-                pos += 1;
-            } else if (self.source[pos] == '\\' and pos + 1 < self.source.len and self.source[pos + 1] == '\n') {
-                pos += 2;
-            } else break;
-        }
-        const word_start = pos;
-        while (pos < self.source.len) {
-            const ch = self.source[pos];
-            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == ';' or ch == '|' or
-                ch == '&' or ch == '(' or ch == ')' or ch == '\'' or ch == '"' or
-                ch == '\\' or ch == '$' or ch == '`') break;
-            pos += 1;
-        }
-        if (pos == word_start) return;
-
-        const next_word = self.source[word_start..pos];
-        const env = self.env orelse return;
-        const next_alias_val = env.getAlias(next_word) orelse return;
-
-        self.substituteInSource(@intCast(word_start), @intCast(pos), next_alias_val);
-
-        if (next_alias_val.len > 0 and next_alias_val[next_alias_val.len - 1] == ' ') {
-            self.expandTrailingSpaceRecursive(@intCast(word_start + next_alias_val.len), depth + 1);
-        }
+        _ = self;
     }
 
     fn parseCompoundWithRedirects(self: *Parser, body: ast.CompoundCommand) ParseError!ast.CompoundPair {
@@ -1693,10 +1604,7 @@ pub const Parser = struct {
 
     fn isDbWordTag(tag: Tag) bool {
         return switch (tag) {
-            .kw_if, .kw_then, .kw_else, .kw_elif, .kw_fi,
-            .kw_do, .kw_done, .kw_case, .kw_esac,
-            .kw_while, .kw_until, .kw_for, .kw_in,
-            .bang => true,
+            .kw_if, .kw_then, .kw_else, .kw_elif, .kw_fi, .kw_do, .kw_done, .kw_case, .kw_esac, .kw_while, .kw_until, .kw_for, .kw_in, .bang => true,
             else => false,
         };
     }

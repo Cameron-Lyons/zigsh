@@ -7,6 +7,7 @@ pub const fd_t = i32;
 pub const pid_t = i32;
 pub const mode_t = c.mode_t;
 pub const WNOHANG: u32 = 1;
+const MIN_INTERNAL_DUP_FD: c_int = 100;
 
 pub fn pipe() ![2]fd_t {
     var fds: [2]fd_t = undefined;
@@ -22,7 +23,7 @@ pub fn dup(old: fd_t) !fd_t {
 }
 
 pub fn dupHighFd(old: fd_t) !fd_t {
-    const rc = c.fcntl(old, c.F.DUPFD, @as(c_int, 100));
+    const rc = c.fcntl(old, c.F.DUPFD, MIN_INTERNAL_DUP_FD);
     if (rc < 0) return error.BadFd;
     _ = c.fcntl(rc, c.F.SETFD, @as(c_int, FD_CLOEXEC));
     return rc;
@@ -146,7 +147,7 @@ pub fn stat(path: [*:0]const u8) !StatResult {
     }
 
     var st: c.Stat = undefined;
-    const rc = c.stat(path, &st);
+    const rc = ext.fstatat(@as(c.fd_t, @intCast(c.AT.FDCWD)), path, &st, 0);
     if (rc < 0) return error.StatFailed;
     return statResultFromC(st);
 }

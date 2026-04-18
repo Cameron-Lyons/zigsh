@@ -6,6 +6,9 @@ const c = std.c;
 const SIG = c.SIG;
 const Sigaction = c.Sigaction;
 
+pub const SIGNAL_LIMIT: usize = 32;
+pub const SIGNAL_LIMIT_U6: u6 = @intCast(SIGNAL_LIMIT);
+
 fn sigNum(sig: SIG) u6 {
     return @intCast(@intFromEnum(sig));
 }
@@ -28,61 +31,74 @@ pub const SIGKILL: u6 = sigNum(SIG.KILL);
 pub const SIGSTOP: u6 = sigNum(SIG.STOP);
 pub const SIGURG: u6 = sigNum(SIG.URG);
 
+const SignalNameEntry = struct {
+    num: u6,
+    short: []const u8,
+    full: []const u8,
+};
+
+const signal_name_entries = [_]SignalNameEntry{
+    .{ .num = SIGHUP, .short = "HUP", .full = "SIGHUP" },
+    .{ .num = SIGINT, .short = "INT", .full = "SIGINT" },
+    .{ .num = SIGQUIT, .short = "QUIT", .full = "SIGQUIT" },
+    .{ .num = SIGABRT, .short = "ABRT", .full = "SIGABRT" },
+    .{ .num = SIGALRM, .short = "ALRM", .full = "SIGALRM" },
+    .{ .num = SIGTERM, .short = "TERM", .full = "SIGTERM" },
+    .{ .num = SIGKILL, .short = "KILL", .full = "SIGKILL" },
+    .{ .num = SIGSTOP, .short = "STOP", .full = "SIGSTOP" },
+    .{ .num = SIGCHLD, .short = "CHLD", .full = "SIGCHLD" },
+    .{ .num = SIGCONT, .short = "CONT", .full = "SIGCONT" },
+    .{ .num = SIGTSTP, .short = "TSTP", .full = "SIGTSTP" },
+    .{ .num = SIGTTIN, .short = "TTIN", .full = "SIGTTIN" },
+    .{ .num = SIGTTOU, .short = "TTOU", .full = "SIGTTOU" },
+    .{ .num = SIGPIPE, .short = "PIPE", .full = "SIGPIPE" },
+    .{ .num = SIGUSR1, .short = "USR1", .full = "SIGUSR1" },
+    .{ .num = SIGUSR2, .short = "USR2", .full = "SIGUSR2" },
+    .{ .num = SIGURG, .short = "URG", .full = "SIGURG" },
+};
+
+fn lookupSignalName(signum: u6) ?SignalNameEntry {
+    for (signal_name_entries) |entry| {
+        if (entry.num == signum) return entry;
+    }
+    return null;
+}
+
 pub fn sigNameFromNum(signum: u6) ?[]const u8 {
     if (signum == 0) return "EXIT";
-    if (signum == SIGHUP) return "HUP";
-    if (signum == SIGINT) return "INT";
-    if (signum == SIGQUIT) return "QUIT";
-    if (signum == SIGABRT) return "ABRT";
-    if (signum == SIGALRM) return "ALRM";
-    if (signum == SIGTERM) return "TERM";
-    if (signum == SIGKILL) return "KILL";
-    if (signum == SIGSTOP) return "STOP";
-    if (signum == SIGCHLD) return "CHLD";
-    if (signum == SIGCONT) return "CONT";
-    if (signum == SIGTSTP) return "TSTP";
-    if (signum == SIGTTIN) return "TTIN";
-    if (signum == SIGTTOU) return "TTOU";
-    if (signum == SIGPIPE) return "PIPE";
-    if (signum == SIGUSR1) return "USR1";
-    if (signum == SIGUSR2) return "USR2";
-    if (signum == SIGURG) return "URG";
+    if (lookupSignalName(signum)) |entry| return entry.short;
     return null;
 }
 
 pub fn sigFullName(signum: u6) ?[]const u8 {
     if (signum == 0) return "EXIT";
-    if (signum == SIGHUP) return "SIGHUP";
-    if (signum == SIGINT) return "SIGINT";
-    if (signum == SIGQUIT) return "SIGQUIT";
-    if (signum == SIGABRT) return "SIGABRT";
-    if (signum == SIGALRM) return "SIGALRM";
-    if (signum == SIGTERM) return "SIGTERM";
-    if (signum == SIGKILL) return "SIGKILL";
-    if (signum == SIGSTOP) return "SIGSTOP";
-    if (signum == SIGCHLD) return "SIGCHLD";
-    if (signum == SIGCONT) return "SIGCONT";
-    if (signum == SIGTSTP) return "SIGTSTP";
-    if (signum == SIGTTIN) return "SIGTTIN";
-    if (signum == SIGTTOU) return "SIGTTOU";
-    if (signum == SIGPIPE) return "SIGPIPE";
-    if (signum == SIGUSR1) return "SIGUSR1";
-    if (signum == SIGUSR2) return "SIGUSR2";
-    if (signum == SIGURG) return "SIGURG";
+    if (lookupSignalName(signum)) |entry| return entry.full;
     return null;
 }
 
 pub const TRAP_EXIT: usize = 0;
-pub const TRAP_ERR: usize = 33;
-const TRAP_COUNT = 34;
+pub const TRAP_ERR: usize = SIGNAL_LIMIT + 1;
+const TRAP_COUNT: usize = TRAP_ERR + 1;
 
-pub var trap_handlers: [TRAP_COUNT]?[]const u8 = [_]?[]const u8{null} ** TRAP_COUNT;
-pub var received_signals: [32]bool = [_]bool{false} ** 32;
+pub const State = struct {
+    trap_handlers: [TRAP_COUNT]?[]const u8 = [_]?[]const u8{null} ** TRAP_COUNT,
+    received_signals: [SIGNAL_LIMIT]bool = [_]bool{false} ** SIGNAL_LIMIT,
+};
+
+var active_state: ?*State = null;
+
+pub fn setActiveState(state: *State) void {
+    active_state = state;
+}
+
+pub fn clearActiveState() void {
+    active_state = null;
+}
 
 fn signalHandler(sig: SIG) callconv(.c) void {
     const s: usize = @intFromEnum(sig);
-    if (s < 32) {
-        received_signals[s] = true;
+    if (s < SIGNAL_LIMIT and active_state != null) {
+        active_state.?.received_signals[s] = true;
     }
 }
 
@@ -125,22 +141,22 @@ pub fn setupInteractiveSignals() void {
     ignoreSignal(SIGTTOU);
 }
 
-pub fn clearTrapsForSubshell() void {
-    for (1..32) |i| {
-        if (trap_handlers[i]) |action| {
+pub fn clearTrapsForSubshell(state: *State) void {
+    for (1..SIGNAL_LIMIT) |i| {
+        if (state.trap_handlers[i]) |action| {
             if (action.len > 0) {
-                trap_handlers[i] = null;
+                state.trap_handlers[i] = null;
                 defaultSignal(@intCast(i));
             }
         }
     }
-    trap_handlers[TRAP_EXIT] = null;
-    trap_handlers[TRAP_ERR] = null;
+    state.trap_handlers[TRAP_EXIT] = null;
+    state.trap_handlers[TRAP_ERR] = null;
 }
 
-pub fn setTrap(signum: u6, action: ?[]const u8) void {
-    if (signum < 32) {
-        trap_handlers[@intCast(signum)] = action;
+pub fn setTrap(state: *State, signum: u6, action: ?[]const u8) void {
+    if (signum < SIGNAL_LIMIT_U6) {
+        state.trap_handlers[@intCast(signum)] = action;
         if (signum == SIGKILL or signum == SIGSTOP) return;
         if (action) |a| {
             if (a.len == 0) {
@@ -154,26 +170,26 @@ pub fn setTrap(signum: u6, action: ?[]const u8) void {
     }
 }
 
-pub fn getExitTrap() ?[]const u8 {
-    return trap_handlers[TRAP_EXIT];
+pub fn getExitTrap(state: *const State) ?[]const u8 {
+    return state.trap_handlers[TRAP_EXIT];
 }
 
-pub fn setExitTrap(action: ?[]const u8) void {
-    trap_handlers[TRAP_EXIT] = action;
+pub fn setExitTrap(state: *State, action: ?[]const u8) void {
+    state.trap_handlers[TRAP_EXIT] = action;
 }
 
-pub fn getErrTrap() ?[]const u8 {
-    return trap_handlers[TRAP_ERR];
+pub fn getErrTrap(state: *const State) ?[]const u8 {
+    return state.trap_handlers[TRAP_ERR];
 }
 
-pub fn setErrTrap(action: ?[]const u8) void {
-    trap_handlers[TRAP_ERR] = action;
+pub fn setErrTrap(state: *State, action: ?[]const u8) void {
+    state.trap_handlers[TRAP_ERR] = action;
 }
 
-pub fn checkPendingSignals() ?u6 {
-    for (0..32) |i| {
-        if (received_signals[i]) {
-            received_signals[i] = false;
+pub fn checkPendingSignals(state: *State) ?u6 {
+    for (0..SIGNAL_LIMIT) |i| {
+        if (state.received_signals[i]) {
+            state.received_signals[i] = false;
             return @intCast(i);
         }
     }
