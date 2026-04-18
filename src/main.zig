@@ -19,10 +19,8 @@ pub const jobs = @import("jobs.zig");
 pub const line_editor = @import("line_editor.zig");
 pub const posix = @import("posix.zig");
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) u8 {
+    const gpa = init.gpa;
 
     var sh = Shell.init(gpa);
     sh.linkJobTable();
@@ -51,7 +49,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var args_buf: [256][]const u8 = undefined;
     var args_count: usize = 0;
-    var args_iter = std.process.Args.Iterator.init(init.args);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = args_iter.next();
     while (args_iter.next()) |arg| {
         if (args_count < args_buf.len) {
