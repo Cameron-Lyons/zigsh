@@ -635,7 +635,6 @@ pub const Arithmetic = struct {
         }
         return false;
     }
-
 };
 
 test "basic arithmetic" {

@@ -73,7 +73,6 @@ pub const Tag = enum {
             else => false,
         };
     }
-
 };
 
 pub const reserved_words = std.StaticStringMap(Tag).initComptime(.{
